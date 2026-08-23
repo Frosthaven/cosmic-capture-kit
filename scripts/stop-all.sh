@@ -19,10 +19,15 @@
 # this logic.
 #
 # The specific hole, measured: a Flatpak instance's argv on the host is
-# `cosmic-capture-kit resident`, with NO leading path, because the sandbox execs
+# `cosmic-capture-kit tray`, with NO leading path, because the sandbox execs
 # it by bare name. Every pattern the recipes carried was anchored to a path
 # (`/app/bin/cosmic-capture-kit`, `target/release/...`), so NONE of them matched
 # it and `just appimage` cheerfully left the Flatpak's tray icon in place.
+#
+# That word was `resident` before DRAGON-695, and a build from before it still
+# says so. This sweep does not care: it matches the EXE, so a legacy `resident`
+# process is stopped exactly like a `tray` one, and no pattern here needs the
+# old spelling.
 #
 # ── Why they can coexist at all (a product gap, not a recipe gap) ────────────
 #

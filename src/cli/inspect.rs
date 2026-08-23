@@ -1,4 +1,6 @@
-/// Print the Cosmic Capture Kit metadata embedded in a capture file (`--inspect`).
+use crate::{errln, outln};
+
+/// Print the Cosmic Capture Kit metadata embedded in a capture file (`debug inspect`).
 /// Reads a PNG `Comment` text chunk for screenshots, or the mp4/mkv `comment` tag
 /// (via `ffprobe`) for recordings.
 pub fn inspect(path: &std::path::Path) {
@@ -16,14 +18,14 @@ pub fn inspect(path: &std::path::Path) {
             // The string is " | "-joined `key=value` pairs; one per line reads nicely.
             for (i, part) in m.split(" | ").enumerate() {
                 if i == 0 {
-                    println!("{part}");
+                    outln!("{part}");
                 } else {
-                    println!("  {part}");
+                    outln!("  {part}");
                 }
             }
         }
-        Some(m) if !m.trim().is_empty() => println!("{m}"),
-        _ => eprintln!(
+        Some(m) if !m.trim().is_empty() => outln!("{m}"),
+        _ => errln!(
             "No Cosmic Capture Kit metadata found in {}",
             path.display()
         ),

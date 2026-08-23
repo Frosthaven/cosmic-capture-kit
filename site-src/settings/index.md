@@ -12,7 +12,7 @@ program. It takes no capture and it does not close itself.
 - Press the gear button on the capture overlay toolbar.
 - Press the Settings button in the preview editor.
 - Use the tray or menu bar icon, if you have the background helper on.
-- Run the app with `--settings`.
+- Run `cosmic-capture-kit settings`.
 - On Windows, use the Cosmic Capture Kit Settings shortcut in the Start Menu.
 
 It also opens by itself, on the Screen Recordings tab, if you try to record and

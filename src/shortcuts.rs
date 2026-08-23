@@ -1383,6 +1383,52 @@ pub fn is_accept_key(modifiers: Modifiers, key: &Key) -> bool {
     }
 }
 
+/// **Pure**, unit-tested: the FIXED live-annotation DISARM key (DRAGON-742): bare **V**.
+///
+/// While a drawing tool is armed during a recording the screen IS a mode, and the owner asked
+/// for two more ways out of it beside Escape: "i would also like right click, or v, to disarm
+/// markers the same way escape does". This is the key half; the mouse half is
+/// `app::update::window_chrome::ink_disarm_fires`, which both halves then share.
+///
+/// **Why `V`, and why it is not a collision.** `V` is Photoshop's Move key, and this app
+/// already spends it on exactly that meaning: [`Action::PreviewAnnotPointer`] is bare `V` in
+/// [`Context::Preview`] (DRAGON-369's tool map). Live ink's Pointer is the same idea on the
+/// other surface, so the letter the user already presses to stop drawing keeps working when
+/// the drawing is on a live recording instead of a still. The two lanes can never both answer
+/// one press: a preview editor owns the keyboard through its own modal lane in `app::keyboard`,
+/// which returns long before the overlay fall-through this is asked from, and no preview editor
+/// exists during a live recording anyway.
+///
+/// **Deliberately NOT a [`Keymap`] entry**, on the same argument as [`is_accept_key`] plus one
+/// that is specific to this key:
+///
+/// * Escape's own disarm is already FIXED ([`fixed_editor_action`]'s `Close`, baked by
+///   DRAGON-617). A selector whose off position is reachable by one baked key and one
+///   rebindable key is one rebind away from an inconsistency nobody can see in either place.
+/// * A [`Keymap`] holds exactly ONE [`Shortcut`] per [`Action`], so an `Action` for this would
+///   put a SECOND bare-`V` default in the defaults table, in a different context, from a
+///   different feature. That is precisely the shape DRAGON-451 retired `Context::Region` to
+///   stop, and there is nothing to arbitrate here: the two contexts are mutually exclusive.
+/// * There is no settings row for it for the same reason there is none for Escape. The
+///   disarm is one behaviour reached three ways, and offering to rebind a third of it would
+///   invite the three to drift.
+///
+/// **No modifiers, exactly**, so every `Ctrl+V`, `Cmd+V` and `Shift+V` in the process falls
+/// through untouched. Nothing in [`Context::Recording`] ships on a bare letter (all three of
+/// its defaults are `Shift+Alt` chords), so on a default install this collides with nothing at
+/// all; a user who deliberately rebinds a Recording action to bare `V` still wins, because the
+/// keymap lane is asked first (`app::keyboard`).
+///
+/// Case-INSENSITIVE, for [`nudge_direction`]'s reason: Caps Lock is not one of the four
+/// modifier flags, so a Caps Lock session delivers `V` through the guard above and must still
+/// disarm.
+pub fn is_ink_disarm_key(modifiers: Modifiers, key: &Key) -> bool {
+    if modifiers != Modifiers::empty() {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+}
+
 /// The five BAKED editor actions (DRAGON-617): Save, Upload, Close, Undo and Redo.
 ///
 /// They were ordinary [`Action`]s with ordinary [`Keymap`] entries until DRAGON-617 took them
@@ -3377,6 +3423,119 @@ mod accept_key_tests {
         // `Location` differs, and this predicate never asks for it.
         assert!(is_accept_key(Modifiers::empty(), &Key::Named(Named::Enter)));
         assert_eq!(magnifier_zoom_step(&Key::Named(Named::Enter), Location::Numpad), None);
+    }
+}
+
+/// DRAGON-742: the live-annotation DISARM key, bare `V`.
+#[cfg(test)]
+mod ink_disarm_key_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The whole of the feature at the key level: bare `V`, either case, and nothing else.
+    #[test]
+    fn bare_v_disarms_in_either_case() {
+        assert!(is_ink_disarm_key(Modifiers::empty(), &ch("v")));
+        // Caps Lock is not one of the four modifier flags, so an upper-case `V` arrives with
+        // an EMPTY modifier set and has to disarm too. Exactly `nudge_direction`'s reason.
+        assert!(is_ink_disarm_key(Modifiers::empty(), &ch("V")));
+    }
+
+    /// A MODIFIED `V` belongs to somebody else, and the one worth naming is paste: primary+V
+    /// is the system paste on every desktop this ships on, and the live text-annotation editor
+    /// really does answer it (`app::preview::annotate`'s `TextEditChord::Paste`).
+    #[test]
+    fn any_modifier_declines_including_the_paste_chord() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SHIFT, Modifiers::LOGO] {
+            for key in [ch("v"), ch("V")] {
+                assert!(!is_ink_disarm_key(m, &key), "{m:?} + {key:?}");
+            }
+        }
+        assert!(!is_ink_disarm_key(Modifiers::CTRL | Modifiers::SHIFT, &ch("v")));
+    }
+
+    /// No OTHER key disarms. The near misses are the ones that share this fall-through: the
+    /// four vim directionals, the accept keys, and Escape, which reaches the disarm by its own
+    /// route and must not also be answered here.
+    #[test]
+    fn no_other_key_disarms() {
+        for c in ["h", "j", "k", "l", " ", "b", "u", "c", "\0", ""] {
+            assert!(!is_ink_disarm_key(Modifiers::empty(), &ch(c)), "{c:?}");
+        }
+        for named in [Named::Escape, Named::Enter, Named::Tab, Named::ArrowLeft] {
+            assert!(!is_ink_disarm_key(Modifiers::empty(), &Key::Named(named)), "{named:?}");
+        }
+    }
+
+    /// The disarm key is disjoint from the two other BARE-key lanes it shares the capture
+    /// overlay's fall-through with. Stated as a crossing rather than as three lists, for
+    /// `accept_key_tests`' reason: one key answering two lanes would make the dispatch order
+    /// load-bearing, and it must not be.
+    #[test]
+    fn the_disarm_key_is_disjoint_from_the_accept_and_nudge_keys() {
+        let keys = [
+            ch("v"),
+            ch("V"),
+            Key::Named(Named::Enter),
+            ch(" "),
+            Key::Named(Named::ArrowLeft),
+            Key::Named(Named::ArrowRight),
+            Key::Named(Named::ArrowUp),
+            Key::Named(Named::ArrowDown),
+            ch("h"),
+            ch("j"),
+            ch("k"),
+            ch("l"),
+        ];
+        for key in keys {
+            let disarms = is_ink_disarm_key(Modifiers::empty(), &key);
+            let accepts = is_accept_key(Modifiers::empty(), &key);
+            let nudges = nudge_direction(Modifiers::empty(), &key).is_some();
+            assert!(!(disarms && accepts), "{key:?} cannot be both a disarm and an accept");
+            assert!(!(disarms && nudges), "{key:?} cannot be both a disarm and a nudge");
+        }
+    }
+
+    /// The one binding in the app that IS bare `V`, and why it can never fight this one.
+    ///
+    /// [`Action::PreviewAnnotPointer`] is bare `V` in [`Context::Preview`] (DRAGON-369's
+    /// Photoshop tool map) and means the SAME thing there: put the tool selector back on
+    /// Pointer. Asserted against the real keymap rather than restated, so a future re-map of
+    /// that letter shows up here as a failure and the two meanings get re-decided together
+    /// instead of drifting.
+    ///
+    /// The second half is what makes them safe: no [`Context::Recording`] default is a bare
+    /// letter, so nothing on the surface this key actually fires on claims it.
+    #[test]
+    fn bare_v_is_the_preview_pointer_too_and_no_recording_default_claims_it() {
+        let km = Keymap::defaults();
+        let bare = Modifiers::empty();
+        assert_eq!(
+            km.action_for(Context::Preview, bare, &ch("v")),
+            Some(Action::PreviewAnnotPointer),
+            "bare V is the preview editor's Pointer, the same meaning on the other surface"
+        );
+        assert_eq!(km.action_for(Context::Recording, bare, &ch("v")), None);
+        for action in Action::ALL.into_iter().filter(|a| a.context() == Context::Recording) {
+            let Some(sc) = km.get(action) else { continue };
+            assert!(
+                !sc.matches(bare, &ch("v")) && !sc.matches(bare, &ch("V")),
+                "{action:?} must not ship on a bare V"
+            );
+        }
+    }
+
+    /// It is NOT an [`Action`], in any context, which is the whole of "fixed rather than
+    /// rebindable" said in the one place a reader would look for the row.
+    #[test]
+    fn the_disarm_is_not_a_keymap_action() {
+        assert!(
+            !Action::ALL.into_iter().any(|a| format!("{a:?}").contains("InkDisarm")),
+            "the live-annotation disarm is a fixed key, not a bindable action"
+        );
     }
 }
 

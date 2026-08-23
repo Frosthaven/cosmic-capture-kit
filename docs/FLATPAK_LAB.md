@@ -53,8 +53,9 @@ Switching between the two is safe in both directions (DRAGON-590). Each recipe
 runs `scripts/stop-all.sh` first, which stops EVERY instance of the app whatever
 build it came from, so you cannot end up with an AppImage tray icon and a Flatpak
 tray icon at once. That used to happen: the recipes matched on command lines, and
-a Flatpak instance's argv on the host is a bare `cosmic-capture-kit resident`
-with no path, so every pattern missed it.
+a Flatpak instance's argv on the host is a bare `cosmic-capture-kit tray`
+with no path, so every pattern missed it. (An older build says `resident` there,
+the word DRAGON-695 replaced; matching the exe rather than the argv covers both.)
 
 Each recipe also repoints `target/artifacts/cosmic-capture-kit`, the stable path
 your capture shortcuts use, so the shortcut follows whichever build you last
@@ -65,7 +66,7 @@ flatpak itself exports:
 ~/.local/share/flatpak/exports/bin/dev.thedragon.CosmicCaptureKit
 ```
 
-which is a two-line script doing `exec flatpak run … "$@"`, so flags pass
+which is a two-line script doing `exec flatpak run … "$@"`, so commands pass
 through unchanged. The recipe derives that path from the app id and from the
 installation it used (`--user` here, `/var/lib/flatpak` for a system one) rather
 than hardcoding it, because the exported script is pinned to the branch and arch
@@ -73,7 +74,7 @@ that were installed. A missing export fails the recipe instead of leaving a
 dangling symlink.
 
 Note that the Settings window's Global shortcuts tab shows a different command
-for a Flatpak build, `flatpak run dev.thedragon.CosmicCaptureKit --flag`, and
+for a Flatpak build, `flatpak run dev.thedragon.CosmicCaptureKit <command>`, and
 that is correct too: it is what a normal user with one install needs, where the
 symlink is a developer convenience for a machine carrying three artifacts.
 
@@ -180,7 +181,7 @@ prompt BEFORE selection rather than after.
 * The mac/Windows **PlainWindows** path is a working template for "capture overlays as ordinary
   windows": `app::shell::overlay_window` plus `App::seed_outputs_mac` in `app/surfaces.rs`.
 * Sizing math is already portable: `app/preview/sizing.rs`, `geometry::OverlayUnits`.
-* Portal capture is proven in the sandbox: `--test pw` was granted a stream and pulled
+* Portal capture is proven in the sandbox: the PipeWire diagnostic was granted a stream and pulled
   5120x1440 frames at 21ms with `restore_token=true`, so repeat captures of the same monitor do
   not re-prompt.
 
@@ -221,7 +222,8 @@ The variant that could work is the capture child lingering as its own selection 
 focus during an interactive capture). **The owner has declined this**: it fights the one-shot
 model, where `finish_session` always exits. Do not build it without a fresh decision.
 
-So editor-less copy (`--no-editor`, and immediate `--active-window` / `--active-monitor`) stays
+So editor-less copy (`--skip-editor`, and immediate `capture --active-window` /
+`capture --active-monitor`) stays
 unavailable in a sandbox, and reports failure honestly rather than claiming success.
 
 ---
@@ -265,11 +267,11 @@ native). Awaiting the owner's live test.
 | Capture overlay / region select | layer shell hidden. THE blocker |
 | Window picker grid | `ext_foreign_toplevel_list_v1` hidden |
 | Per-window / occluded capture | toplevel capture-source hidden |
-| Transparency, glass | transparency: pixfmt forces alpha opaque, pending the DRAGON-562 alpha probe (`CCK_ALPHA_PROBE=1 --test pw window`); glass: needs the scene BEHIND the window, portal can't provide |
+| Transparency, glass | transparency: pixfmt forces alpha opaque, pending the DRAGON-562 alpha probe (`CCK_ALPHA_PROBE=1` with the PipeWire window diagnostic); glass: needs the scene BEHIND the window, portal can't provide |
 | Cursor sprite | no cursor session; portal offers only embedded/hidden |
 | GPU zero-copy encoding | build choice (ffmpeg 7.1 runtime), not a sandbox limit |
 | Editor-less copy | no window to hold a selection; see "Ruled out" |
-| `--active-window` / `--active-monitor` | no compositor access to resolve the active target; the launch fails honestly (`no-outputs`) instead of guessing |
+| `capture --active-window` / `capture --active-monitor` | no compositor access to resolve the active target; the launch fails honestly (`no-outputs`) instead of guessing |
 | Autostart | Background portal absent on COSMIC |
 | One-click update | `/app` is read-only |
 | Colour picker beyond the granted monitor | it mints the SAME overlays a capture does, and on the fallback path only the granted output is backed by a real surface. The tool WORKS, on that one screen; a native session covers all of them. Nothing picker-specific to fix, it moves when the overlay does |
@@ -437,8 +439,9 @@ to the recorded window, and the fallback path destroys its toplevel outright.
 The in-app recording chords therefore CANNOT fire on Linux, and never could.
 
 The answer is the CLI, bound as a desktop shortcut like the capture hotkey:
-`--pause-recording`, `--finish-recording`, `--cancel-recording`, `--toggle-mic`,
-`--toggle-system-audio`. They reach the live recording through the EXISTING
+`record --action pause|save|cancel`, `record --sound <channels>` and
+`record --tool <tool>`, which is `record` with no target option (DRAGON-695
+respelled these; the verbs are the same). They reach the live recording through the EXISTING
 relay, extended by one address: the recording child now also listens on its own
 per-pid socket beside the marker `instance.rs` already writes, the shape
 `preview_ipc` established. Same `Command` words, same `TrayEvent` drain, so a

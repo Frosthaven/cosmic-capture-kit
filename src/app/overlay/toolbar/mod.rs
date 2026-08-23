@@ -1017,6 +1017,66 @@ impl App {
         .padding(GROUP_PAD)
         .class(group_shell());
 
+        // DRAGON-691: the live-annotation group. Draw on the screen while the recording
+        // runs, and the ink is in the video.
+        //
+        // A three-way TOOL SELECTOR plus one action: Pointer (the default and the ordinary
+        // recording state, listed FIRST), Marker, Magic Marker, and Clear Marks. The three
+        // tools are mutually exclusive and pressing the selected one does nothing, which is how
+        // a radio control behaves everywhere else in the app; Clear Marks is an action button,
+        // not a fourth tool, because it is a thing you do once rather than a mode to be parked
+        // in.
+        //
+        // Built whenever a recording is live (`crate::ink::tools_available`, one term since
+        // DRAGON-693). This group is only ever laid out when the toolbar itself is on screen,
+        // so a hidden toolbar shows nothing here and the tray's Live Annotations submenu is the
+        // door instead; the Linux portal fallback has no toolbar at all and arms from the tray
+        // too, on the Silver or Bronze tier.
+        //
+        // The selected look is the toggle group's, not a mode selector's: the same 1px accent
+        // trim ring `toggle_btn` wears, so "this is on" reads identically to the mic and
+        // system-audio buttons the user is already watching on this bar.
+        let ink_tool = self.ink_tool();
+        let ink_group: Option<Element<'_, Msg>> = self.ink_available().then(|| {
+            // DRAGON-693: every button here is named, and the names come from the ONE source
+            // the tray's Live Annotations submenu reads (`InkTool::label` and
+            // `recording_ui::CLEAR_MARKS_LABEL`), so the two surfaces cannot call the same
+            // control two different things. The erase button was unlabelled and its action was
+            // called "Erase"; it is "Clear Marks" everywhere now.
+            let tool_btn = |name: &'static str, tool: crate::ink::InkTool| {
+                tip(
+                    toggle_btn(
+                        name,
+                        ink_tool == tool,
+                        Some(Msg::Ink(InkMsg::SelectTool(tool))),
+                        None,
+                    ),
+                    tool.label(),
+                )
+            };
+            widget::container(
+                widget::row(vec![
+                    // The same pointer glyph the preview editor's own Pointer tool wears, so
+                    // "this one does not draw" reads the same in both places.
+                    tool_btn("input-mouse-symbolic", crate::ink::InkTool::Pointer),
+                    tool_btn("pencil-symbolic", crate::ink::InkTool::Marker),
+                    tool_btn("format-text-highlight-symbolic", crate::ink::InkTool::MagicMarker),
+                    tip(
+                        action_btn("eraser-symbolic", Msg::Ink(InkMsg::Erase)),
+                        crate::recording_ui::CLEAR_MARKS_LABEL,
+                    ),
+                ])
+                .spacing(2.0)
+                .width(row_width)
+                .align_y(Alignment::Center),
+            )
+            .width(group_width)
+            .align_x(Alignment::Center)
+            .padding(GROUP_PAD)
+            .class(group_shell())
+            .into()
+        });
+
         // Kind+timer, mode switcher, audio, [capture], then settings/close. The
         // capture button is only present when anchored to a region; the bottom
         // toolbar (no selection / window / monitor) omits it. While counting down,
@@ -1026,6 +1086,12 @@ impl App {
             // During a video countdown/recording, keep the audio group visible so
             // channels can be toggled live — placed before the timer/record chip.
             let mut g = Vec::new();
+            // DRAGON-691: the drawing tools lead the bar while a recording is live. First
+            // because they are the only controls on it the user reaches for REPEATEDLY
+            // during a take; stop and cancel are pressed once, at the end.
+            if let Some(ink) = ink_group {
+                g.push(ink);
+            }
             if self.kind == Kind::Video {
                 g.push(audio_group.into());
             }

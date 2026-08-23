@@ -45,9 +45,11 @@
 //! zero-copy worker's real GPU encoder session. Those are covered by: the pure
 //! `encode::command` argument-shape tests
 //! (`media_clock_encoded_command_*`/`media_clock_command_*`), the
-//! `record::zero_copy::tests::trailing_frames_needed_*` tests for the screencopy
-//! zero-copy worker's trailing-coverage math, and manual verification against the
-//! real compositor/GPU this environment can't provide.
+//! `record::zero_copy::tests::trailing_frames_needed_*` tests for BOTH zero-copy
+//! workers' trailing-coverage math (the PipeWire one joined the screencopy one in
+//! DRAGON-715, over the same pure function, with `may_cover_pipewire_tail` deciding
+//! whether it runs), and manual verification against the real compositor/GPU this
+//! environment can't provide.
 
 use super::pump::PumpConfig;
 use super::sync_probe::{audio_rms_series, beep_times, flash_times, pair_offset, video_luma_series};
@@ -372,7 +374,7 @@ fn run_owned_shaped_session(
         let _ = std::fs::remove_file(&sys_fifo_path);
         return None;
     };
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdin = child.stdin.take().expect("piped stdin");
 
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
@@ -395,6 +397,16 @@ fn run_owned_shaped_session(
         SessionTimeline { t0, pause_at: t0, resume_at: t0, mute_at: t0, unmute_at: t0, session_end: t0 };
 
     let final_path = std::thread::scope(|scope| {
+        // BOUNDED video writes, the same sink the shipped workers use (DRAGON-712's
+        // `owned::SessionVideoSink`). This harness used to drive ffmpeg's stdin with a
+        // plain blocking `write_all`, and an ffmpeg that stops draining that pipe without
+        // closing it parks the write in the kernel for ever: one run wedged for 3h05m and
+        // another for 12 minutes, and because these tests share one mutex, the wedged
+        // test froze the whole suite behind it. The sink gives up after the shipped
+        // budgets instead, so a wedge FAILS this one test (see the assert at the teardown)
+        // and the gate moves on.
+        let mut stdin = super::owned::SessionVideoSink::new(stdin, &stop);
+        let mut wedged = false;
         let (pump_handle, mut ticker) = super::pump::spawn(
             scope, t0, cfg, mic_fifo_path.clone(), sys_fifo_path.clone(), mic_tap, mic_rx, monitor,
             sys_rx, &stop, &paused, &events,
@@ -450,7 +462,13 @@ fn run_owned_shaped_session(
             let frame = frame_rgba(bright, W, H);
             let due = ticker.due_video_ticks(Instant::now());
             for _ in 0..due {
-                let _ = stdin.write_all(&frame);
+                if stdin.write_all(&frame).is_err() {
+                    wedged = true;
+                    break;
+                }
+            }
+            if wedged {
+                break;
             }
             std::thread::sleep(Duration::from_millis(15));
         }
@@ -461,9 +479,12 @@ fn run_owned_shaped_session(
         let more = ticker.ticks_to_cover(pump_out.final_media);
         let last_frame = frame_rgba(false, W, H);
         for _ in 0..more {
-            let _ = stdin.write_all(&last_frame);
+            if stdin.write_all(&last_frame).is_err() {
+                wedged = true;
+                break;
+            }
         }
-        drop(stdin);
+        drop(stdin.into_stdin());
         // The teardown bound, asserted: with every input EOF'd (video stdin above,
         // the audio FIFOs by the pump's writer), a healthy ffmpeg flushes and
         // exits in ~a second. The DRAGON-125 field wedge (leaked FIFO write fds
@@ -473,6 +494,14 @@ fn run_owned_shaped_session(
         let eof_at = Instant::now();
         let reaped = super::wait_or_kill(&mut child, Duration::from_secs(30));
         let teardown = eof_at.elapsed();
+        // Asserted AFTER the reap so the wedge is reported with ffmpeg already gone
+        // rather than left running behind a panicking scope.
+        assert!(
+            !wedged,
+            "ffmpeg stopped draining its video stdin and the write was abandoned at the \
+             shipped budget: this session is void, not merely slow. Before DRAGON-717 this \
+             harness blocked here instead, for hours."
+        );
         assert!(
             matches!(&reaped, Ok(s) if s.success()),
             "capture ffmpeg must exit cleanly after its inputs close (got {reaped:?})"
@@ -1252,7 +1281,7 @@ fn run_marked_session(
         let _ = std::fs::remove_file(&sys_fifo_path);
         return None;
     };
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdin = child.stdin.take().expect("piped stdin");
 
     // The worker's video-side startup, made explicit.
     let already = capture_start.elapsed().as_secs_f64();
@@ -1279,6 +1308,10 @@ fn run_marked_session(
         None;
 
     let finished = std::thread::scope(|scope| {
+        // BOUNDED video writes, the shipped sink — see the same wrap in
+        // `run_owned_shaped_session` for the hours-long wedge this ends.
+        let mut stdin = super::owned::SessionVideoSink::new(stdin, &stop);
+        let mut wedged = false;
         let (pump_handle, mut ticker) = super::pump::spawn(
             scope, capture_start, cfg, mic_fifo_path.clone(), sys_fifo_path.clone(), mic_tap,
             mic_rx, monitor, sys_rx, &stop, &paused, &events,
@@ -1314,9 +1347,15 @@ fn run_marked_session(
                 last_frame = frame_level(video_level(capture_start.elapsed().as_secs_f64()), W, H);
                 writes.push((written, now));
                 for _ in 0..due {
-                    let _ = stdin.write_all(&last_frame);
+                    if stdin.write_all(&last_frame).is_err() {
+                        wedged = true;
+                        break;
+                    }
                     written += 1;
                 }
+            }
+            if wedged {
+                break;
             }
             std::thread::sleep(Duration::from_millis(8));
         }
@@ -1328,10 +1367,19 @@ fn run_marked_session(
         // The stop tail re-feeds the LAST frame (marker unchanged), exactly like the
         // production workers do — so the anchors stay meaningful.
         for _ in 0..ticker.ticks_to_cover(pump_out.final_media) {
-            let _ = stdin.write_all(&last_frame);
+            if stdin.write_all(&last_frame).is_err() {
+                wedged = true;
+                break;
+            }
         }
-        drop(stdin);
+        drop(stdin.into_stdin());
         let reaped = super::wait_or_kill(&mut child, Duration::from_secs(30));
+        assert!(
+            !wedged,
+            "ffmpeg stopped draining its video stdin and the write was abandoned at the \
+             shipped budget: this session is void, not merely slow. Before DRAGON-717 this \
+             harness blocked here instead, for hours."
+        );
         assert!(
             matches!(&reaped, Ok(s) if s.success()),
             "capture ffmpeg must exit cleanly after its inputs close (got {reaped:?})"
@@ -1364,6 +1412,271 @@ fn run_marked_session(
         levels,
         audio,
     })
+}
+
+/// Mean absolute video content-timing error a healthy recording must stay under.
+/// DRAGON-717 measured mean 0.687s on the broken pipeline and 0.041s on the fixed one
+/// (CLAUDE.md's DRAGON-717 invariant, from a headless replay of the shipped argv), so
+/// this sits 6x above the fixed reading and 2.7x below the broken one. It is the SAME
+/// 0.25s this check used to apply per sample: nothing was loosened, the number moved
+/// from the individual sample to the series (DRAGON-731).
+const CONTENT_MEAN_ERROR_MAX: f64 = 0.25;
+
+/// Per-sample hard cap: one frame this far out of place is a defect whatever the
+/// machine was doing. DRAGON-717's worst single sample was 1.461s (CLAUDE.md) and the
+/// CPU-starvation spike that opened DRAGON-731 was 0.41s, so this sits 2.4x above the
+/// starvation reading and still BELOW the real defect's worst frame, which means the
+/// cap alone would have caught DRAGON-717 even with the mean check absent.
+const CONTENT_SAMPLE_ERROR_MAX: f64 = 1.0;
+
+// The field readings the two bounds above are placed against, so the relations can be
+// asserted at COMPILE time rather than argued in a commit message. All four are
+// TIMESTAMPED OBSERVATIONS, not targets: the first three are CLAUDE.md's DRAGON-717
+// invariant, measured on a headless replay of the shipped argv, and the fourth is the
+// starvation reading that opened DRAGON-731.
+
+/// Mean content lateness of the FIXED pipeline, the render following delivery.
+const DRAGON_717_FIXED_MEAN: f64 = 0.041;
+/// Mean content lateness of the BROKEN pipeline, the video pipe throttled behind audio.
+const DRAGON_717_BROKEN_MEAN: f64 = 0.687;
+/// Worst single sample of the same broken series.
+const DRAGON_717_BROKEN_WORST: f64 = 1.461;
+/// The lone spike a CPU-starved box produced, 1 run of 5, load average 14.8 on 16 cores.
+const DRAGON_731_STARVED_SPIKE: f64 = 0.41;
+
+const _: () = assert!(
+    CONTENT_SAMPLE_ERROR_MAX > CONTENT_MEAN_ERROR_MAX,
+    "the per-sample cap must stay the LOOSER of the two: the mean is what catches a \
+     systematic shift and the cap is what catches a single catastrophe"
+);
+const _: () = assert!(
+    CONTENT_SAMPLE_ERROR_MAX < DRAGON_717_BROKEN_WORST,
+    "the per-sample cap must still reject DRAGON-717's worst frame on its own, or this \
+     check has traded away detection power on the defect it exists to catch"
+);
+const _: () = assert!(
+    CONTENT_MEAN_ERROR_MAX < DRAGON_717_BROKEN_MEAN,
+    "the mean bound must still reject DRAGON-717's systematic shift"
+);
+const _: () = assert!(
+    CONTENT_SAMPLE_ERROR_MAX > DRAGON_731_STARVED_SPIKE,
+    "the per-sample cap must ACCEPT the CPU-starvation spike that opened DRAGON-731"
+);
+const _: () = assert!(
+    CONTENT_MEAN_ERROR_MAX > DRAGON_717_FIXED_MEAN,
+    "the mean bound must accept a healthy pipeline's own content lateness"
+);
+
+/// The summary one video content-timing series is judged on, split out from the
+/// assertion so the DECISION is pure and unit-testable with no ffmpeg, no pulse and no
+/// recording at all (see `content_timing_tests`). Read
+/// [`assert_video_content_timing`] for why the judgement has this shape.
+#[derive(Debug, Clone, Copy)]
+struct ContentTiming {
+    n: usize,
+    /// Mean of |decoded wall minus the wall that slot should carry| over the series.
+    mean: f64,
+    /// How many samples are on their own past [`CONTENT_MEAN_ERROR_MAX`], which is
+    /// also the count the OLD per-sample tolerance would have rejected the run for:
+    /// a passing run reporting `over` above zero is this ticket's fix doing its job,
+    /// visible in the log without anyone having to reproduce a failure.
+    over: usize,
+    /// Media position, and signed error, of the single worst sample.
+    worst_media: f64,
+    worst_err: f64,
+}
+
+impl ContentTiming {
+    /// Summarize one series. Pure, unit-tested. `samples` must be non-empty.
+    fn of(samples: &[(f64, f64, f64)]) -> Self {
+        let n = samples.len();
+        let mean = samples.iter().map(|&(_, e, d)| (d - e).abs()).sum::<f64>() / n as f64;
+        let over =
+            samples.iter().filter(|&&(_, e, d)| (d - e).abs() >= CONTENT_MEAN_ERROR_MAX).count();
+        let (wm, we, wd) = samples
+            .iter()
+            .copied()
+            .max_by(|&(_, ae, ad), &(_, be, bd)| (ad - ae).abs().total_cmp(&(bd - be).abs()))
+            .expect("a non-empty series");
+        Self { n, mean, over, worst_media: wm, worst_err: wd - we }
+    }
+
+    /// No single frame is catastrophically out of place. Pure, unit-tested.
+    fn sample_cap_cleared(&self) -> bool {
+        self.worst_err.abs() < CONTENT_SAMPLE_ERROR_MAX
+    }
+
+    /// The series as a whole is not systematically shifted. Pure, unit-tested.
+    fn mean_cleared(&self) -> bool {
+        self.mean < CONTENT_MEAN_ERROR_MAX
+    }
+}
+
+/// Assert the VIDEO CONTENT-TIMING axis: the frame sitting at a given media position
+/// must be the frame that was captured at the wall instant that position corresponds
+/// to. `samples` is `(media position, the wall instant that slot SHOULD carry, the wall
+/// instant it actually carries)` per checked frame; in a session with no pauses the
+/// middle value IS the media position, and with pauses it is
+/// [`MarkedSession::wall_at_media`], since paused wall time is frozen out of the file.
+/// `min_samples` guards against a check that silently measures nothing.
+///
+/// WHY THIS IS AN AGGREGATE CHECK AND NOT A PER-SAMPLE TOLERANCE (DRAGON-731).
+///
+/// The defect this axis exists to catch is DRAGON-717. With `-shortest` gone, ffmpeg
+/// would not consume the video input more than ~0.25s ahead of the audio timestamps it
+/// had received; the pump delivered audio a fixed 1.5s late, so the video pipe was
+/// throttled for the whole session, and the capture loop's `due_video_ticks` catch-up
+/// covered the missed ticks by re-feeding the FRESHEST frame. Every media slot then
+/// carried content from its own future. That form is SYSTEMATIC: mean 0.687s and max
+/// 1.461s across the series, against 0.041s mean once the render follows delivery.
+///
+/// A CPU-STARVED TEST BOX produces the same per-frame reading, through the same
+/// mechanism, entirely by design: a capture loop that misses ticks owes `fps * elapsed`
+/// and covers them the same way. But it produces ISOLATED SPIKES rather than a
+/// systematic offset. The reading that opened DRAGON-731 was ONE sample at 0.41s in 1
+/// run of 5, at load average 14.8 on 16 cores with two `clippy-driver` processes at
+/// ~98% each, on a run whose audio was healthy (worst wall placement error 0.022s,
+/// `late=0` on both sources, no discards) and whose three opening-frame identity checks
+/// all passed. So the SHAPE is what separates a regression from a busy machine, and the
+/// shape is therefore what is asserted: a strict bound on the mean, which the real
+/// defect fails and a starved-but-correct run passes, plus a much larger per-sample cap
+/// so one catastrophic frame still fails on its own.
+///
+/// DEAD END, recorded so nobody re-runs it: simply widening the per-sample tolerance.
+/// It is the obvious-looking fix and it is the one change that would weaken the exact
+/// net DRAGON-717 paid for. The real defect's per-sample readings begin right at the old
+/// tolerance and climb, so a tolerance loose enough to absorb starvation absorbs a real
+/// desync with it, and the test would then be green on the one axis it exists to guard.
+///
+/// The per-sample cap is checked FIRST on purpose: one catastrophic sample also drags
+/// the mean over its own bound, so reaching the mean check at all means every sample was
+/// inside the cap, which is what makes the word "systematic" honest in that message.
+fn assert_video_content_timing(label: &str, min_samples: usize, samples: &[(f64, f64, f64)]) {
+    let floor = min_samples.max(1);
+    assert!(
+        samples.len() >= floor,
+        "{label}: expected at least {floor} video content-timing samples, got {}. The \
+         check measured nothing, which is not a pass",
+        samples.len()
+    );
+    let t = ContentTiming::of(samples);
+    let ContentTiming { n, mean, over, worst_media: wm, worst_err: werr } = t;
+    let (we, wd) = (wm, wm + werr);
+    eprintln!(
+        "{label}: {n} video content points, mean |error| {mean:.3}s, worst {werr:+.3}s at \
+         media {wm:.2}s (slot wants wall {we:.2}s, carries {wd:.2}s), {over} past \
+         {CONTENT_MEAN_ERROR_MAX:.2}s"
+    );
+
+    assert!(
+        t.sample_cap_cleared(),
+        "{label}: the video frame at media {wm:.2}s carries content captured {werr:+.3}s \
+         away from its own slot (slot wants wall {we:.2}s, decoded {wd:.2}s), past the \
+         per-sample cap of {CONTENT_SAMPLE_ERROR_MAX:.2}s. One frame this far out of place \
+         is a defect whatever the machine was doing. Read the SHAPE before chasing it: \
+         mean |error| over all {n} samples was {mean:.3}s, {over} of them past \
+         {CONTENT_MEAN_ERROR_MAX:.2}s. Every sample late is DRAGON-717, the video pipe \
+         throttled behind the audio. A lone spike on an otherwise clean series means THE \
+         BOX WAS STARVED: a capture loop that misses ticks covers them with the freshest \
+         frame by design, which reads identically per frame (DRAGON-731 recorded 0.41s \
+         that way at load average 14.8 on 16 cores). Re-run this test ALONE on an idle \
+         machine before believing either diagnosis."
+    );
+    assert!(
+        t.mean_cleared(),
+        "{label}: the video content sits {mean:.3}s out of place ON AVERAGE across {n} \
+         sampled frames ({over} of them past {CONTENT_MEAN_ERROR_MAX:.2}s, worst \
+         {werr:+.3}s at media {wm:.2}s), against a bound of {CONTENT_MEAN_ERROR_MAX:.2}s. \
+         A SYSTEMATIC offset is the DRAGON-717 defect: ffmpeg throttles the video pipe \
+         behind the audio timestamps it has received, and `due_video_ticks` covers the \
+         missed ticks with the freshest frame, so every media slot carries content from \
+         its own future (measured then at mean 0.687s, max 1.461s; the fixed pipeline \
+         reads 0.041s). If instead only one or two samples are out and the rest are clean, \
+         suspect THE MACHINE and not the code: a CPU-starved box produces the same \
+         per-frame reading in isolated spikes (DRAGON-731). Re-run this test ALONE on an \
+         idle machine before believing a regression."
+    );
+}
+
+/// The two bounds, pinned against the shapes actually recorded in the field, so the
+/// claim that this change LOSES NO DETECTION POWER on DRAGON-717 is a test rather than
+/// an argument in a commit message. Needs no ffmpeg, no pulse and no recording.
+mod content_timing_tests {
+    use super::{
+        ContentTiming, DRAGON_717_BROKEN_MEAN, DRAGON_717_BROKEN_WORST, DRAGON_717_FIXED_MEAN,
+        DRAGON_731_STARVED_SPIKE,
+    };
+
+    /// The error `e` at media `m`, in this check's `(media, wanted wall, carried wall)`
+    /// shape. A healthy slot has `e == 0.0`.
+    fn at(m: f64, e: f64) -> (f64, f64, f64) {
+        (m, m, m + e)
+    }
+
+    /// One sample per second, each carrying the same error: the SYSTEMATIC shape.
+    fn flat(n: usize, e: f64) -> Vec<(f64, f64, f64)> {
+        (0..n).map(|k| at(2.0 + k as f64, e)).collect()
+    }
+
+    #[test]
+    fn a_healthy_series_clears_both_bounds() {
+        let t = ContentTiming::of(&flat(8, DRAGON_717_FIXED_MEAN));
+        assert!(t.sample_cap_cleared() && t.mean_cleared(), "{t:?}");
+        assert_eq!(t.over, 0);
+    }
+
+    /// The load-bearing one. The DRAGON-717 defect must still fail, on BOTH bounds, so
+    /// the fix cannot be quietly trading detection power for quiet.
+    #[test]
+    fn the_dragon_717_defect_still_fails_on_both_bounds() {
+        let mut series = flat(8, DRAGON_717_BROKEN_MEAN);
+        series[3] = at(5.0, DRAGON_717_BROKEN_WORST);
+        let t = ContentTiming::of(&series);
+        assert!(!t.mean_cleared(), "the mean bound must reject a systematic shift: {t:?}");
+        assert!(!t.sample_cap_cleared(), "the per-sample cap must reject 1.461s: {t:?}");
+        // And so would the OLD per-sample tolerance, which is why moving the number to
+        // the series is not a loosening: every sample here is past it.
+        assert_eq!(t.over, t.n);
+    }
+
+    /// The false positive that opened DRAGON-731: one starvation spike on an otherwise
+    /// healthy E2E-6-sized series. The OLD per-sample tolerance rejected this; both new
+    /// bounds must accept it.
+    #[test]
+    fn one_starvation_spike_passes_where_the_old_tolerance_failed() {
+        let mut series = flat(8, DRAGON_717_FIXED_MEAN);
+        series[0] = at(2.0, DRAGON_731_STARVED_SPIKE);
+        let t = ContentTiming::of(&series);
+        assert_eq!(t.over, 1, "exactly the one sample the old per-sample bound rejected");
+        assert!(t.sample_cap_cleared() && t.mean_cleared(), "{t:?}");
+    }
+
+    /// A much larger cap is still a cap: one catastrophic frame fails on its own, with
+    /// the rest of the series clean, and it fails on the SAMPLE bound, which is why that
+    /// bound is checked first (its message is the honest one for this shape).
+    #[test]
+    fn one_catastrophic_frame_still_fails_alone() {
+        let mut series = flat(8, DRAGON_717_FIXED_MEAN);
+        series[5] = at(7.0, 2.0);
+        let t = ContentTiming::of(&series);
+        assert!(!t.sample_cap_cleared(), "{t:?}");
+    }
+
+    /// How much starvation the mean bound absorbs on E2E-6's short series, stated as a
+    /// fact rather than left to arithmetic: four of eight samples may spike, five may
+    /// not. A box that far gone fails this test's audio checks anyway.
+    #[test]
+    fn the_mean_bound_absorbs_four_spikes_in_eight_and_not_five() {
+        let spiked = |k: usize| {
+            let mut series = flat(8, DRAGON_717_FIXED_MEAN);
+            for s in series.iter_mut().take(k) {
+                *s = at(s.0, DRAGON_731_STARVED_SPIKE);
+            }
+            ContentTiming::of(&series)
+        };
+        assert!(spiked(4).mean_cleared(), "{:?}", spiked(4));
+        assert!(!spiked(5).mean_cleared(), "{:?}", spiked(5));
+    }
 }
 
 /// E2E-6 (DRAGON-417 — the opening of a recording survives a slow start): the app
@@ -1498,17 +1811,21 @@ fn media_clock_recording_opening_survives_a_slow_start_e2e() {
             k as f64 / FPS as f64
         );
     }
+    // Past the opening span the file must carry LIVE content: the frame at media m is
+    // the frame captured at wall m. This samples once a second and then checks the
+    // SHAPE of the whole series rather than each point on its own; see
+    // `assert_video_content_timing` for why a per-sample tolerance was the wrong net
+    // (DRAGON-731). This session yields ~7 points, so 5 is the floor that still leaves
+    // a mean worth reading and cannot be met by a truncated file.
+    let mut content: Vec<(f64, f64, f64)> = Vec::new();
     let mut k = opening_frames + FPS as usize / 2;
     while k + 2 < s.levels.len() {
         let media = k as f64 / FPS as f64;
         let w = s.frame_wall(k).expect("decode frame marker");
-        assert!(
-            (w - media).abs() < 0.25,
-            "past the opening span, video frame {k} (media {media:.2}s) must be the \
-             frame captured at wall {media:.2}s; decoded {w:.2}s"
-        );
+        content.push((media, media, w));
         k += FPS as usize;
     }
+    assert_video_content_timing("E2E-6", 5, &content);
 
     let _ = std::fs::remove_file(&s.path);
 }
@@ -1585,6 +1902,7 @@ fn media_clock_pause_jump_cuts_both_streams_e2e() {
 
     // ---- VIDEO: no frame from inside a pause; every frame where the clock says ----
     let mut video_series: Vec<(f64, f64)> = Vec::new();
+    let mut video_content: Vec<(f64, f64, f64)> = Vec::new();
     // Skip the opening span (see `opening_span`): those frames are copies of the first
     // captured frame by design, not evidence about pause.
     let from_frame = ((s.opening_span() + 0.15) * FPS as f64).ceil() as usize;
@@ -1602,14 +1920,17 @@ fn media_clock_pause_jump_cuts_both_streams_e2e() {
         if seams.iter().any(|&c| (media - c).abs() < 2.0 / FPS as f64) {
             continue;
         }
-        assert!(
-            (w - s.wall_at_media(media)).abs() < 0.30,
-            "video frame {k} at media {media:.2}s should be the frame captured at wall \
-             {:.2}s; decoded {w:.2}s",
-            s.wall_at_media(media)
-        );
+        video_content.push((media, s.wall_at_media(media), w));
     }
     assert!(video_series.len() > 100, "expected a full video track, got {} frames", video_series.len());
+    // The same axis and the same hazard as E2E-6, so the same shape check (DRAGON-731).
+    // This one used to carry a 0.30s PER-SAMPLE tolerance; the series bound it moved to
+    // is 0.25s, so the aggregate is stricter than the point check it replaces. The
+    // inside-a-pause assertion above stays per-frame and hard, because a frame from
+    // inside a pause is a categorical defect and not a timing spike. The floor is 80
+    // and not the 100 asserted just above, because these samples are that track minus
+    // the seam-straddling frames the loop skips (three cycles, a handful each).
+    assert_video_content_timing("E2E-7", 80, &video_content);
 
     // ---- AUDIO: same two questions, asked of the chirp ----
     let mut audio_series: Vec<(f64, f64)> = Vec::new();
@@ -1817,7 +2138,7 @@ fn media_clock_opening_prime_reaches_the_muxer_promptly_e2e() {
 /// deterministic on any box with pactl; like its siblings it skips loudly without one.
 #[test]
 fn mic_tap_survives_its_spawning_threads_exit() {
-    let _guard = test_lock().lock().unwrap();
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _state = GlobalStateGuard;
     let Some(mic_sink) = NullSink::load("cckpdsigmic") else {
         eprintln!("SKIPPED: pactl/null-sink unavailable");

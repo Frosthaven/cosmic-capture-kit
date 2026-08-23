@@ -64,14 +64,22 @@ pub struct RecordingState {
     pub mic: bool,
     /// Whether system audio is armed (menu checkmark).
     pub system: bool,
+    /// DRAGON-693: which live-annotation tool the recording child currently has selected, so
+    /// the resident's Live Annotations submenu can carry the radio mark. Meaningless while
+    /// idle, where it is always the default.
+    pub ink: crate::ink::InkTool,
 }
 
 impl RecordingState {
     /// Encode as a single newline-terminated wire line the daemon parses.
     pub fn encode(&self) -> String {
         format!(
-            "state {} {} {} {}\n",
-            self.recording as u8, self.paused as u8, self.mic as u8, self.system as u8
+            "state {} {} {} {} {}\n",
+            self.recording as u8,
+            self.paused as u8,
+            self.mic as u8,
+            self.system as u8,
+            ink_word(self.ink)
         )
     }
 
@@ -83,20 +91,49 @@ impl RecordingState {
         if it.next()? != "state" {
             return None;
         }
-        let mut bit = || match it.next()? {
+        let bit = || match it.next()? {
             "0" => Some(false),
             "1" => Some(true),
             _ => None,
         };
-        let recording = bit()?;
-        let paused = bit()?;
-        let mic = bit()?;
-        let system = bit()?;
+        // Scoped so the closure's borrow of `it` ends before the tail is read below.
+        let (recording, paused, mic, system) = {
+            let mut bit = bit;
+            (bit()?, bit()?, bit()?, bit()?)
+        };
+        // DRAGON-693 added a FIFTH token, the live-annotation tool. Its absence is tolerated
+        // and reads as the default, deliberately: a resident from an older build is a process
+        // the user may not have restarted, and refusing its lines outright would take the whole
+        // menu's state down over one field. An UNKNOWN word is refused, though, because that is
+        // a garbled line rather than an older one.
+        let ink = match it.next() {
+            None => crate::ink::InkTool::default(),
+            Some(w) => ink_from_word(w)?,
+        };
         // Reject extra tokens so a longer future line can't be half-read as this one.
         if it.next().is_some() {
             return None;
         }
-        Some(RecordingState { recording, paused, mic, system })
+        Some(RecordingState { recording, paused, mic, system, ink })
+    }
+}
+
+/// The wire word for a live-annotation tool (DRAGON-693). One token, no spaces.
+fn ink_word(tool: crate::ink::InkTool) -> &'static str {
+    match tool {
+        crate::ink::InkTool::Pointer => "pointer",
+        crate::ink::InkTool::Marker => "marker",
+        crate::ink::InkTool::MagicMarker => "magic",
+    }
+}
+
+/// [`ink_word`]'s exact inverse; `None` for anything unrecognised.
+fn ink_from_word(word: &str) -> Option<crate::ink::InkTool> {
+    match word {
+        "pointer" => Some(crate::ink::InkTool::Pointer),
+        "marker" => Some(crate::ink::InkTool::Marker),
+        "magic" => Some(crate::ink::InkTool::MagicMarker),
+        _ => None,
     }
 }
 
@@ -114,6 +151,33 @@ pub enum Command {
     Stop,
     /// Cancel the recording and discard its file (the toolbar trash action).
     Cancel,
+    /// DRAGON-693: move the live-annotation selector to this tool. The tray's Live
+    /// Annotations submenu, relayed to the recording child.
+    ///
+    /// A wire word of its own rather than a toggle diff: the selector is a MODE with three
+    /// positions, and "set it to Marker" is not expressible as flips of some other
+    /// capability.
+    InkTool(crate::ink::InkTool),
+    /// DRAGON-693: clear every live-annotation mark at once. The submenu's "Clear Marks" row.
+    InkClear,
+    /// DRAGON-695: set BOTH audio arms to exactly this pair, whatever they are now.
+    ///
+    /// This variant's doc used to argue the opposite, that audio must stay a pair of toggle
+    /// diffs because the tray submenu could reduce a radio pick to
+    /// [`crate::recording_ui::audio_pick_live_actions`] over two existing verbs. That
+    /// argument only ever held for a caller that KNOWS the current arms, which the tray does
+    /// (the child streams its [`RecordingState`] to it) and a CLI process does not. `record
+    /// --sound mic` from a desktop hotkey has no snapshot to diff against, so expressing it
+    /// as toggles would mean asking, waiting for an answer this fire-and-forget wire has no
+    /// room for, and racing the user's own toolbar in between. An ABSOLUTE verb is the only
+    /// spelling that means the same thing whatever the recording was doing.
+    ///
+    /// The diff still happens, one layer up: the child feeds this to the SAME
+    /// `TrayEvent::AudioArms` arm the tray's radio pick lands on, which computes the flips
+    /// against its own live pair and runs each through the ordinary toggle handler. So
+    /// persistence, the meters, the push-to-talk rule and the tray refresh all behave exactly
+    /// as if the two toggles had been clicked by hand.
+    SetAudioArms(crate::recording_ui::AudioArmState),
 }
 
 impl Command {
@@ -125,6 +189,16 @@ impl Command {
             Command::ToggleSystemAudio => "system",
             Command::Stop => "stop",
             Command::Cancel => "cancel",
+            Command::InkTool(crate::ink::InkTool::Pointer) => "ink-pointer",
+            Command::InkTool(crate::ink::InkTool::Marker) => "ink-marker",
+            Command::InkTool(crate::ink::InkTool::MagicMarker) => "ink-magic",
+            Command::InkClear => "ink-clear",
+            Command::SetAudioArms(crate::recording_ui::AudioArmState::Both) => "audio-both",
+            Command::SetAudioArms(crate::recording_ui::AudioArmState::MicrophoneOnly) => {
+                "audio-mic"
+            }
+            Command::SetAudioArms(crate::recording_ui::AudioArmState::SystemOnly) => "audio-system",
+            Command::SetAudioArms(crate::recording_ui::AudioArmState::None) => "audio-none",
         }
     }
 
@@ -141,6 +215,22 @@ impl Command {
             "system" => Some(Command::ToggleSystemAudio),
             "stop" => Some(Command::Stop),
             "cancel" => Some(Command::Cancel),
+            "ink-pointer" => Some(Command::InkTool(crate::ink::InkTool::Pointer)),
+            "ink-marker" => Some(Command::InkTool(crate::ink::InkTool::Marker)),
+            "ink-magic" => Some(Command::InkTool(crate::ink::InkTool::MagicMarker)),
+            "ink-clear" => Some(Command::InkClear),
+            "audio-both" => {
+                Some(Command::SetAudioArms(crate::recording_ui::AudioArmState::Both))
+            }
+            "audio-mic" => {
+                Some(Command::SetAudioArms(crate::recording_ui::AudioArmState::MicrophoneOnly))
+            }
+            "audio-system" => {
+                Some(Command::SetAudioArms(crate::recording_ui::AudioArmState::SystemOnly))
+            }
+            "audio-none" => {
+                Some(Command::SetAudioArms(crate::recording_ui::AudioArmState::None))
+            }
             _ => None,
         }
     }
@@ -325,6 +415,24 @@ fn control_accept_loop(
     listener: &std::os::unix::net::UnixListener,
     tx: &std::sync::mpsc::Sender<Command>,
 ) {
+    accept_loop(listener, tx, Command::parse, "recording control", |c| c.as_str());
+}
+
+/// The blocking accept loop, over ANY one-word inlet protocol (DRAGON-695 generalised it out
+/// of [`control_accept_loop`] so the scanner's inlet could reuse it rather than grow a second
+/// copy of the bounds).
+///
+/// `decode` is the protocol; `what` and `describe` are only for the log lines. Every error is
+/// per-connection: a peer that speaks garbage, stalls or vanishes gets its connection dropped
+/// and the loop keeps serving the next one.
+#[cfg(target_os = "linux")]
+fn accept_loop<T>(
+    listener: &std::os::unix::net::UnixListener,
+    tx: &std::sync::mpsc::Sender<T>,
+    decode: fn(&str) -> Option<T>,
+    what: &str,
+    describe: fn(&T) -> &'static str,
+) {
     use std::io::{BufRead as _, Read as _};
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -339,15 +447,15 @@ fn control_accept_loop(
         if reader.read_line(&mut line).is_err() {
             continue;
         }
-        let Some(cmd) = Command::parse(&line) else {
+        let Some(cmd) = decode(&line) else {
             // Not one of our words. Ignored rather than misapplied, exactly as
             // `RecordingState::parse` ignores a malformed state line.
-            log::debug!("recording control: ignoring an unrecognised command line");
+            log::debug!("{what}: ignoring an unrecognised command line");
             continue;
         };
-        log::info!("recording control: {} received", cmd.as_str());
+        log::info!("{what}: {} received", describe(&cmd));
         if tx.send(cmd).is_err() {
-            // The recording ended and the App dropped its inlet: stop serving.
+            // The session ended and the App dropped its inlet: stop serving.
             return;
         }
     }
@@ -391,15 +499,149 @@ pub fn send_command(cmd: Command) -> Result<u32, String> {
 /// is testable against a socket in a temp dir, with no dependency on the real runtime dir.
 #[cfg(target_os = "linux")]
 fn send_to_recording(path: &str, cmd: Command) -> Result<(), String> {
+    send_line(path, &cmd.encode())
+}
+
+/// One newline-terminated line written at ONE socket path, bounded by [`SEND_TIMEOUT`].
+/// Shared by the recording inlet and the scanner inlet (DRAGON-695), so both get the same
+/// cloexec and the same bound.
+#[cfg(target_os = "linux")]
+fn send_line(path: &str, line: &str) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;
 
     let mut conn = UnixStream::connect(path).map_err(|e| format!("connect: {e}"))?;
     crate::preview_ipc::ensure_cloexec(&conn).map_err(|e| format!("cloexec: {e}"))?;
     conn.set_write_timeout(Some(SEND_TIMEOUT)).map_err(|e| format!("timeout: {e}"))?;
-    conn.write_all(cmd.encode().as_bytes()).map_err(|e| format!("write: {e}"))?;
+    conn.write_all(line.as_bytes()).map_err(|e| format!("write: {e}"))?;
     conn.flush().map_err(|e| format!("flush: {e}"))?;
     Ok(())
+}
+
+// -- The scanner overlay's control inlet (DRAGON-695) -------------------------
+//
+// `scan --action refresh` is the recording controls' shape, one feature over, and for the
+// same structural reason: on Linux the scanner overlay is on screen but a desktop-level key
+// cannot be delivered into it (COSMIC has no portal GlobalShortcuts interface), so the way to
+// reach it from a key is to run this binary again and have that process find the scanner.
+//
+// The address is the per-pid marker namespace `instance.rs` already owns:
+//
+// ```text
+// {runtime_dir}/cosmic-capture-kit.<pid>.scanner        <- the marker (discovery)
+// {runtime_dir}/cosmic-capture-kit.<pid>.scanner.sock   <- this socket (transport)
+// ```
+//
+// Fire and forget, bounded, one line per connection: everything the recording inlet decided
+// applies unchanged, which is why the accept loop and the sender above are now shared.
+// Linux-only for the same reason too; macOS and Windows keep their in-app scan button.
+
+/// A control the scanner overlay accepts from another process. One verb today; an enum
+/// anyway, so a second one is a wire WORD rather than a second protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum ScannerCommand {
+    /// Re-grab the screen and re-run the QR / OCR passes, exactly as pressing the scan
+    /// button again does.
+    Refresh,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl ScannerCommand {
+    /// The single wire word for this command.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScannerCommand::Refresh => "refresh",
+        }
+    }
+
+    /// Encode as a newline-terminated wire line the scanner reads.
+    pub fn encode(self) -> String {
+        format!("{}\n", self.as_str())
+    }
+
+    /// Parse one wire word/line back into a command; `None` for anything unknown.
+    pub fn parse(line: &str) -> Option<Self> {
+        match line.trim() {
+            "refresh" => Some(ScannerCommand::Refresh),
+            _ => None,
+        }
+    }
+}
+
+/// A bound scanner-control listener plus the channel its accept thread feeds. The
+/// [`ControlInlet`] twin, with the same `Drop`-unlinks-the-socket contract.
+#[cfg(target_os = "linux")]
+pub struct ScannerInlet {
+    path: String,
+    commands: std::sync::mpsc::Receiver<ScannerCommand>,
+}
+
+#[cfg(target_os = "linux")]
+impl ScannerInlet {
+    /// Take every command that has arrived since the last call. Non-blocking.
+    pub fn drain(&self) -> Vec<ScannerCommand> {
+        self.commands.try_iter().collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScannerInlet {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Begin accepting scanner-control commands for THIS process. The [`start_control_inlet`]
+/// twin, down to reclaiming a leftover socket at our own pid's path.
+#[cfg(target_os = "linux")]
+pub fn start_scanner_inlet() -> std::io::Result<ScannerInlet> {
+    use std::os::unix::net::UnixListener;
+
+    let path = crate::instance::scanner_socket_path(std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    crate::preview_ipc::ensure_cloexec(&listener)?;
+
+    let (tx, commands) = std::sync::mpsc::channel::<ScannerCommand>();
+    let spawned = std::thread::Builder::new()
+        .name("cck-scanner-control-ipc".into())
+        .spawn(move || {
+            accept_loop(&listener, &tx, ScannerCommand::parse, "scanner control", |c| c.as_str())
+        });
+    if let Err(e) = spawned {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(ScannerInlet { path, commands })
+}
+
+/// Send one [`ScannerCommand`] to the live scanner, if there is one. `Ok(pid)` names the
+/// process it reached; `Err` carries a sentence for a human, in the [`send_command`] shape.
+#[cfg(target_os = "linux")]
+pub fn send_scanner_command(cmd: ScannerCommand) -> Result<u32, String> {
+    let hosts = crate::instance::live_scanner_hosts();
+    if hosts.is_empty() {
+        return Err("no scanner is open".to_string());
+    }
+    let mut last: Option<String> = None;
+    for pid in hosts {
+        let path = crate::instance::scanner_socket_path(pid);
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        match send_line(&path, &cmd.encode()) {
+            Ok(()) => return Ok(pid),
+            Err(why) => {
+                log::info!("scanner control: pid {pid} did not take {}: {why}", cmd.as_str());
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(format!("the scanner could not be reached ({why})")),
+        None => Err("no scanner is listening for commands".to_string()),
+    }
 }
 
 /// Accumulate raw pipe bytes into complete newline-terminated lines. Pure; unit-tested
@@ -617,7 +859,7 @@ mod tests {
             for p in [false, true] {
                 for m in [false, true] {
                     for s in [false, true] {
-                        let st = RecordingState { recording: r, paused: p, mic: m, system: s };
+                        let st = RecordingState { recording: r, paused: p, mic: m, system: s, ..Default::default() };
                         let line = st.encode();
                         assert!(line.ends_with('\n'), "must be newline-terminated: {line:?}");
                         assert_eq!(RecordingState::parse(&line), Some(st), "round trip {st:?}");
@@ -667,7 +909,7 @@ mod tests {
         // Any recording state (incl. paused) keeps `recording` true, which is what makes
         // every renderer show the in-recording controls; the icon distinguishes live
         // recording from paused.
-        let rec = RecordingState { recording: true, paused: false, mic: true, system: false };
+        let rec = RecordingState { recording: true, paused: false, mic: true, system: false, ..Default::default() };
         assert_eq!(icon_state(&rec), IconState::Recording);
         let paused = RecordingState { paused: true, ..rec };
         assert!(paused.recording, "a paused recording is still in progress");
@@ -698,8 +940,8 @@ mod tests {
         let child_path = path.clone();
         let child = std::thread::spawn(move || {
             let mut conn = std::os::unix::net::UnixStream::connect(&child_path).expect("connect");
-            let s1 = RecordingState { recording: true, paused: false, mic: true, system: false };
-            let s2 = RecordingState { recording: true, paused: true, mic: true, system: true };
+            let s1 = RecordingState { recording: true, paused: false, mic: true, system: false, ..Default::default() };
+            let s2 = RecordingState { recording: true, paused: true, mic: true, system: true, ..Default::default() };
             conn.write_all(s1.encode().as_bytes()).unwrap();
             conn.write_all(s2.encode().as_bytes()).unwrap();
             conn.flush().unwrap();
@@ -720,11 +962,11 @@ mod tests {
         r.read_line(&mut l2).unwrap();
         assert_eq!(
             RecordingState::parse(&l1),
-            Some(RecordingState { recording: true, paused: false, mic: true, system: false })
+            Some(RecordingState { recording: true, paused: false, mic: true, system: false, ..Default::default() })
         );
         assert_eq!(
             RecordingState::parse(&l2),
-            Some(RecordingState { recording: true, paused: true, mic: true, system: true })
+            Some(RecordingState { recording: true, paused: true, mic: true, system: true, ..Default::default() })
         );
         writer.write_all(Command::Stop.encode().as_bytes()).unwrap();
         writer.flush().unwrap();

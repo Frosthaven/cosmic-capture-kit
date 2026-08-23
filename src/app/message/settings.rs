@@ -91,7 +91,7 @@ impl CaptureHotkeySlot {
     /// The argv that PERFORMS this slot's action, which is what a resident daemon spawns and
     /// what a desktop-level shortcut has to run (DRAGON-589).
     ///
-    /// The "(no editor)" twins are `<capture flag> --no-editor`: `--no-editor` is a MODIFIER
+    /// The "(no editor)" twins are `<capture flag> --no-editor`: `--skip-editor` is a MODIFIER
     /// rather than a mode, so it composes with the flag its twin uses alone.
     ///
     /// Both daemons keep their own copy of this table, because argv is their only channel to
@@ -107,13 +107,15 @@ impl CaptureHotkeySlot {
     #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
     pub fn flags(self) -> &'static [&'static str] {
         match self {
-            Self::AllInOne => &["--all-in-one"],
-            Self::ActiveWindow => &["--active-window"],
-            Self::ActiveMonitor => &["--active-monitor"],
-            Self::AllInOneNoEditor => &["--all-in-one", "--no-editor"],
-            Self::ActiveWindowNoEditor => &["--active-window", "--no-editor"],
-            Self::ActiveMonitorNoEditor => &["--active-monitor", "--no-editor"],
-            Self::ColorPicker => &["--color-picker"],
+            Self::AllInOne => &[crate::cli::parse::INTERNAL_ALL_IN_ONE],
+            Self::ActiveWindow => &["capture", "--active-window"],
+            Self::ActiveMonitor => &["capture", "--active-monitor"],
+            Self::AllInOneNoEditor => {
+                &[crate::cli::parse::INTERNAL_ALL_IN_ONE, "--skip-editor"]
+            }
+            Self::ActiveWindowNoEditor => &["capture", "--active-window", "--skip-editor"],
+            Self::ActiveMonitorNoEditor => &["capture", "--active-monitor", "--skip-editor"],
+            Self::ColorPicker => &["color", "--picker"],
         }
     }
 
@@ -175,15 +177,16 @@ mod capture_hotkey_slot_tests {
         }
     }
 
-    /// The flags a desktop shortcut runs, pinned exactly. These are the strings `main` parses,
-    /// so a typo here is a shortcut that opens a capture overlay instead of doing the thing.
+    /// The argv a desktop shortcut runs, pinned exactly, and then run through the REAL parser
+    /// so a typo here cannot become a shortcut that does nothing (or, before DRAGON-695, one
+    /// that opened a capture overlay instead of the thing it names).
     #[test]
-    fn each_slot_spells_the_flags_main_parses() {
+    fn each_slot_spells_an_argv_the_parser_accepts() {
         use CaptureHotkeySlot as S;
-        assert_eq!(S::AllInOne.flags(), ["--all-in-one"]);
-        assert_eq!(S::ActiveWindow.flags(), ["--active-window"]);
-        assert_eq!(S::ActiveMonitor.flags(), ["--active-monitor"]);
-        assert_eq!(S::ColorPicker.flags(), ["--color-picker"]);
+        assert_eq!(S::AllInOne.flags(), [crate::cli::parse::INTERNAL_ALL_IN_ONE]);
+        assert_eq!(S::ActiveWindow.flags(), ["capture", "--active-window"]);
+        assert_eq!(S::ActiveMonitor.flags(), ["capture", "--active-monitor"]);
+        assert_eq!(S::ColorPicker.flags(), ["color", "--picker"]);
         // A "(no editor)" twin is its original plus the modifier, in that order, and never
         // anything else: the daemons spawn exactly this and the two must not drift.
         for (twin, original) in [
@@ -191,20 +194,33 @@ mod capture_hotkey_slot_tests {
             (S::ActiveWindowNoEditor, S::ActiveWindow),
             (S::ActiveMonitorNoEditor, S::ActiveMonitor),
         ] {
-            assert_eq!(twin.flags(), [original.flags()[0], "--no-editor"], "{twin:?}");
-            assert_eq!(original.flags().len(), 1, "{original:?}");
+            let mut expected: Vec<&str> = original.flags().to_vec();
+            expected.push("--skip-editor");
+            assert_eq!(twin.flags(), expected.as_slice(), "{twin:?}");
+        }
+        // And every one of them parses to a LAUNCH. This is the pin that matters: the table
+        // above is only a spelling, and the parser is what a shortcut actually meets.
+        for slot in S::ALL {
+            let argv: Vec<String> = std::iter::once("cosmic-capture-kit")
+                .chain(slot.flags().iter().copied())
+                .map(String::from)
+                .collect();
+            assert!(
+                matches!(crate::cli::parse(&argv), Ok(crate::cli::Plan::Launch(_))),
+                "{slot:?} must spell a launch"
+            );
         }
     }
 
-    /// A slot never has an empty flag list and never a short-form flag: `main` matches these
-    /// by exact token, and an empty argv would launch the bare picker.
+    /// A slot never has an empty argv, and every token past the command word is a long flag:
+    /// the parser matches by exact token, and an empty argv would be a bare launch.
     #[test]
     fn no_slot_launches_with_nothing() {
         for slot in CaptureHotkeySlot::ALL {
             assert!(!slot.flags().is_empty(), "{slot:?}");
             assert!(!slot.label().is_empty(), "{slot:?}");
-            for f in slot.flags() {
-                assert!(f.starts_with("--"), "{slot:?} flag {f} must be a long flag");
+            for f in slot.flags().iter().skip(1) {
+                assert!(f.starts_with("--"), "{slot:?} option {f} must be a long flag");
             }
         }
     }
@@ -224,10 +240,11 @@ mod capture_hotkey_slot_tests {
         assert_eq!(S::AllInOne.immediate(), None);
         assert_eq!(S::AllInOneNoEditor.immediate(), None);
         assert_eq!(S::ColorPicker.immediate(), None);
-        // And the two axes agree: a slot is immediate exactly when its capture flag is one of
-        // the two `main` treats as picker-free.
+        // And the two axes agree: a slot is immediate exactly when its argv carries one of the
+        // two targets the parser resolves without a picker.
         for slot in S::ALL {
-            let by_flag = slot.flags()[0] == "--active-window" || slot.flags()[0] == "--active-monitor";
+            let by_flag = slot.flags().contains(&"--active-window")
+                || slot.flags().contains(&"--active-monitor");
             assert_eq!(slot.immediate().is_some(), by_flag, "{slot:?}");
         }
     }
@@ -612,6 +629,20 @@ pub enum SettingsMsg {
     SetActiveOpacity(f32),
     /// Settings: post-capture preview overlay dim opacity.
     SetPreviewOpacity(f32),
+    /// Settings: the DEFAULT pre-capture countdown, in seconds (DRAGON-695). The same value
+    /// the `timer <0-99>` command writes and the overlay's delay chips select from, edited as
+    /// free text so a value no chip offers is reachable from the settings window too.
+    SetCountdownSecs(String),
+    /// Settings: arm the microphone by default for new recordings (DRAGON-695).
+    ///
+    /// Distinct from `RecordingMsg::ToggleMic`, which is the LIVE arm during a session and
+    /// carries the meters, the push-to-talk rule and the tray refresh with it. This is the
+    /// persisted default a new recording starts from, and it is the settings-page twin of the
+    /// `sound <both|mic|system|none>` command.
+    SetRecordMicDefault(bool),
+    /// Settings: arm system audio by default for new recordings (DRAGON-695). The
+    /// [`Self::SetRecordMicDefault`] twin.
+    SetRecordSystemAudioDefault(bool),
     /// Settings: recording frame rate text field.
     SetRecordFps(String),
     /// Settings: recording target bitrate (Kbps).
@@ -711,7 +742,7 @@ pub enum SettingsMsg {
     /// purely to rebuild the view so the tick reverts by the clock, with no explicit clear.
     HealthCopyTick,
     /// Settings → Health → Debug: open the macOS permission-checker window
-    /// (`app::permissions`) from within Settings, rather than only via `--permissions`
+    /// (`app::permissions`) from within Settings, rather than only via `permissions`
     /// or missing-grant routing. Focuses it if already open. macOS-only, mirroring
     /// `PermissionsMsg`'s own cfg pattern; the row that fires this only renders on
     /// macOS, the sole platform with TCC grants to manage.
@@ -762,6 +793,9 @@ pub enum SettingsMsg {
     MicTestTick,
     /// Settings: toggle muting other apps' audio while a video preview plays.
     SetMuteOthersDuringPreview(bool),
+    /// Settings: toggle pausing other apps' media while a live-annotation tool is armed
+    /// during a recording (DRAGON-694).
+    SetPauseOthersDuringInk(bool),
     /// Settings: toggle ducking the recorded system audio under mic speech.
     SetDuckSystemAudio(bool),
     /// Appearance (DRAGON-139): follow the system theme (ON) vs use the overrides

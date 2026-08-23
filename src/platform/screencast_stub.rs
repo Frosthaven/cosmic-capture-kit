@@ -29,6 +29,9 @@ pub struct CastSession {
     pub fd: OwnedFd,
     pub streams: Vec<StreamInfo>,
     pub restore_token: Option<String>,
+    /// DRAGON-737's second PipeWire remote, for the Linux window tie-break. Never
+    /// constructed here, like every other field: the portal is Linux-only.
+    pub probe_fd: Option<OwnedFd>,
 }
 
 /// Why a cast request didn't yield a stream.

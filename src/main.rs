@@ -62,6 +62,13 @@ mod badge;
 // role again: the live canvas and the full-resolution bake must draw ONE parabola, so neither
 // owns the maths.
 mod arrow_curve;
+// Live recording annotation (DRAGON-691): the pure model behind drawing on the screen while a
+// recording runs: the Magic Marker's dissolve curve, the per-point timestamps that drive it,
+// the availability gate, the region clamp and the Linux input-zone rect subtraction. Crate
+// root next to `pen_stroke` for the same reason: it is shared by `app::ink`, the toolbar and
+// the ink widget, and belongs to none of them. The SURFACE and the platform work are
+// elsewhere; nothing here touches a toolkit, so `cargo test` proves it on every host.
+mod ink;
 mod platform;
 mod widgets;
 mod encode;
@@ -105,6 +112,12 @@ mod util;
 // silent-exit path is classified with, and states the privacy rule every new line must obey.
 // Read its module doc before adding a log line anywhere.
 mod diag;
+// The command line (DRAGON-695): `cli::parse` is the ONE table of flag spellings and the
+// only thing that reads the user's argv, plus the bodies of the one-shot commands it
+// dispatches (the diagnostics harness, the metadata dump, the A/V sync tools, the recording
+// controls, the scanner refresh). Read its module doc before touching `main`'s dispatch: it
+// records the flat-flag grammar this replaced, and why a parser that FELL THROUGH on an
+// argument it did not recognise was the shape behind three separate shipped bugs.
 mod cli;
 // Cloud accounts (DRAGON-482): the provider registry, the account store, the platform
 // keyring seam, and the curl transport that keeps every token out of
@@ -127,7 +140,8 @@ mod update;
 mod recording_ui;
 // The resident menu-bar DAEMON (macOS): a tiny AppKit-only process that owns the
 // menu-bar item + PrintScreen hotkey and spawns the full app as one-shot capture
-// children. A bare `resident` launch early-branches here (see `main`), never
+// children. A `tray` launch (and a bare GUI launch with the setting on) early-branches
+// here (see `main`), never
 // touching the iced/wgpu stack. cfg(macos) inside the module keeps Linux clean.
 #[cfg(target_os = "macos")]
 #[path = "platform/mac/daemon.rs"]
@@ -135,14 +149,14 @@ mod daemon;
 // The resident tray DAEMON (Windows, DRAGON-237): the full-parity port of the mac
 // menu-bar daemon — a tiny Win32-only process (NO iced/wgpu) owning a `Shell_NotifyIcon`
 // tray item with the same three-state icon + menu, a `RegisterHotKey` global capture
-// hotkey, and one-shot capture children. A bare `resident` launch early-branches here
+// hotkey, and one-shot capture children. A `tray` launch early-branches here
 // (see `main`). cfg(windows) inside the module keeps Linux/mac clean.
 #[cfg(target_os = "windows")]
 #[path = "platform/windows/daemon.rs"]
 mod daemon;
 // The resident system-tray RESIDENT (Linux, DRAGON-173): the full-parity port of the
 // mac daemon — a tiny process (NO iced/wgpu) owning ONE ksni StatusNotifierItem with the
-// same three-state icon + menu, spawning one-shot capture children. A bare `resident`
+// same three-state icon + menu, spawning one-shot capture children. A `tray`
 // launch early-branches here (see `main`). cfg(linux) inside the module keeps mac clean.
 #[cfg(target_os = "linux")]
 #[path = "platform/linux/daemon.rs"]
@@ -199,10 +213,20 @@ mod decoration_matrix_tests;
 /// that very worker (the capture oneshot), deadlocks the child forever: precisely the
 /// invisible-immortal-process failure this work exists to remove. A worker panic already
 /// reports itself through `ShotOutcome::WorkerDied` on the seam that awaits it.
+///
+/// DRAGON-709 added a second gate beside the main-thread one, shared with the Windows twin:
+/// `app::failure::crash_alert_warranted` withholds the dialog for std's own console-write
+/// panic. That was found on Windows, but the shape is identical here, a `println!` into a
+/// pipe whose reader has gone, and the alert would be just as wrong about the capture.
 #[cfg(target_os = "macos")]
 fn install_macos_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // DRAGON-709, decided before anything is written so the breadcrumb below is
+        // unaffected: std's own "could not write to the console" panic is logged like any
+        // other, and is the one panic that does not get a dialog.
+        let warranted =
+            app::failure::crash_alert_warranted(info.payload_as_str().unwrap_or_default());
         if let Some(home) = std::env::var_os("HOME") {
             let mut dir = std::path::PathBuf::from(home);
             dir.push("Library/Logs/cosmic-capture-kit");
@@ -213,18 +237,24 @@ fn install_macos_panic_hook() {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                // ONE formatted record, ONE `write_all` (DRAGON-709). `writeln!` issues a
+                // separate write per format fragment and an append is only atomic per CALL,
+                // so two panicking processes spliced their records mid-token: the file grew
+                // headers like `===== panic @ unix 58:1784484836` and timestamps that parse
+                // as 1969 and 6146. `diag::write_line` has always done it this way.
+                let record = format!("\n===== panic @ unix {ts} =====\n{info}\n{bt}\n");
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(dir.join("panic.log"))
                 {
-                    let _ = writeln!(f, "\n===== panic @ unix {ts} =====\n{info}\n{bt}");
+                    let _ = f.write_all(record.as_bytes());
                 }
             }
         }
         // The log is written FIRST, so the breadcrumb exists even if presenting the alert
         // goes wrong. The alert's own guards make this at most one dialog per process.
-        if objc2_foundation::MainThreadMarker::new().is_some() {
+        if warranted && objc2_foundation::MainThreadMarker::new().is_some() {
             let msg = app::failure::crash_alert();
             platform::mac::alert::show(&msg.title, &msg.body);
         }
@@ -308,11 +338,24 @@ fn maybe_forced_panic() {
     }
 }
 
+/// The hook itself. Its full rationale is the long block further up, which physically sits
+/// with [`windows_crash_alert_message`] because the two were written together.
+///
+/// DRAGON-709 added a SECOND gate beside the main-thread one:
+/// `app::failure::crash_alert_warranted` withholds the dialog for std's own console-write
+/// panic, which says nothing about the capture and cannot describe itself through the channel
+/// that just failed. That predicate is pure and unit-tested; its doc says why it is a backstop
+/// and not the fix.
 #[cfg(windows)]
 fn install_windows_panic_hook() {
     let default_hook = std::panic::take_hook();
     let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
+        // DRAGON-709, decided before anything is written so the breadcrumb below is
+        // unaffected: std's own "could not write to the console" panic is logged like any
+        // other, and is the one panic that does not get a dialog.
+        let warranted =
+            app::failure::crash_alert_warranted(info.payload_as_str().unwrap_or_default());
         if let Some(dir) = crate::util::app_config_dir()
             && std::fs::create_dir_all(&dir).is_ok()
         {
@@ -324,15 +367,19 @@ fn install_windows_panic_hook() {
                 .unwrap_or(0);
             let thread = std::thread::current();
             let tname = thread.name().unwrap_or("<unnamed>").to_string();
+            // ONE formatted record, ONE `write_all` (DRAGON-709). `writeln!` issues a
+            // separate write per format fragment and an append is only atomic per CALL, so
+            // two panicking processes spliced their records mid-token: the file grew headers
+            // like `===== panic @ unix 58:1784484836` and timestamps that parse as 1969 and
+            // 6146. `diag::write_line` has always done it this way.
+            let record =
+                format!("\n===== panic @ unix {ts} (thread {tname}) =====\n{info}\n{bt}\n");
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(dir.join("panic.log"))
             {
-                let _ = writeln!(
-                    f,
-                    "\n===== panic @ unix {ts} (thread {tname}) =====\n{info}\n{bt}"
-                );
+                let _ = f.write_all(record.as_bytes());
             }
         }
         // The log is written FIRST, so the breadcrumb exists even if presenting the alert
@@ -342,7 +389,8 @@ fn install_windows_panic_hook() {
         // session already put an alert up — a session that reported a failure and THEN
         // panicked gets one box, not two, which is the DRAGON-436 latch doing its job — and
         // then there is nothing to wait for.
-        if std::thread::current().id() == main_thread
+        if warranted
+            && std::thread::current().id() == main_thread
             && let msg = windows_crash_alert_message()
             && let Some(dismissal) = platform::windows::alert::show(&msg.title, &msg.body)
         {
@@ -408,7 +456,7 @@ fn first_set_env<'a>(names: &[&'a str], is_set: impl Fn(&str) -> bool) -> Option
 /// dual-vendor box that means Mesa's `libvulkan_radeon` + `libLLVM` (32.5 MB RSS
 /// / 8.6 MB PSS measured) stay resident purely to describe a GPU we never draw
 /// on. Naming the one driver we want in `VK_LOADER_DRIVERS_SELECT` took
-/// `--settings` from RSS 239.0 -> 204.2 MB and PSS 84.1 -> 75.7 MB.
+/// `settings` from RSS 239.0 -> 204.2 MB and PSS 84.1 -> 75.7 MB.
 ///
 /// This is deliberately SELF-DISABLING — every step below must positively
 /// succeed or we do nothing at all, because a wrong pin is far worse than the
@@ -689,17 +737,22 @@ pub(crate) fn compositor_main_device() -> Option<u64> {
 
 fn main() -> cosmic::iced::Result {
     // DRAGON-229: make the process Per-Monitor-Aware-V2 BEFORE any screen measurement
-    // (the CLI `--test` diagnostics + capture run before winit's own DPI-aware call, so
+    // (the `debug test` diagnostics + capture run before winit's own DPI-aware call, so
     // we can't rely on it). Must be the first statement; idempotent w.r.t. winit's later
     // Once-guarded call. Byte-identical for Linux/mac (cfg-gated one-liner).
     #[cfg(windows)]
     platform::windows::dpi::ensure_process_dpi_aware();
     // DRAGON-233 fix 1: with the GUI subsystem above, a terminal launch has no console
     // of its own — attach to the parent's (a no-op on a GUI/shortcut launch, which is
-    // what keeps it console-free) so `--help` / `--test` / diagnostics still print.
+    // what keeps it console-free) so `--help` / `debug test` / diagnostics still print.
     // First-thing, before any output; redirected streams (pipe / file) are preserved.
+    // DRAGON-695: it also REPORTS whether a console was found, which is Windows' only honest
+    // answer to "was this launched from a terminal" (a GUI-subsystem process has no console of
+    // its own to ask). A bare launch turns on that answer; see `platform::launched_from_terminal`.
     #[cfg(windows)]
-    platform::windows::console::attach_parent_console();
+    let console_attached = platform::windows::console::attach_parent_console();
+    #[cfg(not(windows))]
+    let console_attached = false;
     util::timing_start();
     // DRAGON-419: install the logger. This is the FIRST logging statement of `main`, before
     // every subcommand return and before the resident-daemon branch, so that EVERY way of
@@ -727,20 +780,17 @@ fn main() -> cosmic::iced::Result {
     // children inherit the corrected env. Idempotent — a no-op for terminal launches.
     #[cfg(target_os = "macos")]
     platform::mac::env::normalize_path_env();
-    // The hidden test/diagnostic harnesses (benchmarks + capture/encode/audio probes)
-    // all dispatch through one `--test <name> [args]` entry point, keeping the binary's
-    // flag surface small. Genuine helpers (clipboard, notify, reveal, inspect, settings)
-    // stay first-class below.
+    // === INTERNAL PLUMBING, parsed before the subcommand grammar (DRAGON-695) ===
+    //
+    // Everything below this comment and above `cli::parse` is argv this app writes to ITSELF:
+    // the detached post-capture helpers, the cloud-upload child, the Windows toast URI, the
+    // babysitters and the update swapper. None of it is a user-facing command, none of it
+    // appears in the help, and every branch RETURNS, so the parser never sees these words.
+    //
+    // They stay flat flags on purpose. A subcommand grammar is for a human choosing what to
+    // do; these are one program handing a job to a copy of itself, where the argv is a private
+    // wire format and renaming it buys nothing but a compatibility window.
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return Ok(());
-    }
-    if let Some(i) = args.iter().position(|a| a == "--test") {
-        let name = args.get(i + 1).map(String::as_str).unwrap_or("");
-        cli::run_test(name, &args[(i + 2).min(args.len())..]);
-        return Ok(());
-    }
     // Hidden post-capture helpers (a separate, single-threaded process for each).
     let after = |flag: &str| {
         args.iter()
@@ -776,8 +826,7 @@ fn main() -> cosmic::iced::Result {
     // must be free to close while the transfer finishes.
     //
     // It sits HERE, with the other helpers, and returns either way, so it is already gone
-    // before the three resident-daemon `bare` checks further down, and none of them needs
-    // to learn this flag. Nothing is logged about the file beyond `diag::path_shape`, and
+    // before the grammar further down, so the parser never sees it. Nothing is logged about the file beyond `diag::path_shape`, and
     // the account id and the session id (DRAGON-490) are both random hex that identifies
     // nothing about the user.
     if let Some(p) = after(share::reexec::CLOUD_UPLOAD) {
@@ -808,7 +857,7 @@ fn main() -> cosmic::iced::Result {
             // a safer place for a credential than the log is. A stderr line lands in a
             // journal, a terminal's scrollback, or a screenshot of the terminal.
             let safe = diag::redact_oauth(&e);
-            eprintln!("--cloud-upload: {safe}");
+            crate::errln!("--cloud-upload: {safe}");
             log::warn!("cloud upload: {safe}");
         }
         return Ok(());
@@ -816,8 +865,8 @@ fn main() -> cosmic::iced::Result {
     // DRAGON-450 (Windows): clicking a capture toast activates us through our OWN URI
     // scheme (`activationType="protocol"` — no COM activator), so the click arrives as a
     // bare URI argument rather than a flag. It is the same helper job as `--reveal` above
-    // and belongs in the same place: before any GUI init, before the resident-daemon
-    // branch.
+    // and belongs in the same place: before any GUI init and before the grammar (a bare
+    // positional URI is not a command, and the parser would rightly refuse it).
     //
     // The branch is taken on the SCHEME and returns either way. A stale toast — clicked
     // long after its capture was moved or deleted — must end here as a no-op; falling
@@ -833,46 +882,10 @@ fn main() -> cosmic::iced::Result {
         }
         return Ok(());
     }
-    if let Some(p) = after("--inspect") {
-        cli::inspect(&p);
-        return Ok(());
-    }
-    // A/V-sync calibration subcommands (one-shot, no GUI): write the reference
-    // clip / measure a recording of it. Parsed positionally (not via `after`) so
-    // a missing/optional argument can't fall through into a GUI launch.
-    if let Some(i) = args.iter().position(|a| a == "--make-sync-clip") {
-        let path = args.get(i + 1).filter(|a| !a.starts_with("--")).map(String::as_str);
-        cli::make_sync_clip(path);
-        return Ok(());
-    }
-    if let Some(i) = args.iter().position(|a| a == "--calibrate-sync") {
-        let file = args
-            .get(i + 1)
-            .filter(|a| !a.starts_with("--"))
-            .map(std::path::PathBuf::from);
-        cli::calibrate_sync(file.as_deref(), args.iter().any(|a| a == "--apply"));
-        return Ok(());
-    }
     if args.iter().any(|a| a == "--focus-settings") {
         // Detached helper: focus the already-open settings window (by title) so
         // the activation survives the launching instance exiting.
         platform::compositor::activate_title(app::WINDOW_TITLE);
-        return Ok(());
-    }
-    // Recording CONTROL commands (DRAGON-583): drive a recording that is already running,
-    // from a second process. This is what a Linux desktop-level global hotkey binds, the
-    // same way one already binds `--region`, because on Linux an in-app shortcut cannot
-    // reach a recording at all: COSMIC's portal has no GlobalShortcuts interface, and at
-    // record start the app deliberately hands keyboard focus back to the window being
-    // recorded (a native session) or destroys its one toplevel (the portal fallback).
-    //
-    // It sits HERE, with the other one-shot helpers, and RETURNS either way. Returning is
-    // the load-bearing part: an argument this early parse does not recognise falls all the
-    // way through to a normal launch and silently opens a capture overlay, which is the
-    // last thing a "pause my recording" key should do. It is also before the three
-    // resident-daemon `bare` checks below, so none of them needs to learn these flags.
-    if let Some(cmd) = cli::recording_command_from_args(&args) {
-        cli::run_recording_command(cmd);
         return Ok(());
     }
     // The banner's wording rides the helper's own argv (DRAGON-450): which flag launched
@@ -898,8 +911,8 @@ fn main() -> cosmic::iced::Result {
     // Windows in-app updater (DRAGON-287): the detached MSI swap helper. A temp COPY of this
     // exe is re-launched as `--update-swap <msi> <installed-exe> <log>`; it waits for the app
     // + daemon to exit, runs `msiexec /i <msi> /qn` (per-user, no UAC), then relaunches. Runs
-    // HERE — before the resident-daemon early-branch below (which would otherwise mistake this
-    // flagged launch for a bare one) and before any GUI init.
+    // HERE — before the grammar below (which does not know this internal flag) and before any
+    // GUI init.
     #[cfg(windows)]
     if let Some(i) = args.iter().position(|a| a == platform::windows::update_install::SWAP_FLAG) {
         platform::windows::update_install::run_swap(&args[i + 1..]);
@@ -914,215 +927,366 @@ fn main() -> cosmic::iced::Result {
         platform::mac::window::run_restore_aerospace();
         return Ok(());
     }
-    // macOS resident DAEMON (DRAGON-130): a BARE launch (no capture-mode / settings /
-    // preview / worker flag) with the persisted `resident` setting on runs the tiny
-    // AppKit-only menu-bar daemon and NEVER touches the iced/wgpu GUI stack — that is
-    // what keeps the resident idle footprint at ~15-40MB instead of the ~440MB the old
-    // in-app resident idle cost. All worker/subcommand flags above already returned, so
-    // reaching here means this is a launch that WOULD open the GUI; gate the daemon on
-    // it being bare + resident. Every other launch (capture flags, `--settings`,
-    // `--preview`, or non-resident) falls through to `app::run` exactly as before.
-    // A capture-mode flag is "capture NOW" intent, so it must NOT start the daemon —
-    // it spawns a one-shot capture app, same as a daemon-spawned child.
+    // DRAGON-427 (Windows 10): this process IS the preview EDITOR for a capture another
+    // process just took. The argument is one `preview_ipc::OpenRequest` line — the very same
+    // wire format the unix socket handoff sends — so the document opens with the capture's
+    // own fields (dims, scale, size, and `external=0`, which is what makes the editor treat
+    // the file as ours to manage) rather than as a bare viewer.
+    //
+    // Spawning is the transport here, not a socket: the capture child creates this process
+    // rather than finding one already running, so there is nothing to connect to and no ack
+    // to wait for. It CREATES the first host — once open, later captures can reach it over
+    // `preview_ipc`'s named pipes (DRAGON-651), but nothing can create a host by connecting
+    // to one, so this spawn route stays.
+    //
+    // A malformed line is a hard error rather than a fallback: only our own capture child
+    // ever writes one, so a bad line means the two halves disagree and silently opening
+    // something slightly different would be exactly the wrongness the wire format's strict
+    // parser exists to prevent.
+    //
+    // It is INTERNAL plumbing, so it is read here rather than by the grammar (DRAGON-695):
+    // no user types a serialized wire line at a shell, and the parser would have to reject it
+    // as an unknown command if it ever reached one.
+    if let Some(line) = after("--preview-handoff") {
+        let line = line.to_string_lossy().into_owned();
+        match crate::preview_ipc::OpenRequest::parse(&line) {
+            Ok(req) => {
+                if !req.path.is_file() {
+                    crate::errln!("--preview-handoff: file not found: {}", req.path.display());
+                    std::process::exit(1);
+                }
+                return run_gui(
+                    app::Startup {
+                        // The editor is ALWAYS the windowed variant on Windows 10 (this
+                        // flag's only user): the overlay one would need the software
+                        // rasterizer that cannot draw the preview's `iced::widget::shader`
+                        // layers at all.
+                        preview_windowed: Some(true),
+                        preview_handoff: Some(req),
+                        ..Default::default()
+                    },
+                    false,
+                );
+            }
+            Err(e) => {
+                crate::errln!("--preview-handoff: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // === THE SUBCOMMAND GRAMMAR (DRAGON-695) ===
+    //
+    // Every branch above returned without touching a GUI. From here the argv is the USER's,
+    // and `cli::parse` is the only thing that reads it: one pure function, one table of
+    // spellings, and no fall-through. What that replaced — a flat bag of flags, three
+    // near-duplicate per-platform "is this launch bare?" lists, and an unknown word quietly
+    // opening a capture overlay — is written up in `cli/parse.rs`'s module doc, along with the
+    // two shipped bugs that came out of it.
+    let plan = match cli::parse(&args) {
+        Ok(plan) => plan,
+        Err(e) => {
+            // Both channels, like every other command here: stderr for the person who typed
+            // it, the debug log for a desktop hotkey that has no terminal at all. The message
+            // is our own copy and names no path.
+            //
+            // `debug!` rather than `warn!` for the log half, and only here. The default
+            // stderr filter is `warn`, so a `warn!` would print the SAME line twice to the
+            // same terminal, and a usage error is the one failure that is nearly always read
+            // at a terminal. The debug log still records it (our records at `debug` and above
+            // go to the file), which is what a desktop hotkey with a stale argv needs.
+            eprintln!("{}", e.message);
+            log::debug!("{}", e.message);
+            std::process::exit(e.code);
+        }
+    };
+    // Only a BARE launch asks this; see that arm below for why it is the question.
+    let terminal = platform::launched_from_terminal(console_attached);
+    let launch = match plan {
+        cli::Plan::Help => {
+            println!("{}", cli::parse::HELP);
+            return Ok(());
+        }
+        cli::Plan::Version => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        cli::Plan::SetTimer(secs) => {
+            run_set_timer(secs);
+            return Ok(());
+        }
+        cli::Plan::SetSound(arms) => {
+            run_set_sound(arms);
+            return Ok(());
+        }
+        cli::Plan::ScanRefresh => {
+            cli::run_scan_refresh();
+            return Ok(());
+        }
+        cli::Plan::RecordControl(cmds) => {
+            cli::run_recording_commands(&cmds);
+            return Ok(());
+        }
+        cli::Plan::Debug(plan) => {
+            run_debug(plan);
+            return Ok(());
+        }
+        // An EXPLICIT request for the resident, so it runs whether or not the persisted
+        // `resident` setting is on. That setting still gates autostart registration and what a
+        // bare GUI launch does; neither is a reason to refuse a direct command.
+        cli::Plan::Tray => run_resident(),
+        // A launch with no arguments at all, and the login-time bug DRAGON-695 fixes.
+        //
+        // It used to mean "capture NOW" on every platform, which is how a login item that
+        // raced the tray it was starting could end up asking the winner of that race for a
+        // capture: a region overlay on screen at login, with nobody having pressed anything.
+        // It now means one of three things, and never that one.
+        cli::Plan::Bare => {
+            if terminal {
+                // A shell, no arguments: this is someone asking what the program does.
+                println!("{}", cli::parse::HELP);
+                return Ok(());
+            }
+            if state::load().resident {
+                // A login item, Finder, the Start Menu, the Dock. With the tray turned on
+                // this is TRAY intent on EVERY platform and nothing else: become the
+                // resident, or find one already up and leave quietly.
+                run_resident();
+            }
+            // Tray off, so there is no resident to raise. The only thing a double-click can
+            // sensibly mean then is "show me the app", which is the settings window.
+            cli::parse::Launch { what: cli::parse::What::Settings, ..Default::default() }
+        }
+        cli::Plan::Launch(launch) => launch,
+    };
+    run_launch(launch)
+}
+
+/// Become the RESIDENT (the macOS menu-bar daemon, the Windows tray daemon, the Linux ksni
+/// resident), or leave quietly when one is already up.
+///
+/// The two ways in are the `tray` command and a bare GUI launch with the `resident` setting
+/// on. Both pass DAEMON intent, which is what keeps the bounded restart-handoff retry on the
+/// lock (`instance::daemon_lock_attempts`): a tray restarting itself has to be able to wait
+/// out the outgoing process.
+///
+/// **It never asks a live daemon for a capture.** That is the whole DRAGON-695 fix: the old
+/// bare-launch branch treated a held lock as "somebody already has the tray, so this launch
+/// must have wanted a picture", which was never true of a login item and was the cause of the
+/// phantom overlay at login.
+fn run_resident() -> ! {
+    // DRAGON-419: from here on this pid's lines read `daemon`, which is what lets a reader
+    // untangle the long-lived tray process from the one-shot capture children it spawns into
+    // the same shared file.
+    diag::mark_component(diag::Component::Daemon);
     #[cfg(target_os = "macos")]
-    {
-        let bare = !args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "--settings"
-                    | "--permissions"
-                    | "--region"
-                    | "--window"
-                    | "--monitor"
-                    | "--all-in-one"
-                    | "--active-window"
-                    | "--active-monitor"
-                    | "--no-editor"
-                    | "--image"
-                    | "--video"
-                    | "--scan"
-                    | "--scanner"
-                    | "--countdown"
-                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
-                    // exactly like a capture. Missing here it read as BARE, so with the
-                    // tray on it ran the resident branch, found the daemon lock held,
-                    // signalled "capture now" and exited: the user got a region overlay
-                    // instead of the picker.
-                    | "--color-picker"
-                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
-                    // picker's own window), so it is non-bare for the same reason.
-                    | "--palette-viewer"
-                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
-                    // modifier (like --no-editor), never a resident trigger.
-                    | "--audio"
-                    | "--overlay"
-            )
-        });
-        // `--preview <file>` set `after("--preview")` below; a bare check for the flag
-        // presence covers it here without consuming the value.
-        // DRAGON-427 adds `--preview-handoff` (the spawned editor child) to the same
-        // check: a resident install must not read an editor launch as a bare one.
-        let bare = bare
-            && !args.iter().any(|a| a == "--preview" || a == "--preview-handoff");
-        if bare && state::load().resident {
-            // DRAGON-419: from here on this pid's lines read `daemon`, which is what lets a
-            // reader untangle the long-lived menu-bar process from the one-shot capture
-            // children it spawns into the same shared file.
-            diag::mark_component(diag::Component::Daemon);
-            // Intent from the argv shape, exactly as the Linux and Windows branches below do
-            // (DRAGON-473). Until then this branch alone passed nothing, so the mac daemon
-            // could not tell a launch-at-login `resident` from a capture keypress once it
-            // found its lock already held, and answered both with a capture.
-            let daemon_intent = instance::daemon_intent_from_args(&args);
-            daemon::run(daemon_intent); // never returns — runs the AppKit run loop or exits
-        }
-    }
-    // Linux resident RESIDENT (DRAGON-173): the full-parity counterpart of the mac
-    // branch above. A BARE launch (no capture-mode / settings / preview / worker flag)
-    // with the persisted `resident` setting on runs the tiny ksni-tray resident and NEVER
-    // touches the iced/wgpu GUI stack — the same lightweight technique the mac daemon
-    // uses. Every other launch (capture flags, `--settings`, `--preview`, or non-resident)
-    // falls through to `app::run` exactly as before. `--permissions` is macOS-only, so it
-    // is not in the Linux bare check. Byte-identical to a bare launch when `resident` is
-    // off (the historical Linux default).
+    daemon::run(true); // never returns — runs the AppKit run loop or exits
     #[cfg(target_os = "linux")]
-    {
-        let bare = !args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "--settings"
-                    | "--region"
-                    | "--window"
-                    | "--monitor"
-                    // DRAGON-295: the picker-free immediate captures + All In One are GUI
-                    // capture launches (a COSMIC custom shortcut runs them), NOT resident
-                    // triggers — treat them as non-bare so they reach `app::run`.
-                    | "--all-in-one"
-                    | "--active-window"
-                    | "--active-monitor"
-                    | "--no-editor"
-                    | "--image"
-                    | "--video"
-                    | "--scan"
-                    | "--scanner"
-                    | "--countdown"
-                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
-                    // exactly like a capture. Missing here it read as BARE, so with the
-                    // tray on it ran the resident branch, found the daemon lock held,
-                    // signalled "capture now" and exited: the user got a region overlay
-                    // instead of the picker.
-                    | "--color-picker"
-                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
-                    // picker's own window), so it is non-bare for the same reason.
-                    | "--palette-viewer"
-                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
-                    // modifier (like --no-editor), never a resident trigger.
-                    | "--audio"
-                    | "--overlay"
-                    | "--preview"
-                    // DRAGON-427: the spawned preview EDITOR child. Without it here a
-                    // resident install would read the editor launch as bare and run the
-                    // tray daemon instead of opening the capture the user just took.
-                    | "--preview-handoff"
-            )
-        });
-        if bare && state::load().resident {
-            // Intent from the argv shape (DRAGON-180): the autostart entry launches
-            // with a literal `resident` argument (daemon-intent: keep the restart-
-            // handoff lock retry); a truly bare launch is the global hotkey asking
-            // to capture (single lock attempt, signal the live daemon immediately).
-            // DRAGON-465 moved the rule itself into `instance` so every launcher that
-            // spawns this binary reads the same one; the answer here is unchanged.
-            let daemon_intent = instance::daemon_intent_from_args(&args);
-            // DRAGON-419: re-tag this pid's lines as the resident (see the mac branch).
-            diag::mark_component(diag::Component::Daemon);
-            daemon_linux::run(daemon_intent); // never returns — runs the tray loop or exits
-        }
-    }
-    // Windows resident tray DAEMON (DRAGON-237): the full-parity counterpart of the mac /
-    // Linux branches above. A BARE launch (no capture-mode / settings / preview / worker
-    // flag) with the persisted `resident` setting on runs the tiny Win32 tray daemon and
-    // NEVER touches the iced/wgpu stack — the same lightweight technique. Every other launch
-    // falls through to `app::run` exactly as before. `--permissions` is macOS-only, so it is
-    // not in the Windows bare check. DRAGON-296: `resident` now defaults ON on Windows (matching
-    // macOS — the tray owns the global capture hotkey), so a fresh install's bare launch runs the
-    // daemon; a user who turns the tray off falls through to the historical "bare launch opens the
-    // capture overlay" behaviour. The daemon takes its own lock and, if one is already up, signals
-    // it to capture and exits (the mac "capture NOW" UX).
+    daemon_linux::run(true); // never returns — runs the tray loop or exits
     #[cfg(target_os = "windows")]
     {
-        let bare = !args.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "--settings"
-                    | "--region"
-                    | "--window"
-                    | "--monitor"
-                    | "--all-in-one"
-                    | "--active-window"
-                    | "--active-monitor"
-                    | "--no-editor"
-                    | "--image"
-                    | "--video"
-                    | "--scan"
-                    | "--scanner"
-                    | "--countdown"
-                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
-                    // exactly like a capture. Missing here it read as BARE, so with the
-                    // tray on it ran the resident branch, found the daemon lock held,
-                    // signalled "capture now" and exited: the user got a region overlay
-                    // instead of the picker.
-                    | "--color-picker"
-                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
-                    // picker's own window), so it is non-bare for the same reason.
-                    | "--palette-viewer"
-                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
-                    // modifier (like --no-editor), never a resident trigger.
-                    | "--audio"
-                    | "--overlay"
-                    | "--preview"
-                    // DRAGON-427: the spawned preview EDITOR child. Without it here a
-                    // resident install would read the editor launch as bare and run the
-                    // tray daemon instead of opening the capture the user just took.
-                    | "--preview-handoff"
-            )
-        });
-        if bare && state::load().resident {
-            // Intent from the argv shape (DRAGON-180, mirroring the Linux branch above):
-            // the autostart entry and the resident toggle launch with a literal `resident`
-            // argument (daemon-intent — keep the restart-handoff lock retry); a truly bare
-            // launch is the user asking to CAPTURE (one lock attempt, then hand the request
-            // to the live daemon).
-            // DRAGON-465: the rule now lives in `instance`, because a launcher that gets it
-            // wrong asks for a capture without meaning to — which is exactly what the
-            // post-update relaunch was doing (see `update::post_update_relaunch_args`).
-            let daemon_intent = instance::daemon_intent_from_args(&args);
-            // DRAGON-438: THE choke point. Either we become the daemon, or a live daemon
-            // acknowledged taking this capture (and `claim_or_signal` exited), or we fall
-            // through below to a one-shot capture. What used to happen instead was a silent
-            // `exit(0)` on any held lock, which turned every capture launch into a no-op
-            // whenever the daemon was wedged. These launcher-side lines stay tagged `app` —
-            // this process is not the daemon unless the call says so.
-            if daemon::claim_or_signal(daemon_intent) {
-                // DRAGON-419: re-tag this process's debug-log lines as the DAEMON before its
-                // message loop takes over, so the shared file distinguishes the long-lived tray
-                // process from the one-shot capture children it spawns (see the mac branch).
-                diag::mark_component(diag::Component::Daemon);
-                // Never returns — runs the Win32 message loop or exits. A capture-intent
-                // launch that became the daemon still owes the user their overlay
-                // (DRAGON-181's rule, which Linux has had all along).
-                daemon::run(!daemon_intent);
+        // DRAGON-438's takeover, with DRAGON-695's ending. `claim_or_signal(true)` is the
+        // ProbeOnly path: it asks a live daemon only whether it is still pumping, hands it no
+        // work, and takes the lock itself if that daemon is wedged.
+        if daemon::claim_or_signal(true) {
+            // `false`: a tray launch owes the user no capture overlay.
+            daemon::run(false);
+        }
+        // A healthy daemon is already up. Nothing to do and nothing to say to the user: the
+        // tray they asked for is on screen. This used to fall through to a one-shot capture.
+        log::info!("tray: a resident is already running; this launch has nothing to do");
+        std::process::exit(0);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        eprintln!("tray: this platform has no tray resident");
+        log::warn!("tray: this platform has no tray resident");
+        std::process::exit(1);
+    }
+}
+
+/// `timer [0-99]`: write the persisted default countdown, or print the current one.
+///
+/// The value is EXACT seconds (DRAGON-695), not one of the overlay's four chips, which is why
+/// the setting had to stop being an index. `0` clears it; the chips light the nearest preset.
+///
+/// It prints the bare number, with no `s` suffix and no prose, for the reason [`run_set_sound`]
+/// gives: what a setting command prints has to be a value that command accepts.
+fn run_set_timer(secs: Option<u64>) {
+    let mut p = state::load();
+    let value = match secs {
+        None => p.countdown_secs,
+        Some(secs) => {
+            p.countdown_secs = secs;
+            state::save(&p);
+            secs
+        }
+    };
+    // Both paths print the SAME thing, and it is exactly the token this command accepts back
+    // (`timer 7`, never `timer 7s`). See `run_set_sound` for the rule and why it is a rule.
+    println!("timer: {value}");
+}
+
+/// `sound [both|mic|system|none]`: write the persisted default recording arms, or print them.
+///
+/// **What a setting command prints is a value that command accepts.** Both paths print through
+/// `AudioArmState::cli_word`, not the tray's `word()` UI copy, which is what this used to do:
+/// bare `sound` answered `sound: None` and a set answered `sound: Mic + System`, neither of
+/// which is a word the command takes. A user pasting back what they were just told got exit 2.
+///
+/// The same rule shapes [`run_set_timer`], which prints a bare number rather than `7s`. Two
+/// commands, one property: read it, type it back, get the same state.
+fn run_set_sound(arms: Option<recording_ui::AudioArmState>) {
+    let mut p = state::load();
+    let value = match arms {
+        None => recording_ui::AudioArmState::from_arms(p.record_mic, p.record_system_audio),
+        Some(arms) => {
+            let (mic, system) = arms.arms();
+            p.record_mic = mic;
+            p.record_system_audio = system;
+            state::save(&p);
+            arms
+        }
+    };
+    println!("sound: {}", value.cli_word());
+}
+
+/// The hidden `debug` namespace: the diagnostics harness and the one-shot tools. Never in the
+/// help, and never a GUI launch.
+fn run_debug(plan: cli::parse::DebugPlan) {
+    use cli::parse::DebugPlan;
+    match plan {
+        DebugPlan::Test { name, args } => cli::run_test(&name, &args),
+        DebugPlan::Inspect(file) => cli::inspect(&file),
+        DebugPlan::MakeSyncClip(path) => cli::make_sync_clip(path.as_deref()),
+        DebugPlan::CalibrateSync { file, apply } => cli::calibrate_sync(file.as_deref(), apply),
+        DebugPlan::CloudUpload { file, account, auto_share } => {
+            // The same body the editor's own detached child runs; only the argv differs (that
+            // one carries `share::reexec::CLOUD_UPLOAD`, read far above with the rest of the
+            // internal plumbing). A hand-run upload is unwatched: it mints no session id, so
+            // nothing cross-process is waiting on its progress.
+            if let Err(e) = cloud::child::run_cloud_upload(&file, &account, auto_share, "") {
+                let safe = diag::redact_oauth(&e);
+                crate::errln!("debug cloud-upload: {safe}");
+                log::warn!("cloud upload: {safe}");
             }
-            // Otherwise: no daemon could be reached AND none could be started. Fall through
-            // to `app::run` for a one-shot capture — the historical behaviour of a bare
-            // launch with the tray turned off. The worst case of a stuck daemon is now "the
-            // tray is broken", not "the app does nothing".
         }
     }
-    // DRAGON-336: every path from here on either returns without a GUI or ends in
-    // `app::run`, so this is the one spot that covers them all (the `--preview` arm
-    // below returns `app::run` itself). Self-disabling and Linux-only — see
-    // `pin_vulkan_icd` for the six conditions it insists on before touching anything.
+}
+
+/// Turn a parsed [`cli::parse::Launch`] into an `app::Startup` and run it.
+///
+/// This is where a plan that parsed cleanly can still fail, because these are the questions a
+/// pure parser may not ask: does the file exist, is this platform the one that has a
+/// permission checker, is a settings window already open somewhere, is a colour picker window
+/// already up. Each answers with a message and an exit code rather than opening something the
+/// user did not ask for.
+fn run_launch(launch: cli::parse::Launch) -> cosmic::iced::Result {
+    use cli::parse::What;
+
+    // The macOS permission checker is the one command with no meaning elsewhere. It must NOT
+    // fall through to an ordinary launch (the old `permissions` flag did exactly that off
+    // macOS, which is a capture overlay in answer to a question about permissions).
+    if matches!(launch.what, What::Permissions) && !cfg!(target_os = "macos") {
+        let why = "the permission checker is macOS only; this platform grants no TCC \
+                   permissions to check";
+        eprintln!("permissions: {why}");
+        log::warn!("permissions: {why}");
+        std::process::exit(1);
+    }
+
+    let mut startup = app::Startup {
+        mode: launch.mode,
+        kind: launch.kind(),
+        countdown_secs: launch.timer,
+        audio_arms: launch.sound,
+        immediate: launch.immediate,
+        no_editor: launch.skip_editor,
+        ..Default::default()
+    };
+    match &launch.what {
+        What::Screenshot | What::Recording | What::Scanner => {}
+        What::ColorPicker => startup.color_picker = true,
+        What::PaletteViewer => {
+            startup.palette_viewer = true;
+            // The single-window rule (DRAGON-613) is CROSS-PROCESS, so it has to be answered
+            // before this process pays for a GUI: if a picker window is already open anywhere,
+            // this launch asks it to come forward and exits, rather than putting a second one
+            // on screen. A refusal (no window, one mid-close, a build with no transport) falls
+            // through to the ordinary launch below, which is the same never-lose-it ladder
+            // every pick takes.
+            match crate::preview_ipc::send_raise_to_picker() {
+                Ok(pid) => {
+                    log::info!("color --viewer: the open picker window at pid {pid} came forward");
+                    return Ok(());
+                }
+                Err(e) => log::info!(
+                    "color --viewer: no open picker window took it ({e}); opening one here"
+                ),
+            }
+        }
+        What::Settings => {
+            startup.settings_only = true;
+            // Only one settings pane may exist (across all instances); a capture instance can
+            // still run alongside it (nothing else is locked).
+            if !instance::acquire_settings_lock() {
+                log::info!("settings already open; not opening another");
+                // macOS (DRAGON-153) / Windows (DRAGON-246): don't vanish silently — poke the
+                // live holder to COME FORWARD + un-hide its settings window (the daemon's
+                // "Settings" menu item lands here each click when a pane is already open; the
+                // real Windows bug is the holder's window ending up HIDDEN, so a silent return
+                // leaves it stuck + the mutex held). The holder's `sub_settings_poke` picks up
+                // the poke and self-activates (or exits if its window is truly gone, so this
+                // retry then opens fresh). Linux keeps its historical quiet return (the in-app
+                // gear path covers focus there via the --focus-settings helper).
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                platform::compositor::activate_title(app::WINDOW_TITLE);
+                return Ok(());
+            }
+        }
+        What::Permissions => {
+            // Reached on macOS only; the refusal above covers every other platform.
+            startup.permissions_only = true;
+        }
+        What::Editor { file, overlay } => {
+            // A viewer, not a capture: no lock, and unsupported types are rejected up front.
+            if !file.exists() {
+                eprintln!("editor: file not found: {}", file.display());
+                std::process::exit(1);
+            }
+            if app::preview_media_kind(file).is_none() {
+                eprintln!("editor: unsupported file type: {}", file.display());
+                eprintln!("supported: images (png, jpg, gif, …) and videos (mp4, mkv, webm, …)");
+                std::process::exit(1);
+            }
+            // `editor` opens in a WINDOW by default (a file viewer wants a normal, resizable
+            // window); `--overlay` asks for the fullscreen one instead.
+            startup.preview = Some(file.clone());
+            startup.preview_windowed = Some(!overlay);
+        }
+    }
+
+    // A CAPTURE launch takes no lock at all (DRAGON-351): every launch runs as its own
+    // instance, so there is nothing to step aside for. The step-aside that used to live
+    // here — "another capture instance holds the capture lock, don't open a duplicate
+    // overlay" — WAS the "allow multiple capture instances = off" behaviour, and it went
+    // with the setting (so did the lock itself; see `instance`'s module doc).
+
+    run_gui(startup, launch.opens_overlays())
+}
+
+/// The one GUI tail: the preamble every window and overlay shares, then `app::run`. Shared
+/// with the `--preview-handoff` branch in `main`, which bypasses the grammar entirely.
+///
+/// `arm_guard` is the DRAGON-413 startup self-exit budget, and it is exactly
+/// [`cli::parse::Launch::opens_overlays`]: a capture-shaped launch gets a bounded window to
+/// put something on screen, and a plain window (settings, the permission checker, either
+/// editor flavour, the palette viewer) keeps its historical unbounded life, because arming a
+/// 90 second self-exit against a window the user is reading would close it under them.
+fn run_gui(startup: app::Startup, arm_guard: bool) -> cosmic::iced::Result {
+    // DRAGON-336: every path that reaches here is a GUI launch, so this is the one spot that
+    // covers them all. Self-disabling and Linux-only — see `pin_vulkan_icd` for the six
+    // conditions it insists on before touching anything.
     #[cfg(target_os = "linux")]
     pin_vulkan_icd();
     // DRAGON-527: seed the OCR language directory from the bundled `eng.traineddata`.
@@ -1137,296 +1301,22 @@ fn main() -> cosmic::iced::Result {
     // deferring: with a distro tesseract it returns after a couple of `stat`s (the packs
     // are the distro's), and with a bundled one it copies only on the very first run.
     util::seed_tessdata();
-    // DRAGON-427 (Windows 10): this process IS the preview EDITOR for a capture another
-    // process just took. The argument is one `preview_ipc::OpenRequest` line — the very same
-    // wire format the unix socket handoff sends — so the document opens with the capture's
-    // own fields (dims, scale, size, and `external=0`, which is what makes the editor treat
-    // the file as ours to manage) rather than as a bare `--preview` viewer.
-    //
-    // Spawning is the transport here, not a socket: the capture child creates this process
-    // rather than finding one already running, so there is nothing to connect to and no ack
-    // to wait for. It CREATES the first host — once open, later captures can reach it over
-    // `preview_ipc`'s named pipes (DRAGON-651), but nothing can create a host by connecting
-    // to one, so this spawn route stays.
-    //
-    // A malformed line is a hard error rather than a fallback: only our own capture child
-    // ever writes one, so a bad line means the two halves disagree and silently opening
-    // something slightly different would be exactly the wrongness the wire format's strict
-    // parser exists to prevent.
-    if let Some(line) = after("--preview-handoff") {
-        let line = line.to_string_lossy().into_owned();
-        match crate::preview_ipc::OpenRequest::parse(&line) {
-            Ok(req) => {
-                if !req.path.is_file() {
-                    eprintln!("--preview-handoff: file not found: {}", req.path.display());
-                    std::process::exit(1);
-                }
-                return app::run(app::Startup {
-                    // The editor is ALWAYS the windowed variant on Windows 10 (this flag's
-                    // only user): the overlay one would need the software rasterizer that
-                    // cannot draw the preview's `iced::widget::shader` layers at all.
-                    preview_windowed: Some(true),
-                    preview_handoff: Some(req),
-                    ..Default::default()
-                });
-            }
-            Err(e) => {
-                eprintln!("--preview-handoff: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    // `--preview <file>` opens the preview overlay directly for an existing image/video
-    // (no capture overlay, no lock — it's a viewer). Reject unsupported types up front.
-    if let Some(p) = after("--preview") {
-        if !p.exists() {
-            eprintln!("--preview: file not found: {}", p.display());
-            std::process::exit(1);
-        }
-        if app::preview_media_kind(&p).is_none() {
-            eprintln!("--preview: unsupported file type: {}", p.display());
-            eprintln!("supported: images (png, jpg, gif, …) and videos (mp4, mkv, webm, …)");
-            std::process::exit(1);
-        }
-        // `--preview` opens in a WINDOW by default (a file viewer wants a normal,
-        // resizable window); pass `--overlay` alongside it for the fullscreen overlay.
-        let preview_windowed = Some(!args.iter().any(|a| a == "--overlay"));
-        return app::run(app::Startup {
-            settings_only: false,
-            preview: Some(p),
-            preview_windowed,
-            ..Default::default()
-        });
-    }
-    // `--permissions` opens the macOS permission-checker window directly (no capture
-    // overlay). On non-macOS the flag is inert (no TCC grants / no permission window) —
-    // it falls through to a normal launch, keeping Linux byte-identical to a bare launch.
+    // DRAGON-413: arm the startup self-exit guard. From here the child has a bounded window to
+    // put something on screen; if it never does — a wedged TCC probe, a stalled scene grab, a
+    // GUI that never maps — it ends itself quietly instead of lingering forever with nothing
+    // to show and nothing to reap it. Armed BEFORE `app::run` so a hang inside `App::init` is
+    // covered too (an in-app timer could never fire there). macOS-only, so Linux/Windows stay
+    // byte-identical (see the module doc).
     #[cfg(target_os = "macos")]
-    let permissions_only = args.iter().any(|a| a == "--permissions");
-    #[cfg(not(target_os = "macos"))]
-    let permissions_only = false;
-    // `--settings` opens the settings window directly (no capture overlay).
-    let settings_only = args.iter().any(|a| a == "--settings");
-    if settings_only {
-        // Only one settings pane may exist (across all instances); a capture instance
-        // can still run alongside it (nothing else is locked).
-        if !instance::acquire_settings_lock() {
-            log::info!("settings already open; not opening another");
-            // macOS (DRAGON-153) / Windows (DRAGON-246): don't vanish silently — poke the
-            // live holder to COME FORWARD + un-hide its settings window (the daemon's
-            // "Settings" menu item lands here each click when a pane is already open; the
-            // real Windows bug is the holder's window ending up HIDDEN, so a silent return
-            // leaves it stuck + the mutex held). The holder's `sub_settings_poke` picks up
-            // the poke and self-activates (or exits if its window is truly gone, so this
-            // retry then opens fresh). Linux keeps its historical quiet return (the in-app
-            // gear path covers focus there via the --focus-settings helper).
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            platform::compositor::activate_title(app::WINDOW_TITLE);
-            return Ok(());
-        }
-    }
-    // A CAPTURE launch takes no lock at all (DRAGON-351): every launch runs as its own
-    // instance, so there is nothing to step aside for. The step-aside that used to live
-    // here — "another capture instance holds the capture lock, don't open a duplicate
-    // overlay" — WAS the "allow multiple capture instances = off" behaviour, and it went
-    // with the setting (so did the lock itself; see `instance`'s module doc). A
-    // permission-checker launch (`--permissions`) took no lock before either, and the
-    // macOS resident "capture NOW on second launch" UX is unaffected: it lives in the
-    // daemon, which early-branches on a bare `resident` launch and owns its own lock.
-
-    // Capture-mode flags: launch straight into a mode / kind / countdown. Absent
-    // flags leave the fields `None`, so a bare launch is byte-identical to before.
-    let has = |flag: &str| args.iter().any(|a| a == flag);
-    // DRAGON-295: the picker-free immediate captures (a daemon global hotkey / direct CLI).
-    // `--all-in-one` just opens the normal overlay (no `immediate`); it exists so the daemon
-    // has a distinct flag from the mode flags and the bare-check treats it as a capture
-    // launch. macOS/Windows resolve the target; Linux never spawns these (byte-identical).
-    let immediate = if has("--active-window") {
-        Some(app::ImmediateCapture::ActiveWindow)
-    } else if has("--active-monitor") {
-        Some(app::ImmediateCapture::ActiveMonitor)
-    } else {
-        None
-    };
-    let mode = if has("--monitor") {
-        Some(app::Mode::Monitor)
-    } else if has("--window") {
-        Some(app::Mode::Window)
-    } else if has("--region") {
-        Some(app::Mode::Region)
-    } else {
-        None
-    };
-    // DRAGON-428: a MODIFIER, not a mode — it composes with every capture launch above
-    // (bare picker, --region/--window/--monitor, --active-window/--active-monitor) so one
-    // flag gives a no-editor variant of each. Named for the editor rather than the
-    // "preview" because `--preview <file>` already means something else entirely (open a
-    // file in the viewer), and `--no-preview` would read as that flag's opposite.
-    let no_editor = has("--no-editor");
-    // DRAGON-582: `--color-picker` launches the COLOUR PICKER instead of a capture. It
-    // is its own launch shape rather than a `--kind`, because it captures nothing: it
-    // shows a dimmed magnifier overlay, samples one pixel, and opens a result window.
-    // Linux needs the flag most (the tray and a COSMIC custom shortcut are the only ways
-    // to start it there), but it works identically on every platform.
-    let color_picker = has("--color-picker");
-    // DRAGON-680: `--palette-viewer` opens the picker's RESULT WINDOW on its own, with no
-    // overlay and no pick, so the saved palette can be read and reused. It is a window
-    // launch, not a capture: `Startup::opens_overlays` answers false for it, exactly as it
-    // does for `--settings`.
-    //
-    // The single-window rule (DRAGON-613) is CROSS-PROCESS, so it has to be answered before
-    // this process pays for a GUI: if a picker window is already open anywhere, this launch
-    // asks it to come forward and exits, rather than putting a second one on screen. A
-    // refusal (no window, one mid-close, a build with no transport) falls through to the
-    // ordinary launch below, which is the same never-lose-it ladder every pick takes.
-    let palette_viewer = has("--palette-viewer");
-    if palette_viewer {
-        match crate::preview_ipc::send_raise_to_picker() {
-            Ok(pid) => {
-                log::info!("palette viewer: the open picker window at pid {pid} came forward");
-                return Ok(());
-            }
-            Err(e) => log::info!(
-                "palette viewer: no open picker window took it ({e}); opening one here"
-            ),
-        }
-    }
-    let kind = if has("--scan") || has("--scanner") {
-        Some(app::Kind::Scanner)
-    } else if has("--video") {
-        Some(app::Kind::Video)
-    } else if has("--image") {
-        Some(app::Kind::Image)
-    } else {
-        None
-    };
-    // Exact seconds — not snapped to a UI preset — so `--countdown 7` counts 7.
-    // Clamped to the u8 ticker range; 0 is a valid "no delay".
-    let countdown_secs = after("--countdown")
-        .and_then(|p| p.to_str().and_then(|s| s.parse::<u64>().ok()))
-        .map(|s| s.min(u8::MAX as u64));
-    // DRAGON-559: `--audio <channels>` — arm exactly these audio channels FOR THIS LAUNCH,
-    // overriding the persisted arms without writing them back (the pure decision is
-    // `recording_ui::launch_audio_arms`, applied in `App::init`). A modifier like
-    // `--no-editor`, chainable with every capture launch (`--window --video --audio system`).
-    // A bad or missing value REJECTS the launch instead of guessing: unlike `--countdown`
-    // (where a typo just keeps the persisted delay), silently keeping the persisted arms
-    // here could record a microphone the user asked to silence.
-    let audio_arms = match args.iter().position(|a| a == "--audio") {
-        None => None,
-        Some(i) => {
-            let value = args.get(i + 1).filter(|v| !v.starts_with("--")).map(String::as_str);
-            match value.and_then(recording_ui::AudioArmState::parse_flag) {
-                Some(state) => Some(state),
-                None => {
-                    eprintln!(
-                        "--audio: expected one of both|mic|system|none (got {})",
-                        value.unwrap_or("nothing")
-                    );
-                    std::process::exit(2);
-                }
-            }
-        }
-    };
-    // DRAGON-413: arm the startup self-exit guard for a CAPTURE launch. From here the
-    // child has a bounded window to put something on screen; if it never does — a wedged
-    // TCC probe, a stalled scene grab, a GUI that never maps — it ends itself quietly
-    // instead of lingering forever with nothing to show and nothing to reap it. Armed
-    // BEFORE `app::run` so a hang inside `App::init` is covered too (an in-app timer
-    // could never fire there). `--settings` / `--permissions` are windows the user asked
-    // for and keep their historical unbounded life; `--preview <file>` returned above.
-    // DRAGON-680: `--palette-viewer` joins that list rather than the capture one. It mints
-    // NO overlay, so it can present nothing the guard's `Surfaces` snapshot recognises, and
-    // arming it would kill a window the user was reading after 90 seconds.
-    // macOS-only, so Linux/Windows stay byte-identical (see the module doc).
-    #[cfg(target_os = "macos")]
-    if !settings_only && !permissions_only && !palette_viewer {
+    if arm_guard {
         startup_guard::arm(startup_guard::budget_from_env(
             std::env::var(startup_guard::BUDGET_ENV).ok().as_deref(),
         ));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = arm_guard;
     util::timing_mark("about to call app::run (into iced/cosmic runtime)");
-    app::run(app::Startup {
-        settings_only,
-        permissions_only,
-        preview: None,
-        color_picker,
-        palette_viewer,
-        mode,
-        kind,
-        countdown_secs,
-        audio_arms,
-        immediate,
-        preview_windowed: None,
-        preview_handoff: None,
-        no_editor,
-        // DRAGON-440 / DRAGON-443: both filled in by `app::run`'s macOS preamble, which is
-        // the only place early enough to influence the boot-time activation policy.
-        #[cfg(target_os = "macos")]
-        route_probe: None,
-        #[cfg(target_os = "macos")]
-        post_update: false,
-    })
-}
-
-/// Print the user-facing CLI usage (`--help`/`-h`).
-fn print_usage() {
-    println!(
-        "cosmic-capture-kit: native COSMIC screen capture\n\
-\n\
-USAGE:\n\
-    cosmic-capture-kit [FLAGS]\n\
-\n\
-Launch (opens the capture overlay by default):\n\
-    --region                Start in region-select mode (default)\n\
-    --window                Start in window-select mode\n\
-    --monitor               Start in monitor-select mode\n\
-    --all-in-one            Open the full capture picker overlay\n\
-    --active-window         Capture the active window immediately (no picker)\n\
-    --active-monitor        Capture the monitor under the cursor immediately (no picker)\n\
-    --no-editor             Skip the preview editor: save, copy and notify instead\n\
-                            (combines with any launch flag above)\n\
-    --image                 Capture a screenshot (default)\n\
-    --video                 Capture a screen recording\n\
-    --scan                  Start the QR/OCR scanner (forces region)\n\
-    --color-picker          Pick a color from the screen (magnifier overlay)\n\
-    --palette-viewer        Open the palette viewer window (no overlay, no pick)\n\
-    --countdown <secs>      Pre-capture countdown in seconds (any value, e.g. 7)\n\
-    --audio <channels>      Arm exactly these audio channels for this launch only:\n\
-                            both | mic | system | none (persisted arms are untouched)\n\
-\n\
-Control a recording that is already running (Linux; bind these to system shortcuts):\n\
-    --pause-recording       Pause the recording, or resume it when paused\n\
-    --finish-recording      Finish the recording and save it\n\
-    --cancel-recording      Cancel the recording and delete it\n\
-    --toggle-mic            Toggle the microphone\n\
-    --toggle-system-audio   Toggle system audio\n\
-\n\
-Other:\n\
-    --preview <file>        Open an existing image/video in the preview (windowed)\n\
-    --overlay               With --preview: use the fullscreen overlay, not a window\n\
-                            (ignored on Windows 10, which has no overlay editor)\n\
-    --cloud-upload <file>   Upload a capture to a connected cloud account\n\
-    --account <id>          With --cloud-upload: which connected account to use\n\
-    --auto-share            With --cloud-upload: also copy a share link\n\
-    --inspect <file>        Print a capture's embedded metadata and exit\n\
-    --make-sync-clip [path] Write the A/V-sync reference clip (flash + beep) and exit\n\
-    --calibrate-sync <file> Measure a recording of the reference clip; --apply stores it\n\
-    --settings              Open the settings window only (no capture overlay)\n\
-    --permissions           Open the macOS permission checker (macOS only)\n\
-    -h, --help              Show this help\n\
-\n\
-{}\n\
-\n\
-Examples:\n\
-    cosmic-capture-kit --region --video --countdown 3\n\
-    cosmic-capture-kit --monitor --video --audio system\n\
-    cosmic-capture-kit --monitor\n\
-    cosmic-capture-kit --scan\n\
-    cosmic-capture-kit --color-picker\n\
-    cosmic-capture-kit --toggle-mic",
-        cli::SYNC_WORKFLOW
-    );
+    app::run(startup)
 }
 
 /// DRAGON-336: the pure islands of the Vulkan-ICD pin. Everything that decides

@@ -18,7 +18,12 @@
 use super::*;
 use std::path::PathBuf;
 
-mod annotate;
+// `pub(in crate::app)` since DRAGON-691: the live recording ink is a sibling of this editor
+// rather than part of it, and it reads TWO things from here so the two pens cannot drift:
+// `PEN_MIN_STEP` (the trail-thinning step the pseudo-pressure signal is measured against) and
+// `default_annot_color` (so live ink and a fresh annotation are the same colour). Everything
+// else in the module stays `pub(super)`.
+pub(in crate::app) mod annotate;
 // `pub(in crate::app)`: the colour picker window borrows `chrome::flyout` (the shared
 // chip + popover recipe) for its mode menu (DRAGON-630), so the module has to be
 // reachable from a sibling; everything else in it stays `pub(super)`.
@@ -186,7 +191,7 @@ pub struct PreviewState {
     /// back into that box (`contain_dims`) rather than the preview shrinking to
     /// the encode. For STILLS it's only the pre-decode estimate; the decoded
     /// dims (`edit.frame`) take over once known (stills display 1:1, never
-    /// upscaled). `None` for external files (`--preview`) — no capture footprint.
+    /// upscaled). `None` for external files (`editor`) — no capture footprint.
     pub display_dims: Option<(u32, u32)>,
     /// The capture's on-disk path once saved — `None` while the grab/finalize is still
     /// running (the overlay is open showing a spinner before the file exists).
@@ -227,7 +232,7 @@ pub struct PreviewState {
     // tracking existed to avoid.
     /// The saved file's size in bytes (shown as a chip), once known.
     pub size: Option<u64>,
-    /// `true` when previewing a pre-existing file (`--preview`) rather than a fresh
+    /// `true` when previewing a pre-existing file (`editor`) rather than a fresh
     /// capture: the file isn't ours to manage, so it is never auto-copied to the clipboard
     /// on open and a Save offers its OWN folder rather than the capture folder.
     pub external: bool,
@@ -239,7 +244,7 @@ pub struct PreviewState {
     /// Retina grab isn't shown 2× too large). Resolved on EVERY platform from the SOURCE
     /// output's own reported scale (`App::scale_for_selection`: the COSMIC output's buffer
     /// scale on Linux, `NSScreen.backingScaleFactor` on macOS, `GetDpiForMonitor / 96` on
-    /// Windows) — `1.0` only on an unscaled panel, on a `--preview` file, or when the
+    /// Windows) — `1.0` only on an unscaled panel, on an `editor` file, or when the
     /// source output can't be resolved. On those `1.0` cases every consumer stays
     /// byte-identical, which is what makes this safe to thread everywhere.
     pub source_scale: f32,
@@ -554,6 +559,92 @@ impl DuckRefs {
     }
 }
 
+/// What is known about a preview document's soundtrack at the moment the "pause other
+/// apps' media" decision is made (DRAGON-733).
+///
+/// The feature's rule, in the owner's words, is "pause as soon as the preview editor opens
+/// AND audio is detected in the track loaded". Those are TWO different instants and the
+/// answer is not the same at both, which is exactly what went wrong: every call site was
+/// passing a bare `bool` computed from the RECORDING TOGGLES, and three of the four were
+/// therefore answering "was the app told to record sound", not "does this file make any".
+/// Naming the states makes each site say which question it is able to answer.
+///
+/// The open-time guess stays, and it is not a compromise: the module doc of
+/// `crate::audio::ducking` requires the pause to land the instant the editor appears, not
+/// when its asset finishes loading, and probing the file first would cost exactly that
+/// delay. So the guess opens the guard and the readings below correct it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrackAudio {
+    /// A still image. No soundtrack is possible, ever.
+    Still,
+    /// A video the editor has not read yet. `expected` is the only thing available at open
+    /// time: for a capture we just took, whether this session's audio toggles were on; for
+    /// an `editor` file, `true`, because an arbitrary video usually has sound.
+    Unread { expected: bool },
+    /// `ffprobe` found no audio stream at all, so this file can never make a sound.
+    NoStream,
+    /// There IS an audio stream, but nothing has looked at its samples yet. Not the same as
+    /// "audible": a recording taken with both audio toggles off still carries one stream,
+    /// because `record::finalize` always mixes the two channels through `amix` and mutes
+    /// them with a filter rather than dropping them. So the stream's PRESENCE cannot answer
+    /// the owner's question and only the peaks below can.
+    StreamUnread,
+    /// The soundtrack's peaks have been read: `audible` says whether any of them carry sound.
+    Read { audible: bool },
+}
+
+/// **Pure**, unit-tested: should a preview document take the "pause other media" guard as
+/// it OPENS?
+///
+/// The optimistic arm is deliberate. `StreamUnread` takes the guard because a file with a
+/// soundtrack is about to compete with the user's music, and holding it for the fraction of
+/// a second until the peaks land is the cheap mistake; the expensive one is a preview that
+/// plays over a song for its whole life.
+pub(crate) fn opens_ducked(audio: TrackAudio) -> bool {
+    match audio {
+        TrackAudio::Still | TrackAudio::NoStream => false,
+        TrackAudio::Unread { expected } => expected,
+        TrackAudio::StreamUnread => true,
+        TrackAudio::Read { audible } => audible,
+    }
+}
+
+/// **Pure**, unit-tested: what a LATER, better reading of the same document means for a
+/// guard that is (or is not) already held for it.
+///
+/// `Some(true)` = engage now, `Some(false)` = release now, `None` = this reading carries no
+/// new information, leave the guard exactly as it is. The `None` arms matter as much as the
+/// others: a settle that "helpfully" re-decided on `Unread` would undo the open-time guess
+/// with the very value that produced it, and one that acted on `StreamUnread` would engage
+/// for every recording ever made, including the fully muted ones.
+pub(crate) fn duck_settlement(holding: bool, audio: TrackAudio) -> Option<bool> {
+    let want = match audio {
+        // No new information: these are the states the OPEN decision was made from.
+        TrackAudio::Unread { .. } | TrackAudio::StreamUnread => return None,
+        TrackAudio::Still | TrackAudio::NoStream => false,
+        TrackAudio::Read { audible } => audible,
+    };
+    (want != holding).then_some(want)
+}
+
+/// **Pure**, unit-tested: do these soundtrack peaks carry any actual sound?
+///
+/// This is the reading behind [`TrackAudio::Read`], and it is what the owner's phrase
+/// "audio is detected in the track loaded" actually means. It has to be the PEAKS and not
+/// the stream list, because a recording taken with both audio toggles off still ships an
+/// audio stream: `record::finalize` mutes the channels with a filter and always mixes them
+/// through `amix`, so `ffprobe` reports a soundtrack on every recording this app has ever
+/// produced.
+///
+/// The threshold is the smallest step a 16-bit sample can express (the peaks are extracted
+/// from `s16le`, so anything quieter than one LSB was silence before it was a float), which
+/// keeps a hard-muted track on the silent side of the line without calling a genuinely quiet
+/// recording empty.
+pub(crate) fn peaks_carry_sound(peaks: &[(f32, f32)]) -> bool {
+    const ONE_LSB_16BIT: f32 = 1.0 / 32768.0;
+    peaks.iter().any(|(l, r)| l.abs() > ONE_LSB_16BIT || r.abs() > ONE_LSB_16BIT)
+}
+
 
 // DRAGON-467 removed `copy_intent` and `delete_intent` from here. They fanned the
 // "Automatically save on copy" / "Automatically close on copy" / "Automatically copy to
@@ -853,7 +944,7 @@ pub(in crate::app) enum SettingsActivation {
     /// A pane is open in ANOTHER instance: spawn the `--focus-settings` helper, so the
     /// activation outlives our own spawn.
     FocusOther,
-    /// No pane anywhere: spawn a `--settings` child.
+    /// No pane anywhere: spawn a `settings` child.
     Spawn,
 }
 
@@ -1160,7 +1251,7 @@ impl App {
                             .preview_output
                             .as_ref()
                             .map(|(n, o)| monitor_fit_points(*o, monitor_point_scale(Some(n))));
-                        // Windows (DRAGON-288): an external `--preview` has no capture anchor,
+                        // Windows (DRAGON-288): an external `editor` has no capture anchor,
                         // so `out` is None and the shared fit below would native-size the
                         // window (spilling a large picture off-screen). Fall back to the
                         // preview window's LIVE monitor so the media is bounded to it, exactly
@@ -2133,9 +2224,20 @@ impl App {
                         }
                     }
                 }
+                // DRAGON-733: the first real reading of the file the "pause other media"
+                // guard was opened on a GUESS for. A missing probe counts as no stream: a
+                // file the editor cannot read is a file it cannot play, so it can never
+                // compete with the user's music. A stream that IS there settles nothing yet,
+                // because every recording carries one whether or not it makes a sound; the
+                // waveform above is what answers that, in `on_waveform`.
+                let heard = match meta {
+                    Some(m) if m.has_audio => TrackAudio::StreamUnread,
+                    _ => TrackAudio::NoStream,
+                };
+                self.settle_preview_duck(id, heard);
                 // The probe just revealed the recording's true encoded dims. A windowed
                 // preview whose CAPTURED footprint was never known (an external
-                // `--preview` file, or a stop before the worker's first frame) opened
+                // `editor` file, or a stop before the worker's first frame) opened
                 // at the size-unknown fallback — re-fit it now that `sizing_media`
                 // has something real (the footprint keeps precedence when present,
                 // so a fitted recording never gets shrunk to a res-capped encode).
@@ -2148,7 +2250,7 @@ impl App {
                             .preview_output
                             .as_ref()
                             .map(|(n, o)| monitor_fit_points(*o, monitor_point_scale(Some(n))));
-                        // Windows (DRAGON-288): an external `--preview` video has no capture
+                        // Windows (DRAGON-288): an external `editor` video has no capture
                         // anchor (`out` None) — bound the fit to the preview window's LIVE
                         // monitor instead of native-sizing it off-screen. Additive; Linux/mac
                         // keep `out` unchanged.
@@ -2257,7 +2359,7 @@ impl App {
             // ── Upload (DRAGON-482) ──────────────────────────────────────────────────────
             PreviewMsg::UploadFlyoutToggle => {
                 // The accounts are RE-READ here: the settings window is a separate document
-                // (and, when it is a detached `--settings` child, a separate process), so an
+                // (and, when it is a detached `settings` child, a separate process), so an
                 // account connected since this editor opened has to appear the first time the
                 // user asks to see the list. This is the only refresh point besides the
                 // document's own open; the toolbar reads the snapshot every frame. Filtered to
@@ -2736,7 +2838,7 @@ impl App {
                 // shows its own result window, so nothing is lost either way.
                 let pid = std::process::id().to_string();
                 crate::recording_ui::spawn_capture_child_args(
-                    &["--color-picker"],
+                    &["color", "--picker"],
                     &[(crate::app::color_picker::COLOR_TO_PID_ENV, pid.as_str())],
                 );
                 Task::none()
@@ -2796,7 +2898,7 @@ impl App {
                     };
                 };
                 // Gather everything the background worker needs, then release `self`.
-                // (`external` used to matter here: a `--preview` file was COPIED while a
+                // (`external` used to matter here: an `editor` file was COPIED while a
                 // fresh capture was MOVED. DRAGON-353 made copy-not-move universal, so the
                 // distinction is gone — see the export note below.)
                 let processing_msg = random_processing_msg();
@@ -2984,7 +3086,7 @@ impl App {
                             // to `shot.jpg` produced PNG bytes under a `.jpg` name while an
                             // edited one produced a real JPEG. The destination is forced to
                             // `.png` above, so a byte copy is now the CORRECT answer for a
-                            // PNG source (and keeps its `--inspect` chunk for free); a
+                            // PNG source (and keeps its `debug inspect` chunk for free); a
                             // non-PNG source is re-written as a real PNG instead. That whole
                             // decision, and why the copy is deliberate rather than
                             // incidental, lives in `edit::save_unedited_still`.
@@ -3919,5 +4021,97 @@ mod overlay_demotion_tests {
         assert_eq!(overlay_siblings(&previews, None), vec![previews[0].window]);
         // ...and a document never sweeps itself, however demotable it looks.
         assert!(overlay_siblings(&previews, Some(previews[0].window)).is_empty());
+    }
+}
+
+/// The "does this preview want other media paused" decision (DRAGON-733). The four openers
+/// and the two later readings all route through these three functions, so what each site is
+/// able to KNOW is a type and not a comment.
+#[cfg(test)]
+mod duck_decision_tests {
+    use super::{TrackAudio, duck_settlement, opens_ducked, peaks_carry_sound};
+
+    /// An image preview never takes the guard, on any path. This is the one answer that was
+    /// always right and must stay right.
+    #[test]
+    fn a_still_never_ducks() {
+        assert!(!opens_ducked(TrackAudio::Still));
+        assert_eq!(duck_settlement(false, TrackAudio::Still), None);
+        assert_eq!(duck_settlement(true, TrackAudio::Still), Some(false));
+    }
+
+    /// The open-time guess is exactly the guess, and nothing more: this is the only thing a
+    /// spinner over a recording that has not finished writing can possibly say.
+    #[test]
+    fn the_open_time_guess_is_taken_at_face_value() {
+        assert!(opens_ducked(TrackAudio::Unread { expected: true }));
+        assert!(!opens_ducked(TrackAudio::Unread { expected: false }));
+    }
+
+    /// And it is never RE-applied later. A settle that acted on `Unread` would re-decide the
+    /// open question with the same value that produced it, which can only ever undo a
+    /// correction that a real reading has already made.
+    #[test]
+    fn the_guess_carries_no_new_information_later() {
+        for expected in [true, false] {
+            for holding in [true, false] {
+                assert_eq!(duck_settlement(holding, TrackAudio::Unread { expected }), None);
+            }
+        }
+    }
+
+    /// A probe that found no audio stream is definitive in the negative: release a guard the
+    /// guess took, and never take one.
+    #[test]
+    fn no_stream_releases_and_never_engages() {
+        assert!(!opens_ducked(TrackAudio::NoStream));
+        assert_eq!(duck_settlement(true, TrackAudio::NoStream), Some(false));
+        assert_eq!(duck_settlement(false, TrackAudio::NoStream), None);
+    }
+
+    /// A stream that EXISTS settles nothing, and this is the arm the whole bug turns on:
+    /// `record::finalize` always mixes both channels through `amix`, so every recording this
+    /// app has ever produced reports an audio stream, including one taken with both audio
+    /// toggles off. Acting on it would pause the user's music for a silent recording.
+    #[test]
+    fn a_present_stream_is_not_evidence_of_sound() {
+        assert_eq!(duck_settlement(true, TrackAudio::StreamUnread), None);
+        assert_eq!(duck_settlement(false, TrackAudio::StreamUnread), None);
+        // It DOES open ducked, though: a file with a soundtrack is about to compete with the
+        // user's music, and the peaks are a moment away.
+        assert!(opens_ducked(TrackAudio::StreamUnread));
+    }
+
+    /// The peaks are the answer, in both directions, and only when they disagree with the
+    /// guard's current state. This is the correction the owner's specification asks for:
+    /// "audio is detected in the track loaded".
+    #[test]
+    fn the_peaks_settle_it_both_ways() {
+        assert_eq!(duck_settlement(false, TrackAudio::Read { audible: true }), Some(true));
+        assert_eq!(duck_settlement(true, TrackAudio::Read { audible: false }), Some(false));
+        // Agreement is a no-op, so a settle can never respawn a babysitter that is already up.
+        assert_eq!(duck_settlement(true, TrackAudio::Read { audible: true }), None);
+        assert_eq!(duck_settlement(false, TrackAudio::Read { audible: false }), None);
+    }
+
+    /// Silence detection. A hard-muted recording's peaks are zeros; anything a 16-bit sample
+    /// can express is sound.
+    #[test]
+    fn silence_is_below_one_sixteen_bit_step() {
+        assert!(!peaks_carry_sound(&[]), "no peaks at all is not sound");
+        assert!(!peaks_carry_sound(&[(0.0, 0.0); 64]), "a muted track is silent");
+        assert!(!peaks_carry_sound(&[(1.0 / 65536.0, 0.0)]), "half a step is still silence");
+        assert!(peaks_carry_sound(&[(0.0, 0.0), (0.02, 0.0)]), "one quiet bucket is sound");
+        assert!(peaks_carry_sound(&[(0.9, 0.9)]));
+    }
+
+    /// A negative peak is as loud as a positive one. `timeline::bucket_peaks` happens to
+    /// return absolute values today, so this is defensive rather than load-bearing: it pins
+    /// that a future signed extractor cannot make a bass-heavy track read as silence, which
+    /// is the kind of change that would be invisible everywhere else.
+    #[test]
+    fn a_negative_peak_counts() {
+        assert!(peaks_carry_sound(&[(-0.5, 0.0)]));
+        assert!(peaks_carry_sound(&[(0.0, -0.5)]));
     }
 }

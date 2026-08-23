@@ -4,7 +4,7 @@
 //! content built from native `settings::section`/`settings::item` rows (group
 //! header + subdued helper text + right-aligned control).
 //!
-//! Opened on demand (the gear button) or directly via `--settings`. This module
+//! Opened on demand (the gear button) or directly via `settings`. This module
 //! owns the settings window's UI state and view; the persisted config *values*
 //! (opacities, capture flags, scan options, paths, …) live on `App`, since the
 //! capture/record logic shares them.
@@ -388,7 +388,7 @@ pub enum ResetScope {
 pub struct SettingsState {
     /// The settings toplevel window, when open (`None` while closed).
     pub window: Option<window::Id>,
-    /// Launched via `--settings`: closing the settings window exits the app.
+    /// Launched via `settings`: closing the settings window exits the app.
     pub only: bool,
     /// Nav-rail model — one entry per page.
     pub nav: widget::segmented_button::SingleSelectModel,
@@ -936,13 +936,13 @@ impl App {
         // pane — the child is a never-activated ACCESSORY app (the DRAGON-151
         // overlay model) and the activation policy is boot-time-only, so a converted
         // pane could not be Cmd+Tab'd or focused like a real window. Hand off to a
-        // fresh `--settings` process instead (it boots with the REGULAR policy) and
+        // fresh `settings` process instead (it boots with the REGULAR policy) and
         // end this capture session. If a pane is already open somewhere, the child's
         // own launch path focuses it and exits.
         #[cfg(target_os = "macos")]
         {
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).arg("--settings").spawn();
+                let _ = std::process::Command::new(exe).arg("settings").spawn();
             }
             return self.teardown();
         }
@@ -953,19 +953,19 @@ impl App {
         // rasterizer. That is the configuration DRAGON-336 tested and rejected: the
         // microphone test is a live, continuously redrawing level meter, the worst case for
         // software rasterization, and it starves the audio work it is meant to visualise.
-        // A fresh `--settings` process opens no overlay, so it keeps wgpu.
+        // A fresh `settings` process opens no overlay, so it keeps wgpu.
         //
         // Windows 11 (and any build we could not identify) is untouched and still converts
         // this process in place, exactly as it does today.
         #[cfg(windows)]
         if crate::platform::software_overlays() {
             // The pane is single-instance across processes; a live holder is focused by the
-            // child's own `--settings` launch path, which then exits. So this one spawn is
+            // child's own `settings` launch path, which then exits. So this one spawn is
             // correct whether or not a pane already exists.
             match std::env::current_exe() {
                 Ok(exe) => {
                     let mut cmd = std::process::Command::new(exe);
-                    cmd.arg("--settings");
+                    cmd.arg("settings");
                     // Hand the child the user's own `ICED_BACKEND` back rather than ours —
                     // a child inherits the parent's environment, and ours says software.
                     crate::app::restore_user_backend_env(&mut cmd);

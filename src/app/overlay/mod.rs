@@ -179,7 +179,7 @@ const SELECTION_LINE_ALPHA: f32 = 1.0;
 //
 // It read as a KIND bug, and that is worth recording because the false lead is cheap to fall
 // for twice: the scanner looked fine and region/video looked broken, so the difference seemed
-// to be `Kind`. It never was. A `--scan` launch grabs the frozen flats and so runs later, and
+// to be `Kind`. It never was. A `scan` launch grabs the frozen flats and so runs later, and
 // its first-frame stall happened to measure 53ms rather than 148ms, which leaves enough of the
 // ramp for a human to see. Same code path, same ordering, different stall. The render path is
 // byte-identical for every `Kind`, which is the thing to check FIRST next time.
@@ -221,7 +221,7 @@ pub(super) const DIM_FADE_MS: u64 = 200;
 /// on macOS" report; the ramp was correct and simply had no frames to be drawn on.
 ///
 /// The scanner LOOKED fine for the same reason in reverse, and this is why the bug read as
-/// kind-dependent when it is not: a `--scan` launch grabs the frozen flats, which pushes
+/// kind-dependent when it is not: a `scan` launch grabs the frozen flats, which pushes
 /// everything later, and its first-frame stall measured 53ms rather than 148ms, leaving 147ms
 /// of ramp and about ten intermediate frames. Same code, same ordering, different stall
 /// length. Nothing about `Kind` enters into it.

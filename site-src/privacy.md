@@ -136,12 +136,12 @@ GitHub Pages, so GitHub can see the IP address of visitors in its own server
 logs. The page fonts are loaded from Google Fonts, which means your browser
 fetches them from Google when the page opens.
 
-The site uses Google Analytics to count visits and see which pages help
-people, and only if you say yes. A consent banner asks on your first visit;
-analytics stays off until you accept, and rejecting changes nothing about how
-the site works. If you accept, Google Analytics sets cookies and collects the
-pages you view, the rough region you are visiting from, and basic browser and
-device information. Google processes that data as the service's provider. You
+The site uses Google Analytics to count visits, count downloads, and see which
+pages help people, and only if you say yes. A consent banner asks on your first
+visit; analytics stays off until you accept, and rejecting changes nothing about
+how the site works. If you accept, Google Analytics sets cookies and collects the
+pages you view, the download links you press, the rough region you are visiting
+from, and basic browser and device information. Google processes that data as the service's provider. You
 can change your answer any time by clearing the site's cookies, which makes
 the banner ask again.
 

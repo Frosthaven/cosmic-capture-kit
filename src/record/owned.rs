@@ -23,19 +23,24 @@ pub(super) type MuteIntervals = Vec<(f64, f64)>;
 
 /// Build the frame-writer closure the media-clock owned single-session loop
 /// (DRAGON-125) uses: convert to NV12 on the hardware path (or pass RGBA through)
-/// and write to `stdin` at the STREAM size. Shared so the conversion logic (and its
+/// and write to `sink` at the STREAM size. Shared so the conversion logic (and its
 /// "never resize on the capture path" invariant) has exactly one definition.
 /// Returns `false` once the pipe is closed. `pub(super)`: the screencopy owned path
 /// (DRAGON-127, `record::screencopy`) and the macOS SCK path (`record::sck`) reuse
 /// this exact closure instead of re-deriving the NV12/write logic.
+///
+/// The sink is `&mut dyn Write` rather than `&mut ChildStdin` (DRAGON-711) so the stop
+/// tail can hand the SAME closure a [`CoveringWriter`] wrapped around ffmpeg's stdin.
+/// Every capture-loop call site passes `&mut stdin` exactly as before (the coercion is
+/// implicit), so no worker's own write path changed.
 pub(super) fn make_frame_writer(
     w0: u32,
     h0: u32,
     nv12: bool,
-) -> impl FnMut(u32, u32, &[u8], &mut std::process::ChildStdin) -> bool {
+) -> impl FnMut(u32, u32, &[u8], &mut dyn Write) -> bool {
     let (w0s, h0s) = (w0 as usize, h0 as usize);
     let mut nv12buf = vec![0u8; w0s * h0s * 3 / 2];
-    move |w: u32, h: u32, rgba: &[u8], stdin: &mut std::process::ChildStdin| {
+    move |w: u32, h: u32, rgba: &[u8], sink: &mut dyn Write| {
         // DRAGON-277: a capture frame whose byte length is SHORT of its reported `w*h*4` dims
         // would OOB-panic `rgba_to_nv12` (a band thread indexes past `rgba`) and — because
         // that panic crosses the scoped-thread join — take the WHOLE app down mid-recording.
@@ -74,7 +79,7 @@ pub(super) fn make_frame_writer(
         } else {
             rgba
         };
-        stdin.write_all(out).is_ok()
+        sink.write_all(out).is_ok()
     }
 }
 
@@ -87,19 +92,31 @@ pub(super) fn make_frame_writer(
 /// The wedge this closes (reproduced headlessly — see the `nonblocking_*` tests in
 /// [`super::sck`]): the stop tail feeds the FINAL covering video ticks
 /// (`VideoTicker::ticks_to_cover`) to ffmpeg's stdin AFTER the pump has EOF'd the audio
-/// FIFOs. Under `-shortest`, an ffmpeg whose audio was the shorter stream decides it is
-/// DONE and stops draining its stdin video pipe WITHOUT closing the read end — so a
-/// plain blocking `write_all` of even one frame parks in the kernel forever (a
+/// FIFOs. The wedge was FOUND under `-shortest`, where an ffmpeg whose audio was the
+/// shorter stream decided it was DONE and stopped draining its stdin video pipe WITHOUT
+/// closing the read end. Neither recording muxer carries that flag now (DRAGON-457,
+/// DRAGON-710), which removes the one KNOWN way to reach the wedge and none of the
+/// unknown ones: any ffmpeg that stops reading and does not close leaves us in exactly
+/// the same place, so this guard stays.
+///
+/// A plain blocking `write_all` of even one frame parks in the kernel forever (a
 /// full-monitor RGBA frame is tens of MB, dwarfing the ~64K pipe). With the write hung,
 /// the worker never reaches `wait_or_kill`, never fills `RecordHandle.done`, and the
 /// preview spinner spins forever (`DoneGuard` can't fire — the thread is alive, not
 /// unwound). SIGKILLing ffmpeg does NOT reliably unblock a write already parked in the
 /// kernel (measured live), so the fix is to never block.
 ///
-/// While this guard is active, a `write_all` to a FULL pipe returns `WouldBlock`
-/// immediately, so the covering-tick loop stops instead of hanging. Restoring blocking
-/// mode on drop keeps the subsequent `drop(stdin)` (EOF) and any later error semantics
-/// normal.
+/// While this guard is active, a write to a FULL pipe fails immediately instead of
+/// parking: `WouldBlock` on POSIX, a zero-byte `Ok` under Windows' `PIPE_NOWAIT`.
+/// Restoring blocking mode on drop keeps the subsequent `drop(stdin)` (EOF) and any
+/// later error semantics normal.
+///
+/// This guard is only half the answer, and for a long time it was mistaken for the whole
+/// one (DRAGON-711): "the pipe is full" is not "the pipe is dead", and giving up on the
+/// first one threw away the very frames the stop tail exists to write. What sits on top
+/// of it now is [`CoveringWriter`], which retries a full pipe on a BOUNDED deadline. The
+/// guard is what makes that deadline enforceable at all — a blocking write cannot be
+/// abandoned once the kernel has it.
 #[cfg(unix)]
 pub(super) struct NonblockingStdin {
     /// The raw fd (owned by the `ChildStdin` the caller still holds — this only borrows
@@ -143,6 +160,339 @@ impl Drop for NonblockingStdin {
 #[cfg(windows)]
 pub(super) use crate::platform::windows::named_pipe::StdinNoWait as NonblockingStdin;
 
+/// How long the stop tail's covering writes may spend WAITING on a full ffmpeg stdin
+/// pipe, across the whole covering phase (DRAGON-711). Not per frame: one deadline is
+/// taken before the first covering write and every later one shares it, so the phase
+/// costs at most this no matter how many ticks [`super::pump::VideoTicker::ticks_to_cover`]
+/// asks for.
+///
+/// Why three seconds:
+/// * It has to cover a SATURATED encoder draining the tail. The measured worst case
+///   (DRAGON-710, synthetic full-motion content at 5120x1440) was about a second of
+///   video left uncovered, i.e. ~30 frames at 30fps; a hardware encoder that has fallen
+///   to a third of realtime still drains that inside three seconds, and by the stop tail
+///   nothing new is being captured, so its backlog only shrinks.
+/// * It has to be invisible to a user stopping a recording. In the healthy case it costs
+///   ZERO — a pipe with room never waits — and even the pathological case is dwarfed by
+///   the 30s bounded reap that follows it on the very same path.
+/// * It has to NEST. Three plus that 30s reap is 33s, comfortably inside
+///   `progress::SESSION_STALL_SECS` (60), where the compile-time assert pinning that
+///   relationship lives.
+pub(super) const COVERING_WRITE_BUDGET: Duration = Duration::from_secs(3);
+
+/// The stop tail's BOUNDED reap (DRAGON-118): how long [`run_video_stop_tail`] waits for
+/// ffmpeg to flush its backlog and exit after the stdin EOF before killing it. Named
+/// (DRAGON-711) because it is now one of two waits inside the stop tail, and the bound that
+/// has to clear their SUM, `progress::SESSION_STALL_SECS`, should derive from it rather than
+/// restate a literal. It was three waits and two bounds until DRAGON-712 deleted Windows'
+/// own `STOP_KILL_GRACE`; see `platform/windows/record_worker.rs` for why that guard is
+/// gone and what replaced it.
+pub(super) const STOP_TAIL_REAP: Duration = Duration::from_secs(30);
+
+/// How many full-pipe retries spin on [`std::thread::yield_now`] before the writer starts
+/// sleeping. The fast regime — ffmpeg draining eagerly, the pipe momentarily full — is
+/// measured in microseconds, and a sleep there would throttle the tail to one pipe buffer
+/// per timer tick (~64K per 15ms on Windows, whose default timer resolution is 15.6ms, not
+/// the 1ms the argument would suggest). Yielding covers that regime; the sleep below is
+/// for the genuinely stalled one, where burning a core would buy nothing.
+const COVERING_WRITE_SPINS: u32 = 64;
+
+/// The poll interval once the spins are used up. Kept short because it is the only thing
+/// standing between "the encoder freed a buffer" and "we filled it".
+const COVERING_WRITE_POLL: Duration = Duration::from_millis(1);
+
+/// How long ONE capture-loop frame write may keep waiting on a FULL ffmpeg stdin pipe
+/// once the session has been asked to STOP, before it abandons the frame (DRAGON-712).
+///
+/// Small on purpose. Past the stop nothing new is being captured and the only thing left
+/// to do is close the pipe, so every millisecond spent here is a millisecond the user
+/// watches a "finalizing" spinner for. Half a second is long enough that a healthy
+/// encoder finishing the frame in flight is never cut short, and short enough that the
+/// stop feels immediate.
+pub(super) const STOP_ABANDON_GRACE: Duration = Duration::from_millis(500);
+
+/// How long ONE capture-loop frame write may keep waiting on a FULL ffmpeg stdin pipe
+/// MID-SESSION before the session declares the muxer stalled and winds down (DRAGON-712).
+///
+/// This is the same question `MuxerWatchdog` asks from the other side, so it takes the
+/// same number: the watchdog notices "ffmpeg is being fed and writes nothing" in
+/// `MUXER_LIVENESS_SECS`, and this notices "ffmpeg is not even taking bytes" in the same
+/// budget. Sharing it means a stalled muxer ends a session in one budget however it
+/// stalled, instead of two different ones depending on which symptom appeared first.
+/// A write that spends it returns `false`, which every owned worker already treats as
+/// "ffmpeg is gone, wind down through the stop tail".
+pub(super) const HOT_WRITE_STALL_BUDGET: Duration =
+    Duration::from_secs(super::MUXER_LIVENESS_SECS);
+
+/// Pure and unit-tested (DRAGON-712): whether a capture-loop frame write that has found
+/// ffmpeg's stdin FULL should keep waiting for room, given whether the session has been
+/// asked to stop and how long this frame has already waited.
+///
+/// The two budgets answer two different questions. Mid-session a full pipe is ordinary
+/// backpressure and waiting is exactly right, so the only bound is the one that separates
+/// "slow" from "stalled" ([`HOT_WRITE_STALL_BUDGET`]). Once the user has asked to stop,
+/// waiting buys nothing: the frame in flight is one of the last, and the thing that
+/// actually has to happen is the stdin EOF that [`run_video_stop_tail`] delivers, which
+/// this write is standing in front of. So the budget collapses to
+/// [`STOP_ABANDON_GRACE`].
+fn keep_waiting_for_pipe(stopping: bool, waited: Duration) -> bool {
+    if stopping { waited < STOP_ABANDON_GRACE } else { waited < HOT_WRITE_STALL_BUDGET }
+}
+
+// The stop path's own worst case, end to end, must stay inside the session bound that
+// would otherwise declare the whole session wedged (DRAGON-423). Written here rather
+// than restated as a literal, in the style of `pump`'s render-horizon assert, because
+// the failure it prevents is the one this ticket exists for: a stop that spends longer
+// than `progress::SESSION_STALL_SECS` produces the recovery alert and a pre-finalize
+// `-recovered.mkv` instead of a finished recording.
+const _: () = assert!(
+    STOP_ABANDON_GRACE.as_millis()
+        + COVERING_WRITE_BUDGET.as_millis()
+        + STOP_TAIL_REAP.as_millis()
+        < (super::progress::SESSION_STALL_SECS as u128) * 1000,
+    "the stop path's abandon grace + covering budget + bounded reap must fit inside the \
+     session stall bound, or a slow stop is reported to the user as a wedged recording"
+);
+
+// The mid-session stall budget must not outlast the watchdog that asks the same question
+// from the other side, or a stalled muxer would be noticed twice, at two different times,
+// depending only on which symptom appeared first.
+const _: () = assert!(
+    HOT_WRITE_STALL_BUDGET.as_secs() <= super::MUXER_LIVENESS_SECS,
+    "the capture loop's full-pipe stall budget must not outlast MUXER_LIVENESS_SECS, or a \
+     stalled ffmpeg ends the session on whichever symptom happened to be seen first"
+);
+
+/// The capture loop's video sink: ffmpeg's stdin, held NON-BLOCKING for the whole session,
+/// written through a patient byte-level retry that can always be ABANDONED (DRAGON-712).
+///
+/// ## The wedge this closes
+///
+/// DRAGON-160 established the rule and [`NonblockingStdin`]'s doc still states it: a
+/// blocking `write_all` of a full-monitor frame into an ffmpeg that stopped draining
+/// without closing the pipe parks in the kernel forever. That rule was applied to the
+/// stop tail's covering writes and to nothing else, so the CAPTURE LOOP kept writing to a
+/// blocking pipe, and that is where a recording was lost in the field:
+///
+/// 1. ffmpeg's muxer stops taking packets. It happens when the audio the pump renders
+///    runs past the video ffmpeg has actually received, which is exactly what the stop
+///    does: the pump's final render advances the audio by the whole render horizon
+///    (`pump::RENDER_LAG_SECS`, 1.5s) while the video side has stopped feeding. Measured
+///    headlessly against the shipped argv: ffmpeg accepts audio ~0.2s past its last video
+///    packet and then accepts nothing at all, on every encoder, container and
+///    `-max_interleave_delta` value tried.
+/// 2. With the muxer stopped, ffmpeg stops draining stdin too, and the capture loop's
+///    in-flight `write_all` parks.
+/// 3. The loop can then never reach the top of its `while !stop` test, so it never runs
+///    the stop tail, so it never closes stdin. And the stdin EOF is the ONE thing that
+///    releases ffmpeg: it finishes the video stream, the muxer stops waiting for video,
+///    and the audio drains in about a second (measured: 0.8s to 1.7s).
+///
+/// So the deadlock ring closes on our own unabandonable write standing in front of the
+/// EOF that would break it. Making the write abandonable is what opens the ring, and it
+/// is why this is a completion of DRAGON-160 rather than a new mechanism.
+///
+/// ## Why this is not a throughput regression
+///
+/// Measured on the incident's own shape (1528x982 BGRA, 30fps, ~6MB a frame, the shipped
+/// VideoToolbox argv): 26.9fps and 161.5 MB/s with the old blocking pipe, 27.0fps and
+/// 161.9 MB/s through this. The spin-then-sleep backoff [`CoveringWriter`] already uses
+/// covers the fast regime, which is where nearly all of the waiting is: 108470 spins
+/// against 2098 backoff sleeps over a twelve second session.
+///
+/// ## What it costs when it fires
+///
+/// A frame abandoned MID-write leaves partial bytes in a rawvideo stream that has no
+/// frame boundaries to resynchronize on, so [`truncated`](Self::truncated) latches and
+/// the caller skips the stop tail's covering ticks entirely rather than shearing every
+/// frame after it. That is a few frames of video possibly ending short of the audio,
+/// paid only on a pipeline that had already stopped moving, in exchange for the
+/// recording existing at all.
+pub(super) struct SessionVideoSink<'a> {
+    /// Declared FIRST so it drops FIRST: the guard restores the pipe's original flags,
+    /// and it must do that while `stdin` below is still open.
+    _nb: NonblockingStdin,
+    stdin: ChildStdin,
+    stop: &'a std::sync::atomic::AtomicBool,
+    /// When the CURRENT write first found the pipe full. Reset on every byte that lands,
+    /// so the budget is per stall and not per frame.
+    waiting_since: Option<std::time::Instant>,
+    spins: u32,
+    truncated: bool,
+}
+
+impl<'a> SessionVideoSink<'a> {
+    pub(super) fn new(stdin: ChildStdin, stop: &'a std::sync::atomic::AtomicBool) -> Self {
+        let _nb = NonblockingStdin::new(&stdin);
+        Self { _nb, stdin, stop, waiting_since: None, spins: 0, truncated: false }
+    }
+
+    /// True once a frame was abandoned mid-write, so the byte stream is no longer on a
+    /// frame boundary and no further video may be appended (see the type doc).
+    pub(super) fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Hand ffmpeg's stdin back to [`run_video_stop_tail`], restoring the pipe's original
+    /// flags on the way (the stop tail re-applies its own guard).
+    pub(super) fn into_stdin(self) -> ChildStdin {
+        let Self { _nb, stdin, .. } = self;
+        drop(_nb);
+        stdin
+    }
+
+    /// Back off between full-pipe retries, exactly as [`CoveringWriter`] does: yield while
+    /// the pipe is draining eagerly, sleep once the spins are spent. See
+    /// [`COVERING_WRITE_SPINS`] for why the spin phase is load-bearing.
+    fn back_off(&mut self) {
+        if self.spins < COVERING_WRITE_SPINS {
+            self.spins += 1;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(COVERING_WRITE_POLL);
+        }
+    }
+}
+
+impl Write for SessionVideoSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::ErrorKind;
+        use std::sync::atomic::Ordering;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // The two spellings of "the pipe is full", the same pair `CoveringWriter`
+            // reads: `WouldBlock` under POSIX `O_NONBLOCK`, a zero-byte success under
+            // Windows' `PIPE_NOWAIT`. Everything else is the pipe being gone.
+            let full = match self.stdin.write(buf) {
+                Ok(0) => true,
+                Ok(n) => {
+                    self.spins = 0;
+                    self.waiting_since = None;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => false,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+                Err(e) => return Err(e),
+            };
+            let waited = match self.waiting_since {
+                Some(since) => since.elapsed(),
+                None => {
+                    self.waiting_since = Some(std::time::Instant::now());
+                    Duration::ZERO
+                }
+            };
+            let stopping = self.stop.load(Ordering::Relaxed);
+            if !keep_waiting_for_pipe(stopping, waited) {
+                self.truncated = true;
+                log::warn!(
+                    "recording: ffmpeg stopped taking video after {waited:?} ({}); \
+                     abandoning the frame so the session can close its stdin and let \
+                     ffmpeg finish (DRAGON-712)",
+                    if stopping { "the session was stopping" } else { "mid-session stall" }
+                );
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "ffmpeg stopped draining its video pipe",
+                ));
+            }
+            if full {
+                self.back_off();
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stdin.flush()
+    }
+}
+
+/// A `Write` adapter over ffmpeg's NON-BLOCKING stdin that retries a FULL pipe until
+/// `deadline`, then gives up (DRAGON-711). This is the stop tail's covering writes, and
+/// only theirs: the capture loop writes to the raw blocking pipe as it always has.
+///
+/// What it fixes: [`NonblockingStdin`] makes a full pipe fail the write, and the covering
+/// loop treated that failure as final, so under a saturated encoder the covering frames
+/// were never written and the video stream ended SHORT of the audio — the DRAGON-78 rule
+/// broken by the very code that implements it. `-shortest` hid it (it trimmed the audio
+/// down to the short video instead); DRAGON-710 removed the flag and the shortfall showed
+/// as itself: 28.866s of video against 29.013s of audio, measured on Windows/MF at
+/// 5120x1440.
+///
+/// Why the retry lives HERE, at the byte level, rather than in the covering loop above:
+/// a full pipe interrupts a write MID-FRAME. Re-writing the whole frame after a partial
+/// write would push duplicate bytes into a rawvideo stream that has no frame boundaries
+/// to resynchronize on, and every later frame would be sheared. Resuming from the exact
+/// byte offset is the only correct retry, and only the writer knows that offset — which
+/// is also why the `covering` closure's `-> bool` contract did not need to grow a third
+/// state. `false` still means "stop the loop"; it now means it after the deadline, not
+/// after the first `EAGAIN`.
+///
+/// Bounded, never blocking (DRAGON-118, DRAGON-160): the pipe stays non-blocking, so a
+/// wedged ffmpeg that stopped draining without closing the pipe costs the budget and not
+/// a second more, and a wedge is still never MARKED here — a stop tail that ran out of
+/// patience is not evidence the muxer never wrote output.
+pub(super) struct CoveringWriter<'a, W: Write> {
+    inner: &'a mut W,
+    deadline: std::time::Instant,
+    spins: u32,
+}
+
+impl<'a, W: Write> CoveringWriter<'a, W> {
+    pub(super) fn new(inner: &'a mut W, deadline: std::time::Instant) -> Self {
+        Self { inner, deadline, spins: 0 }
+    }
+
+    /// Back off between full-pipe retries: yield first, sleep once the spins are spent.
+    fn back_off(&mut self) {
+        if self.spins < COVERING_WRITE_SPINS {
+            self.spins += 1;
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(COVERING_WRITE_POLL);
+        }
+    }
+}
+
+impl<W: Write> Write for CoveringWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::ErrorKind;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // The two spellings of "the pipe is full": `WouldBlock` under POSIX
+            // `O_NONBLOCK`, and a zero-byte success under Windows' `PIPE_NOWAIT`. Both
+            // are retryable; every other error is the pipe being gone, and waiting on a
+            // dead pipe would only spend the budget for nothing.
+            let full = match self.inner.write(buf) {
+                Ok(0) => true,
+                Ok(n) => {
+                    self.spins = 0;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => false,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+                Err(e) => return Err(e),
+            };
+            if std::time::Instant::now() >= self.deadline {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "covering write gave up on a full ffmpeg stdin pipe",
+                ));
+            }
+            if full {
+                self.back_off();
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// The pure salvage-vs-fail decision every owned worker's stop tail ends with: given
 /// how ffmpeg reaped (`wait_result`), whether the muxer was declared wedged
 /// (`muxer_wedged` — the watchdog/liveness kill, meaning it never wrote real output),
@@ -181,20 +531,27 @@ pub(super) fn salvage_decision(
 }
 
 /// The shared stop tail every RGBA owned worker (screencopy / PipeWire / SCK) runs once
-/// the capture loop and pump have finished: feed the FINAL covering video ticks
-/// NON-BLOCKING, close the stdin (EOF), kill a wedged muxer, reap ffmpeg BOUNDED
-/// (DRAGON-118), and return the pure [`salvage_decision`] — logging the same salvage
-/// warning the workers used to inline. Extracting it here (DRAGON-161) makes the
+/// the capture loop and pump have finished: feed the FINAL covering video ticks on a
+/// BOUNDED non-blocking write, close the stdin (EOF), kill a wedged muxer, reap ffmpeg
+/// BOUNDED (DRAGON-118), and return the pure [`salvage_decision`] — logging the same
+/// salvage warning the workers used to inline. Extracting it here (DRAGON-161) makes the
 /// bounded covering-write behavior — born macOS-only in [`NonblockingStdin`]
 /// (DRAGON-160) — the SINGLE implementation, so Linux gets it too.
 ///
-/// `covering` is called `count` times, each writing ONE covering frame to `stdin`; it
-/// returns `false` once a write fails. A covering-write failure is BENIGN under
-/// `-shortest` (ffmpeg already took all the video it wants; the pipe non-blocking means
-/// a full pipe returns `WouldBlock`), so — unlike the old blocking Linux loop, which
-/// set `muxer_wedged` on failure and then DELETED the temp — it merely stops the loop
-/// and never marks the muxer wedged. `count`/`covering` are skipped entirely when
-/// `muxer_wedged` is already set (a wedged muxer is being killed regardless).
+/// `covering` is called `count` times, each writing ONE covering frame; it returns
+/// `false` once a write fails. These writes are what MAKES the video at least as long as
+/// the audio (the DRAGON-78 rule), so failing one is a real loss, not a formality: this
+/// doc used to justify ignoring it with "the video is already long enough by the time
+/// these run", which was circular, and under a saturated encoder simply false
+/// (DRAGON-711). Every frame therefore goes through a [`CoveringWriter`], which retries
+/// a full pipe until [`COVERING_WRITE_BUDGET`] — ONE deadline shared by the whole phase —
+/// and only then reports the failure that stops the loop.
+///
+/// A stopped loop still never marks the muxer wedged and never deletes the temp (unlike
+/// the old blocking Linux loop, which did both): running out of patience with a full pipe
+/// says nothing about whether ffmpeg wrote real output, and the recording that IS on disk
+/// is worth more than the tick we could not deliver. `count`/`covering` are skipped
+/// entirely when `muxer_wedged` is already set (a wedged muxer is being killed regardless).
 ///
 /// Returns `Ok(())` to salvage/finalize the temp, `Err(reason)` to have already
 /// removed it and fail the recording (the caller does the `remove_file`).
@@ -203,17 +560,43 @@ pub(super) fn run_video_stop_tail(
     child: &mut std::process::Child,
     temp: &std::path::Path,
     muxer_wedged: bool,
+    truncated: bool,
     count: u32,
-    mut covering: impl FnMut(&mut ChildStdin) -> bool,
+    mut covering: impl FnMut(&mut dyn Write) -> bool,
 ) -> Result<(), String> {
     let mut stdin = stdin;
-    if !muxer_wedged {
-        // Non-blocking for the covering ticks: a stalled ffmpeg (audio was the shorter
-        // `-shortest` stream, so it stopped draining video without closing the pipe)
-        // yields `WouldBlock` and the loop stops, instead of an unbounded kernel park.
+    if truncated {
+        // DRAGON-712: the capture loop abandoned a frame mid-write, so the byte stream is
+        // no longer on a frame boundary. Appending covering frames here would shear every
+        // one of them (rawvideo has no boundaries to resynchronize on — see
+        // `CoveringWriter`'s doc), so the EOF below is the only thing left to do. The
+        // video may end short of the audio; that is the price of the pipeline having
+        // stopped moving, and it is far cheaper than the sheared tail or the wedge.
+        log::warn!(
+            "recording stop tail: a video frame was abandoned mid-write, so the covering \
+             ticks are skipped (the stream is not on a frame boundary); the video may end \
+             slightly short of the audio"
+        );
+    }
+    if !muxer_wedged && !truncated {
+        // Non-blocking for the covering ticks: a stalled ffmpeg (one that stopped
+        // draining video without closing the pipe) can never park this write in the
+        // kernel. `CoveringWriter` then spends at most `COVERING_WRITE_BUDGET` waiting
+        // for such a pipe to drain — the guard is what keeps that wait abandonable.
         let _nb = NonblockingStdin::new(&stdin);
+        let deadline = std::time::Instant::now() + COVERING_WRITE_BUDGET;
+        let mut sink = CoveringWriter::new(&mut stdin, deadline);
         for _ in 0..count {
-            if !covering(&mut stdin) {
+            if !covering(&mut sink) {
+                // Loud on purpose: this is the video ending short of the audio, the one
+                // thing the covering ticks exist to prevent, and it spent a whole
+                // `COVERING_WRITE_BUDGET` failing to. Either the pipe stayed full that
+                // long or it is gone; both are worth a line in the debug log.
+                log::warn!(
+                    "recording stop tail: a covering video write failed (full ffmpeg stdin \
+                     past the {COVERING_WRITE_BUDGET:?} deadline, or a closed pipe); the \
+                     video stream may end slightly short of the audio"
+                );
                 break;
             }
         }
@@ -225,7 +608,7 @@ pub(super) fn run_video_stop_tail(
     // Bounded reap (DRAGON-118): a healthy ffmpeg flushes its backlog and exits well
     // inside this; one that survives it is wedged and gets killed.
     let pid = child.id();
-    let wait_result = super::wait_or_kill(child, Duration::from_secs(30));
+    let wait_result = super::wait_or_kill(child, STOP_TAIL_REAP);
     let temp_alive = super::muxer_alive(temp);
     // DRAGON-432: `wait_or_kill` has already written any stderr tail to the debug log; this
     // picks up the ONE line worth showing a user. `salvage_decision`'s own strings say only
@@ -461,23 +844,120 @@ pub(super) fn mark_first_frame(
 /// like every other slot write here, and kept a separate function from
 /// [`mark_first_frame`] rather than a shared `fill` because the two slots' contracts differ
 /// and each doc has to be able to say where its own call belongs.
+///
+/// # This is NOT media 0, and it never reliably was (DRAGON-725)
+///
+/// It was documented as landing "a few milliseconds after" [`media_zero`], and the app
+/// therefore read media 0 off this slot. Both halves of that were wrong, and the second
+/// one made every baked ink mark lead the cursor that drew it by the whole span.
+///
+/// The span is the OPENING PHASE, and its length is not ours to choose. The phase ends
+/// when a video write returns inside one tick period, and ffmpeg paces the video pipe
+/// against the audio timestamps it has already received (the same lockstep gate DRAGON-712
+/// measured at the muxer and DRAGON-717 measured on the video pipe), so how long it takes
+/// is decided by ANOTHER PROCESS'S SCHEDULER. Measured with `debug test mac-rec-bench
+/// largest 5 videotoolbox 30 1245`, n=8 per build: 328ms median before the v0.34.0 batch,
+/// 480ms after it, and the range ran 54ms to 562ms. The "9 to 30ms" readings that made the
+/// old claim look true came from light-content window recordings whose first write happened
+/// to return inside one tick, not from the pipeline being fast.
+///
+/// **Levers tried, all MEASURED, all worse, so nobody re-runs them.** Restoring `-shortest`
+/// does shorten it (480ms to 206ms median) and is the ONLY thing that does, but DRAGON-710
+/// and DRAGON-712 both measured that flag losing recordings, so it stays gone. Delivering
+/// the audio EARLIER (deciding `pump`'s device-latency latch at pump entry, so the DRAGON-554
+/// opening prime renders at 203ms instead of 421ms) made it 5x WORSE, 2604ms median.
+/// Delivering it LATER (the pre-DRAGON-717 fixed render holdback) made it 6.7x worse,
+/// 3206ms. The shipped configuration already sits near that curve's optimum.
+///
+/// A related red herring, recorded here because it will look like the culprit to the next
+/// reader exactly as it did to the last one: `pump::SYS_LATENCY_LATCH_BUDGET` (350ms) holds
+/// the opening prime on every macOS and Windows session, because
+/// `audio::capture::MonitorCapture::latest_signed_latency_ms` structurally never reports on
+/// SCK or WASAPI and the latch only fails open once the budget expires. It is real, it is on
+/// the critical path, and cutting it is the 2604ms row above. Leave it alone.
+///
+/// So the fix was never to close the span. It is to stop inferring media 0 from it: that is
+/// [`super::RecordHandle::media_zero_at`], filled by [`media_zero`] itself.
+///
+/// `session_start` is media 0, taken so this can REPORT the span (DRAGON-725 acceptance 4).
+/// The old claim drifted silently for weeks because nothing measured it, so every session
+/// now says how long its opening took, and one past [`SETTLE_SPAN_WARN`] says so loudly.
 pub(super) fn mark_settled(
     slot: &std::sync::Mutex<Option<std::time::Instant>>,
     at: std::time::Instant,
+    session_start: std::time::Instant,
 ) {
     if let Ok(mut g) = slot.lock() {
         *g = Some(at);
     }
+    let span = at.saturating_duration_since(session_start);
+    if settle_span_is_notable(span) {
+        log::warn!(
+            "recording bring-up: the opening phase ran {:.0}ms past media 0, which is longer \
+             than the {:.0}ms this platform's openings are expected to need; the file and the \
+             UI are still correct (both count from media 0, DRAGON-725), but the opening's \
+             own ticks are close to outliving the capture queue's opening window and will \
+             start repeating frames",
+            span.as_secs_f64() * 1000.0,
+            SETTLE_SPAN_WARN.as_secs_f64() * 1000.0,
+        );
+    } else {
+        log::debug!(
+            "recording bring-up: the opening phase ran {:.0}ms past media 0 (DRAGON-725)",
+            span.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+/// How long an opening phase may run past media 0 before [`mark_settled`] says so at `warn`
+/// rather than `debug`.
+///
+/// Not a correctness bound: nothing downstream needs this span to be small any more, since
+/// the file and every UI readout count from media 0. It is a DRIFT DETECTOR, and it exists
+/// because the old "a few milliseconds" claim went wrong silently and stayed wrong for weeks.
+///
+/// The number is tied to a real edge rather than picked. Past
+/// `frame_queue::OPENING_STASH_MAX_SECS` the capture queue starts dropping the very frames
+/// the opening's ticks are waiting for, which is DRAGON-554's frozen opening returning, so
+/// the warning has to fire BEFORE that. Measured healthy openings top out at 562ms, so this
+/// sits comfortably above the normal band and comfortably below the edge.
+pub(super) const SETTLE_SPAN_WARN: std::time::Duration = std::time::Duration::from_millis(1500);
+
+const _: () = assert!(
+    SETTLE_SPAN_WARN.as_millis()
+        < (super::frame_queue::OPENING_STASH_MAX_SECS as u128) * 1000,
+    "the opening-span warning must fire BEFORE the capture queue's opening window expires \
+     (DRAGON-725): past that window the opening's own ticks lose the frames they are waiting \
+     for and the file opens on a repeated frame, which is the DRAGON-554 freeze"
+);
+
+/// Whether an opening phase's span past media 0 is long enough to report at `warn`.
+///
+/// Pure, unit-tested. The whole rule is [`SETTLE_SPAN_WARN`]; this exists so the comparison
+/// has one home and one test rather than being spelled inline at a call site nothing can
+/// exercise without a live recording.
+fn settle_span_is_notable(span: std::time::Duration) -> bool {
+    span >= SETTLE_SPAN_WARN
 }
 
 /// MEDIA TIME 0: the instant the whole pipeline is ready, which every owned worker takes
 /// immediately before spawning [`super::pump`] and after its ffmpeg exists (DRAGON-672).
 ///
-/// The file begins HERE, and the point is that this is the same instant the user is told
-/// recording began. The warming spinner is on screen for everything before it
-/// (`App::adopt_warm_start` declares live on `settled_at`, which lands a few milliseconds
-/// after this), so nothing captured before this instant was ever promised to the user, and
-/// nothing captured before it is kept.
+/// The file begins HERE, and everything that counts the FILE counts from here: the record
+/// chip's elapsed readout and the clock every live ink stroke is stamped against, both
+/// through [`super::RecordHandle::media_zero_at`], which this function fills.
+///
+/// The warming spinner is on screen for everything before it, so nothing captured before
+/// this instant was ever promised to the user, and nothing captured before it is kept.
+///
+/// THE SPINNER DOES NOT CLEAR HERE, and this doc used to say it did (DRAGON-725). It said
+/// `settled_at` "lands a few milliseconds after this", and the app read media 0 off that
+/// slot on the strength of it. The opening phase sits between the two and is 328 to 480ms
+/// on a measured mac, not a few milliseconds, so every baked ink mark led the cursor that
+/// drew it by that span and the elapsed readout undercounted the finished file by it. The
+/// live declaration is a SEPARATE question with a separate answer; see
+/// [`mark_settled`] for the measurements, and for the levers that were tried on the span
+/// and made it worse.
 ///
 /// WHY THIS MOVED, because it used to be [`OwnedAudioStart::capture_start`] and the reason
 /// it was matters. DRAGON-417 anchored media 0 at the audio pre-flight's ENTRY, and its
@@ -533,7 +1013,12 @@ pub(super) fn mark_settled(
 /// be able to park a worker forever; hitting the cap is logged at `warn` and the session
 /// starts anyway. The app also OPENS the gate when it abandons a warming worker, so an
 /// ordinary countdown cancel never reaches that cap.
+///
+/// `slot` is [`super::RecordHandle::media_zero_at`], and filling it HERE rather than at the
+/// six call sites is the point: the function that mints media 0 is the function that
+/// reports it, so a worker cannot anchor its clock at one instant and tell the UI another.
 pub(super) fn media_zero(
+    slot: &std::sync::Mutex<Option<std::time::Instant>>,
     audio_capture_start: std::time::Instant,
     start_gate: Option<&std::sync::atomic::AtomicBool>,
     mic_rx: &std::sync::mpsc::Receiver<StreamTap>,
@@ -589,6 +1074,10 @@ pub(super) fn media_zero(
         while sys_rx.try_recv().is_ok() {}
     }
     let now = std::time::Instant::now();
+    // Poison-tolerant like every other slot write here: a recording never dies of a lock.
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(now);
+    }
     log::debug!(
         "media-clock session: media 0 is the settled pipeline; dropping {:.0}ms of audio \
          captured before it, which the user was shown a spinner or a countdown for \
@@ -609,6 +1098,56 @@ const START_GATE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// the taps never build a backlog, and the gate read is free, so the file starts within one
 /// of these of the app's promotion.
 const GATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// RETRACT the two bring-up signals a worker published for a session it is now ABANDONING
+/// to a successor (DRAGON-730). The mirror of [`media_zero`] and [`mark_settled`], and the
+/// only thing in this module that ever empties a slot.
+///
+/// Exactly one caller can reach this: the pipewire zero-copy worker's `ZcOutcome::Fallback`
+/// return, which hands the whole recording to the CPU pipewire worker on the SAME slots (see
+/// `record::start_pipewire_recording`, where both workers are given clones of one `Arc`).
+/// Every other worker on every platform owns its session to the end, and the screencopy
+/// zero-copy arm's post-media-0 failures are all `ZcOutcome::Done`, so none of them has
+/// anything to retract.
+///
+/// WHY it exists, and what it does NOT fix on its own. A filled slot is supposed to describe
+/// the worker that owns the session; a fallback left the abandoned attempt's media 0 sitting
+/// in a slot the UI reads every 100ms, so the elapsed readout counted from an instant no
+/// delivered file begins at and every ink stroke was stamped against it. Emptying the slots
+/// is the invariant half of that fix and it is NOT the whole of it: a poll that already read
+/// the abandoned value cannot be reached from here, which is why `app::recording`'s
+/// `warm_adoption` also RE-ADOPTS a media 0 that changed. Read that function's doc before
+/// deciding either half is redundant, because neither covers the other's case.
+///
+/// BOTH slots go, not just media 0, and that is deliberate. `warm_adoption`'s guard rests on
+/// the ordering "a poll that can see `settled_at` has already been able to see
+/// `media_zero_at`", and retracting only the earlier one would invert that pair for the
+/// length of the successor's bring-up. Clearing `settled_at` also puts the record chip back
+/// on its warming face while the CPU worker comes up, which is simply true: the pipeline is
+/// not steady, and DRAGON-422 will refuse a STOP pressed in that window anyway.
+///
+/// [`super::RecordHandle::warm_at`] is deliberately left alone. Nothing counts from it, and
+/// [`mark_first_frame`] overwrites, so the successor's own first frame lands there before it
+/// reaches [`media_zero`] and the bring-up log line reads the right pair either way.
+///
+/// Poison-tolerant like every other slot access here: a recording never dies of a lock.
+#[cfg(feature = "zero-copy")]
+pub(super) fn retract_bring_up(
+    media_zero_at: &std::sync::Mutex<Option<std::time::Instant>>,
+    settled_at: &std::sync::Mutex<Option<std::time::Instant>>,
+) {
+    if let Ok(mut g) = media_zero_at.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = settled_at.lock() {
+        *g = None;
+    }
+    log::debug!(
+        "recording bring-up: this attempt is handing the session to its fallback worker, so \
+         its media 0 and settled marks are retracted; the successor publishes its own \
+         (DRAGON-730)"
+    );
+}
 
 /// Called INLINE by every worker, as the first thing after it has confirmed a genuinely
 /// real captured frame and reported it through [`mark_first_frame`].
@@ -762,6 +1301,59 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     Ok(started)
 }
 
+/// DRAGON-725: the opening-span drift detector. One module of its own, per the house norm
+/// that a file with several pure decisions names a module per decision.
+#[cfg(test)]
+mod settle_span_tests {
+    use super::{SETTLE_SPAN_WARN, settle_span_is_notable};
+    use std::time::Duration;
+
+    /// The measured healthy band stays QUIET. These are the real readings from
+    /// `debug test mac-rec-bench largest 5 videotoolbox 30 1245`: 54ms was the shortest
+    /// opening seen on the pre-batch build and 562ms the longest on the batch. A detector
+    /// that cried at either would be noise nobody reads.
+    #[test]
+    fn the_measured_healthy_band_says_nothing() {
+        for ms in [0, 15, 54, 206, 328, 480, 562] {
+            assert!(
+                !settle_span_is_notable(Duration::from_millis(ms)),
+                "{ms}ms is inside the measured healthy band and must not warn"
+            );
+        }
+    }
+
+    /// A span that has grown past the band DOES warn. 2985ms is the worst reading in the
+    /// owner's own log, from a saturated 6400x3600 encode, and it is exactly the shape of
+    /// growth this exists to catch.
+    #[test]
+    fn a_span_past_the_band_warns() {
+        assert!(settle_span_is_notable(SETTLE_SPAN_WARN));
+        assert!(settle_span_is_notable(Duration::from_millis(2985)));
+        assert!(settle_span_is_notable(Duration::from_secs(30)));
+    }
+
+    /// The threshold is an inclusive edge, so the boundary case is decided rather than
+    /// left to whichever way the comparison happened to be written.
+    #[test]
+    fn the_threshold_is_inclusive() {
+        assert!(!settle_span_is_notable(SETTLE_SPAN_WARN - Duration::from_millis(1)));
+        assert!(settle_span_is_notable(SETTLE_SPAN_WARN));
+    }
+
+    /// The relation the compile-time assert pins, stated once more at runtime so a reader
+    /// grepping the tests finds the WHY: the warning has to beat the capture queue's
+    /// opening window, because past that the opening's ticks lose their frames.
+    #[test]
+    fn the_warning_fires_before_the_opening_queue_gives_up() {
+        let window = Duration::from_secs(crate::record::frame_queue::OPENING_STASH_MAX_SECS);
+        assert!(
+            SETTLE_SPAN_WARN < window,
+            "SETTLE_SPAN_WARN ({SETTLE_SPAN_WARN:?}) must fire before the opening window \
+             ({window:?}) so the warning arrives before the file's opening starts repeating"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::salvage_decision;
@@ -830,5 +1422,290 @@ mod tests {
         let e = salvage_decision(&Err(std::io::Error::other("reap boom")), false, false)
             .unwrap_err();
         assert!(e.contains("reap boom"), "surfaces the io error: {e}");
+    }
+}
+
+/// The DRAGON-711 bounded-retry writer, proved against fake pipes so it runs on every
+/// platform (the real-ffmpeg half of this contract is `sck`'s `nonblocking_*` tests,
+/// which are macOS-only, and the recording E2Es).
+#[cfg(test)]
+mod covering_writer_tests {
+    use super::{COVERING_WRITE_BUDGET, CoveringWriter};
+    use std::io::{Error, ErrorKind, Write};
+    use std::time::{Duration, Instant};
+
+    /// A pipe that reports itself FULL (in either platform's spelling) for the first
+    /// `full_for` attempts of each write, then accepts at most `chunk` bytes — the shape
+    /// of a real pipe behind a saturated encoder.
+    struct FakePipe {
+        wrote: Vec<u8>,
+        full_for: u32,
+        seen: u32,
+        chunk: usize,
+        /// `true` = Windows `PIPE_NOWAIT` (a zero-byte success), `false` = POSIX
+        /// `O_NONBLOCK` (`WouldBlock`). Both spellings must retry identically.
+        zero_byte_full: bool,
+    }
+
+    impl FakePipe {
+        fn new(full_for: u32, chunk: usize, zero_byte_full: bool) -> Self {
+            Self { wrote: Vec::new(), full_for, seen: 0, chunk, zero_byte_full }
+        }
+    }
+
+    impl Write for FakePipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.seen < self.full_for {
+                self.seen += 1;
+                return if self.zero_byte_full {
+                    Ok(0)
+                } else {
+                    Err(Error::new(ErrorKind::WouldBlock, "full"))
+                };
+            }
+            self.seen = 0;
+            let n = self.chunk.min(buf.len());
+            self.wrote.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pipe that is full FOREVER — the stalled ffmpeg that stopped draining without
+    /// closing.
+    struct AlwaysFull {
+        zero_byte_full: bool,
+    }
+
+    impl Write for AlwaysFull {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            if self.zero_byte_full {
+                Ok(0)
+            } else {
+                Err(Error::new(ErrorKind::WouldBlock, "full"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pipe whose reader is GONE. Waiting on it would only burn the budget.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(Error::new(ErrorKind::BrokenPipe, "gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The whole point (DRAGON-711): a momentarily full pipe used to end the covering
+    /// phase on the FIRST `EAGAIN`, so the frames that make video ≥ audio were never
+    /// written. Both platforms' spellings of "full" must now be ridden out.
+    #[test]
+    fn a_full_pipe_is_retried_and_the_frame_lands_whole() {
+        for zero_byte_full in [false, true] {
+            let mut pipe = FakePipe::new(3, 4096, zero_byte_full);
+            let frame: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let ok = {
+                let mut w = CoveringWriter::new(&mut pipe, deadline);
+                w.write_all(&frame).is_ok()
+            };
+            assert!(ok, "a full-then-draining pipe must not fail the write");
+            assert_eq!(pipe.wrote, frame, "every byte, in order, exactly once");
+        }
+    }
+
+    /// Partial writes RESUME at the byte offset instead of restarting the frame. A
+    /// rawvideo stream has no frame boundaries to resynchronize on, so a restart would
+    /// shear every later frame — which is why the retry lives in the writer and not in
+    /// the covering loop.
+    #[test]
+    fn a_partial_write_resumes_instead_of_repeating_bytes() {
+        let mut pipe = FakePipe::new(1, 7, false);
+        let frame: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut w = CoveringWriter::new(&mut pipe, Instant::now() + Duration::from_secs(5));
+            w.write_all(&frame).expect("the write completes");
+        }
+        assert_eq!(pipe.wrote.len(), frame.len(), "no duplicated bytes");
+        assert_eq!(pipe.wrote, frame);
+    }
+
+    /// The bound (DRAGON-118: nothing in the record path waits unboundedly). A pipe that
+    /// never drains costs the deadline and stops — it does not park, and it does not wait
+    /// a second longer than it was given.
+    #[test]
+    fn a_pipe_that_never_drains_gives_up_at_the_deadline() {
+        for zero_byte_full in [false, true] {
+            let mut pipe = AlwaysFull { zero_byte_full };
+            let budget = Duration::from_millis(120);
+            let started = Instant::now();
+            let err = {
+                let mut w = CoveringWriter::new(&mut pipe, started + budget);
+                w.write_all(&[0u8; 4096]).unwrap_err()
+            };
+            let took = started.elapsed();
+            assert_eq!(err.kind(), ErrorKind::TimedOut, "names the deadline, not the pipe");
+            assert!(took >= budget, "it must actually spend the budget: {took:?}");
+            assert!(took < budget + Duration::from_secs(2), "and must not overrun it: {took:?}");
+        }
+    }
+
+    /// A DEAD pipe is not a full one: it fails instantly, so a closed ffmpeg never costs
+    /// the covering budget.
+    #[test]
+    fn a_closed_pipe_fails_immediately() {
+        let started = Instant::now();
+        let mut pipe = Broken;
+        let err = {
+            let mut w = CoveringWriter::new(&mut pipe, started + Duration::from_secs(30));
+            w.write_all(&[0u8; 64]).unwrap_err()
+        };
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe, "the real error survives");
+        assert!(started.elapsed() < Duration::from_secs(1), "and is not waited on");
+    }
+
+    /// The budget is the STOP TAIL's, not one frame's: a hundred covering frames against
+    /// a dead-full pipe still cost one budget, because the deadline is taken once.
+    #[test]
+    fn the_budget_covers_the_whole_phase_not_each_frame() {
+        let mut pipe = AlwaysFull { zero_byte_full: false };
+        let budget = Duration::from_millis(80);
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut written = 0u32;
+        {
+            let mut w = CoveringWriter::new(&mut pipe, deadline);
+            for _ in 0..100 {
+                if w.write_all(&[0u8; 4096]).is_err() {
+                    break;
+                }
+                written += 1;
+            }
+        }
+        assert_eq!(written, 0, "nothing lands on a pipe that never drains");
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(2),
+            "one shared deadline, not one per frame: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The shipped budget, pinned. It has to be big enough to drain a saturated encoder's
+    /// tail (~1s of video, the DRAGON-710 worst case) and small enough that the 30s
+    /// bounded reap after it still fits inside `progress::SESSION_STALL_SECS`.
+    #[test]
+    fn the_shipped_budget_stays_in_its_band() {
+        assert!(
+            COVERING_WRITE_BUDGET >= Duration::from_secs(2),
+            "too small to drain a saturated encoder's tail"
+        );
+        assert!(
+            COVERING_WRITE_BUDGET <= Duration::from_secs(10),
+            "long enough to be felt when a user stops a recording"
+        );
+    }
+}
+
+/// The capture loop's abandonable video write (DRAGON-712): the pure retry decision, and
+/// the sink's behaviour against a real pipe whose reader never drains.
+#[cfg(test)]
+mod session_video_sink_tests {
+    use super::{
+        HOT_WRITE_STALL_BUDGET, STOP_ABANDON_GRACE, keep_waiting_for_pipe,
+    };
+    use std::time::Duration;
+
+    /// Mid-session a full pipe is ordinary backpressure: keep waiting, all the way to the
+    /// stall budget. This is the property that keeps the fix from costing throughput.
+    #[test]
+    fn mid_session_a_full_pipe_is_backpressure_not_a_failure() {
+        assert!(keep_waiting_for_pipe(false, Duration::ZERO));
+        assert!(keep_waiting_for_pipe(false, Duration::from_millis(1)));
+        assert!(keep_waiting_for_pipe(false, Duration::from_secs(1)));
+        assert!(keep_waiting_for_pipe(false, HOT_WRITE_STALL_BUDGET - Duration::from_millis(1)));
+    }
+
+    /// A mid-session stall still ENDS. Without this the loop would spin forever on a
+    /// wedged ffmpeg and never reach its own stop tail, which is DRAGON-297's shape.
+    #[test]
+    fn a_mid_session_stall_ends_at_the_stall_budget() {
+        assert!(!keep_waiting_for_pipe(false, HOT_WRITE_STALL_BUDGET));
+        assert!(!keep_waiting_for_pipe(false, HOT_WRITE_STALL_BUDGET + Duration::from_secs(1)));
+    }
+
+    /// THE regression this ticket exists for: once the user has asked to stop, the write
+    /// must give up quickly, because it is standing in front of the stdin EOF that is the
+    /// only thing that releases a jammed ffmpeg.
+    #[test]
+    fn a_stopping_session_abandons_the_frame_at_the_grace() {
+        assert!(keep_waiting_for_pipe(true, Duration::ZERO));
+        assert!(keep_waiting_for_pipe(true, STOP_ABANDON_GRACE - Duration::from_millis(1)));
+        assert!(!keep_waiting_for_pipe(true, STOP_ABANDON_GRACE));
+        assert!(!keep_waiting_for_pipe(true, STOP_ABANDON_GRACE + Duration::from_secs(30)));
+    }
+
+    /// The stop grace must be far shorter than the mid-session one. They answer different
+    /// questions (see `keep_waiting_for_pipe`), and a stop that inherited the mid-session
+    /// budget would spend twelve seconds before closing the pipe, which is most of the
+    /// way to the session bound on its own.
+    #[test]
+    fn the_stop_grace_is_far_shorter_than_the_mid_session_budget() {
+        assert!(
+            STOP_ABANDON_GRACE * 10 <= HOT_WRITE_STALL_BUDGET,
+            "stopping must abandon an order of magnitude sooner than a mid-session stall: \
+             {STOP_ABANDON_GRACE:?} vs {HOT_WRITE_STALL_BUDGET:?}"
+        );
+    }
+
+    /// The whole point, end to end, against a REAL pipe nobody reads: a stopping session's
+    /// frame write returns instead of parking in the kernel, so the caller can reach the
+    /// stdin EOF. Before DRAGON-712 this write was blocking and this test could not
+    /// terminate.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopping_write_returns_instead_of_parking_on_an_unread_pipe() {
+        use super::SessionVideoSink;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        // A real child holding a real pipe it never reads: `cat` with its stdin piped and
+        // its own stdin never touched would still drain, so use `sleep`, which reads
+        // nothing at all. The pipe fills and stays full.
+        let Ok(mut child) = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("SKIP: no `sleep` binary to hold an unread pipe");
+            return;
+        };
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stop = AtomicBool::new(true);
+        let mut sink = SessionVideoSink::new(stdin, &stop);
+        let frame = vec![0u8; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let err = sink.write_all(&frame).expect_err("an unread pipe cannot take 4MB");
+        let took = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
+        assert!(sink.truncated(), "an abandoned frame must latch `truncated`");
+        assert!(
+            took < STOP_ABANDON_GRACE * 4,
+            "a stopping write must abandon near its grace, not park: took {took:?}"
+        );
+        drop(sink.into_stdin());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stop.load(Ordering::Relaxed);
     }
 }

@@ -20,9 +20,18 @@
   request); see `site-src/assets/custom.css`, which also carries the one-rule
   slot for dropping a real photograph in later.
 
-  Everything here is self-contained. No external assets, no scripts, no fonts
-  beyond what Material already ships. The styling lives in
+  Everything here is self-contained. No external assets and no fonts beyond
+  what Material already ships. The styling lives in
   `site-src/assets/custom.css` under the `.cck-` prefix.
+
+  The ONE script involved is `site-src/assets/download.js` (DRAGON-704), wired
+  through `extra_javascript` in mkdocs.yml exactly as the stylesheet is wired
+  through `extra_css`. It reads the `data-cck-*` attributes on the download
+  button below and may upgrade that button to a direct link for the visitor's
+  own machine. Everything it touches is written here as a WORKING fallback
+  first, so the page is complete and correct with the script removed, blocked
+  or broken. Read that file's header before changing any `data-cck-*`
+  attribute.
 #}
 {% extends "main.html" %}
 
@@ -30,10 +39,20 @@
   ONE canonical description sentence, reused by the card, the meta preview tags
   and the structured data below, so the four can never drift apart.
 #}
-{% set cck_description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations." %}
+{% set cck_description = "Screen capture/recording with live annotations, OCR/QR/barcode scanning, color picker with saved palettes, and cloud uploads for every platform." %}
 {% set cck_og_image = config.site_url ~ "assets/og-card.png" %}
 {% set cck_download = config.repo_url ~ "/releases/latest" %}
+{% set cck_all_downloads = config.repo_url ~ "/releases" %}
 {% set cck_author_url = "https://github.com/Frosthaven" %}
+
+{#
+  The release API the download button asks for the newest artifacts and their
+  file names (DRAGON-704). DERIVED from `repo_url` rather than written out, so
+  the project is named in exactly one place in the whole config and the two can
+  never point at different repositories.
+#}
+{% set cck_repo_slug = config.repo_url | replace("https://github.com/", "") %}
+{% set cck_releases_api = "https://api.github.com/repos/" ~ cck_repo_slug ~ "/releases/latest" %}
 
 {#
   Social previews and structured data.
@@ -198,23 +217,107 @@
         <h1 class="cck-glass__title">Cosmic Capture Kit</h1>
         <p class="cck-glass__desc">{{ cck_description }}</p>
         {#
-          A secondary availability line under the description. Placeholder copy for
-          now (the platforms and their versions), to be revisited later.
+          A secondary availability line under the description: the platforms and
+          the oldest release of each that this project supports. Real copy since
+          DRAGON-704, replacing the placeholder that named the wrong versions.
         #}
         <p class="cck-glass__tagline">Capture &bull; Annotate &bull; Share</p>
-        <p class="cck-glass__platforms">Available for Windows 11, macOS 14, and COSMIC.</p>
+        <p class="cck-glass__platforms">Available for Windows 10/11, macOS 13+, and Linux (COSMIC).</p>
         {#
-          One download link for every platform. The release page always lists the
-          newest assets, and the per-platform story (which file, which OS
-          versions) lives in the release notes' own download table, so it is not
-          repeated here.
+          The download button, in its FALLBACK state: one link to the releases
+          page, labelled "Download", correct for every visitor on every platform.
+          The release page always lists the newest assets, and the per-platform
+          story (which file, which OS versions) lives in the release notes' own
+          download table, so it is not repeated here.
+
+          `site-src/assets/download.js` may then upgrade it in place to a direct
+          link for the visitor's own machine, rewriting the href, the label and
+          the analytics attributes together. It does that only when it is
+          CONFIDENT: it never guesses a Mac's architecture from a user agent
+          string (Safari on Apple silicon reports an Intel one), and it never
+          points at an artifact the release does not actually carry. Anything
+          less certain, including no JavaScript at all, leaves this markup
+          exactly as written.
+
+          The `data-cck-*` attributes:
+
+            data-cck-download       marks the button for the script to find.
+            data-cck-releases-api   where to ask what the newest artifacts are
+                                    called. api.github.com is used rather than
+                                    the release download URLs because only the
+                                    API sends CORS headers, and because the file
+                                    names carry a version that must never be
+                                    hardcoded here.
+            data-cck-event          the analytics event a click sends, which the
+                                    script rewrites along with the href.
+            data-cck-file           the exact release asset name, added by the
+                                    script when it upgrades the button, and one
+                                    of the four parameters the `download` event
+                                    carries.
+            data-cck-arch           the architecture of that asset.
+            data-cck-kind           its artifact kind.
+            data-cck-version        the release version it came from.
+                                    Those last four are absent from this markup
+                                    on purpose: they exist only on an upgraded
+                                    button, and the script writes each one only
+                                    when it positively derived it, so an absent
+                                    attribute is what makes a parameter be left
+                                    out of the event (DRAGON-707).
+            data-cck-label          the text the script rewrites. It is a span,
+                                    not the button itself, because the button
+                                    also holds the platform logos below and
+                                    rewriting the whole button would delete them.
+            data-cck-os             one platform logo, hidden until detection
+                                    picks it.
+
+          THE PLATFORM LOGOS. All three ship in the markup and all three ship
+          HIDDEN, so the icon is bound to detection by construction: the script
+          reveals exactly the one it resolved, and no icon can ever appear on the
+          generic fallback button, which stays the plain "Download" it has always
+          been. They are Material's own bundled FontAwesome brand icons, inlined
+          at BUILD time by the include below, so the page still makes no external
+          request and still ships no icon file of its own. Both macOS labels,
+          Apple silicon and Intel, share the one Apple logo.
+
+          The `hidden` attribute rather than a class is deliberate: it hides them
+          through the browser's own stylesheet, so they stay hidden even if
+          `custom.css` never arrives.
+
+          Analytics is consent gated by Material's own banner and sends exactly
+          two events, both of them nothing but a count:
+
+            download_from_releases  this button in its fallback state, or the
+                                    All downloads link below, so the visitor
+                                    went to choose for themselves. No parameters.
+            download                an upgraded button, carrying `file` (the
+                                    exact release asset name), `arch`, `kind`
+                                    and `version` (DRAGON-707). All four
+                                    describe the artifact and none of them
+                                    describe the visitor. The script's own
+                                    header is where each one's derivation is
+                                    written out.
+
+          Rejecting consent, or blocking the analytics script, makes both a
+          no-op; neither one ever delays the click.
         #}
         <p class="cck-glass__cta">
           <a
             href="{{ cck_download }}"
             class="md-button md-button--primary cck-glass__download"
+            data-cck-download
+            data-cck-releases-api="{{ cck_releases_api }}"
+            data-cck-event="download_from_releases"
           >
-            Download
+            <span class="cck-glass__os" data-cck-os="windows" aria-hidden="true" hidden>
+              {% include ".icons/fontawesome/brands/windows.svg" %}
+            </span>
+            <span class="cck-glass__os" data-cck-os="macos" aria-hidden="true" hidden>
+              {% include ".icons/fontawesome/brands/apple.svg" %}
+            </span>
+            <span class="cck-glass__os" data-cck-os="linux" aria-hidden="true" hidden>
+              {% include ".icons/fontawesome/brands/linux.svg" %}
+            </span>
+            <span data-cck-label>Download</span>
           </a>
         </p>
         {#
@@ -226,12 +329,24 @@
           this" is usually "what changed", and the Download button above says
           nothing about that (DRAGON-515).
 
-          One row, two links, separated by a dot the screen reader skips. Keeping
-          both inside the SAME paragraph is deliberate: the card's centring is a
-          fixed full-viewport grid with an auto-margin card, so every extra block
-          costs height that the short-viewport rules then have to claw back.
+          "All downloads" leads the row (DRAGON-704). It is the escape hatch from
+          the button above: whatever that button resolved to, this reaches every
+          artifact of every platform and architecture, which is what a reader
+          wants when they are downloading for a machine other than the one they
+          are reading on. It points at the releases LIST rather than at
+          `releases/latest`, because an older version is one of the things a
+          person comes here for.
+
+          One row, three links, separated by dots the screen reader skips.
+          Keeping them all inside the SAME paragraph is deliberate: the card's
+          centring is a fixed full-viewport grid with an auto-margin card, so
+          every extra block costs height that the short-viewport rules then have
+          to claw back. The row is ordinary inline text, so a narrow card wraps
+          it rather than overflowing, and it needs no styling of its own.
         #}
         <p class="cck-glass__docs">
+          <a href="{{ cck_all_downloads }}" data-cck-event="download_from_releases">All downloads</a>
+          <span class="cck-glass__dot" aria-hidden="true">&middot;</span>
           <a href="{{ 'getting-started/' | url }}">Read the documentation</a>
           <span class="cck-glass__dot" aria-hidden="true">&middot;</span>
           <a href="{{ 'releases/' | url }}">Release notes</a>

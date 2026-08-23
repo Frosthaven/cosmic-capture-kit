@@ -578,8 +578,8 @@ body:has(.cck-space) .md-content__inner::before {
 
 /*
  * The platform-availability line: a secondary note beneath the description, so it
- * reads a step smaller and dimmer than `.cck-glass__desc`. Placeholder copy for
- * now; it sits between the description and the download button.
+ * reads a step smaller and dimmer than `.cck-glass__desc`. It sits between the
+ * description and the download button.
  */
 .md-typeset .cck-glass__platforms {
   font-size: clamp(0.55rem, 1.6vmin, 0.68rem);
@@ -597,10 +597,17 @@ body:has(.cck-space) .md-content__inner::before {
  * The download button is styled here rather than left to `.md-button--primary`
  * for the same reason as the text above: the theme's primary colour tracks the
  * colour scheme, and this button always sits on the dark card.
+ *
+ * The width is a MINIMUM with a `max-width` ceiling, never a fixed size, because
+ * the label is not fixed: DRAGON-704 may rewrite "Download" to "Download for
+ * macOS (Apple Silicon)", the longest label it can produce. The button grows to
+ * fit on a roomy card and wraps inside its own pill on a narrow one, rather than
+ * pushing past the card's edge.
  */
 .md-typeset .cck-glass__download.md-button {
   display: inline-block;
   min-width: clamp(8rem, 30vmin, 12rem);
+  max-width: 100%;
   padding: clamp(0.4rem, 1.5vmin, 0.62rem) clamp(1rem, 4vmin, 1.6rem);
   font-size: clamp(0.68rem, 2vmin, 0.8rem);
   font-weight: 700;
@@ -614,6 +621,40 @@ body:has(.cck-space) .md-content__inner::before {
     transform 120ms ease,
     background-color 120ms ease,
     box-shadow 120ms ease;
+}
+
+/*
+ * The platform logo inside the download button (DRAGON-704). All three ship in
+ * the markup with the `hidden` attribute and the detection script clears it on
+ * exactly one, so the icon appears only on a button that resolved a platform.
+ *
+ * `[hidden]` needs its own rule here. The browser's own stylesheet hides a
+ * hidden element with `display: none`, but ANY author `display` rule outranks
+ * it, so the rule above would un-hide all three. Repeating the attribute in the
+ * selector gives it the higher specificity and keeps `!important` out of it.
+ *
+ * The colour is `currentColor`, not a literal black, so the logo is exactly the
+ * near-black the label already uses and the two stay together through the
+ * button's hover state. The height is `1em` with an automatic width, so each
+ * logo keeps its own proportions (the Apple mark is taller than it is wide) and
+ * every one of them stands the height of the label beside it.
+ */
+.md-typeset .cck-glass__download .cck-glass__os {
+  display: inline-block;
+  margin-right: 0.45em;
+  vertical-align: -0.125em;
+  line-height: 1;
+}
+
+.md-typeset .cck-glass__download .cck-glass__os[hidden] {
+  display: none;
+}
+
+.md-typeset .cck-glass__download .cck-glass__os svg {
+  display: block;
+  height: 1em;
+  width: auto;
+  fill: currentColor;
 }
 
 .md-typeset .cck-glass__download.md-button:hover,

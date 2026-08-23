@@ -200,10 +200,34 @@ impl crate::app::App {
                 Severity::Warn,
             )
         }];
+        // DRAGON-694: the same guard, on a second trigger, so it takes the same capability
+        // gate. Its own setting, and default OFF, because this one changes what the
+        // recording CONTAINS: the pause lands in the recorded system track, and annotating
+        // over a video that is meant to keep playing is a real use of the tools.
+        mixing.push(if crate::audio::ducking::media_pause_available() {
+            Item::new(
+                "Pause other media during live annotation",
+                "While recording, arming a drawing tool will attempt to pause other audio. \
+                 Paused audio will resume when you return to the pointer, and when the \
+                 recording ends.",
+                toggle(self.pause_others_during_ink, |a0| Msg::Settings(SettingsMsg::SetPauseOthersDuringInk(a0))),
+            )
+            .reset_with(
+                self.pause_others_during_ink,
+                d.pause_others_during_ink,
+                |a0| Msg::Settings(SettingsMsg::SetPauseOthersDuringInk(a0)),
+            )
+        } else {
+            gated_row(
+                "Pause other media during live annotation",
+                if self.pause_others_during_ink { "On" } else { "Off" },
+                Severity::Warn,
+            )
+        });
         if !crate::audio::ducking::media_pause_available() {
             mixing.push(Item::note(widget::text::caption(
                 "This build cannot reach other media players over the session bus, so their \
-                 audio keeps playing while you edit.",
+                 audio keeps playing while you edit or annotate.",
             )));
         }
         mixing.extend([

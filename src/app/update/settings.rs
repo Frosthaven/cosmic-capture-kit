@@ -263,17 +263,21 @@ impl App {
                     // (On macOS the extra argument is inert: the bare check ignores it
                     // and the launch still early-branches to the daemon.) Its own
                     // single-instance lock makes a redundant spawn a harmless no-op.
-                    // DRAGON-465: the token is `instance::RESIDENT_ARG`, the same constant
+                    // DRAGON-465: the word is `instance::TRAY_ARG`, the same constant
                     // `main` reads through `instance::daemon_intent_from_args`. It was a raw
                     // literal here, which is exactly how the post-update relaunch came to be
                     // spawned bare: an argv-building launcher that owns its own copy of the
                     // rule can silently stop agreeing with the one that reads it.
+                    // DRAGON-695 made it a PUBLIC command (`tray`) as well as a launcher's
+                    // word, and it now runs the resident regardless of the setting, which is
+                    // exactly what this spawn wants: the setting was just turned ON, and this
+                    // process may not have re-read it yet.
                     // `self_exe` (DRAGON-510): the resident is meant to outlive every
                     // capture process, including this one, so an AppImage mount path
                     // would be exactly the wrong thing to hand it.
                     if let Ok(exe) = crate::util::self_exe() {
                         match std::process::Command::new(&exe)
-                            .arg(crate::instance::RESIDENT_ARG)
+                            .arg(crate::instance::TRAY_ARG)
                             .spawn()
                         {
                             Ok(child) => log::info!("resident on: spawned resident (pid {})", child.id()),
@@ -366,6 +370,34 @@ impl App {
             SettingsMsg::SetPreviewOpacity(v) => {
                 self.preview_overlay_opacity = v.clamp(0.0, 1.0);
                 self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetCountdownSecs(s) => {
+                // Free-form field; the last value that parses to 0..=99 wins, the same range
+                // the `timer` command and the `--timer` modifier enforce.
+                if self.countdown_secs.edit(s, 0..=99) {
+                    // The overlay's delay chips light the NEAREST preset, so a value typed
+                    // here is visible there even when no chip offers it exactly. And a typed
+                    // value takes over from a per-launch `--timer` override, exactly as a chip
+                    // press does.
+                    self.delay_idx = crate::app::countdown_index(self.countdown_secs.value);
+                    self.countdown_override = None;
+                    self.save_state();
+                }
+                Task::none()
+            }
+            SettingsMsg::SetRecordMicDefault(on) => {
+                self.record_mic = on;
+                self.save_state();
+                self.sync_meters();
+                self.refresh_tray_audio();
+                Task::none()
+            }
+            SettingsMsg::SetRecordSystemAudioDefault(on) => {
+                self.record_system_audio = on;
+                self.save_state();
+                self.sync_meters();
+                self.refresh_tray_audio();
                 Task::none()
             }
             SettingsMsg::SetRecordFps(s) => {
@@ -733,6 +765,16 @@ impl App {
             SettingsMsg::SetMuteOthersDuringPreview(b) => {
                 self.mute_others_during_preview = b;
                 self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetPauseOthersDuringInk(b) => {
+                self.pause_others_during_ink = b;
+                self.save_state();
+                // DRAGON-694: turning it OFF while a tool is armed resumes the players right
+                // away, rather than holding them until the next disarm. Turning it ON does
+                // the mirror image. `sync_ink_duck` is idempotent, so the ordinary case (no
+                // recording, no armed tool) costs one comparison.
+                self.sync_ink_duck();
                 Task::none()
             }
             SettingsMsg::SetDuckSystemAudio(b) => {
@@ -1368,7 +1410,7 @@ impl App {
     ///
     /// Portable on the outside: the body branches by `cfg`, so both settings-window mints
     /// (`App::open_settings` for the in-process convert, `OpenSettingsAtStartup` for a
-    /// standalone `--settings` process) call it with no `cfg` of their own. BOTH need it.
+    /// standalone `settings` process) call it with no `cfg` of their own. BOTH need it.
     /// That is not belt and braces: the Cloud page's reload was wired to only one of them and
     /// the other listed no accounts at all, which on macOS is the only mint there is.
     pub(in crate::app) fn autostart_settings_opened(&mut self) {

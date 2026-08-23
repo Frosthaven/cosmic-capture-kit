@@ -117,6 +117,11 @@ pub enum CaptureMsg {
     /// clean of our own UI now, so run the re-grab. The twin of `DoPixelCapture` for a
     /// session that CONTINUES (nothing was torn down; the overlay just stopped painting).
     ScanShotTick,
+    /// DRAGON-695: drain the scanner's control inlet. Carries no data; the inlet lives on
+    /// `App::scan_control` and the only verb it can deliver is "read the screen again". Fires
+    /// only while the scanner kind is live and the inlet bound (Linux), so a session that
+    /// never scans never ticks.
+    ScanControlPoll,
     /// DRAGON-460: advance a busy glyph's spin. Carries no data — the angle lives on the
     /// App (`busy_spin`) and this only says "another frame".
     ///
@@ -159,8 +164,10 @@ pub enum CaptureMsg {
     /// nothing left to force (DRAGON-353 removed the copy-to-clipboard setting it bypassed),
     /// so this is simply the editor-less delivery, reached one keypress earlier.
     ///
-    /// A no-op unless the gate's conditions hold; the message re-checks them, since it could
-    /// arrive by some other route than the chord.
+    /// A no-op unless the gate's conditions hold; the message re-checks the ones the capture
+    /// itself cannot survive without, since it could arrive by some other route than the
+    /// chord. Since DRAGON-756 that includes "no colour pick is up", because a pick mints the
+    /// same overlays and carries the same remembered region.
     CopySelection,
     /// Drag delta (logical px) moving the toolbar on a given output (by name, so each
     /// monitor's toolbar moves independently).
@@ -169,6 +176,13 @@ pub enum CaptureMsg {
     ToolbarDragEnd,
     /// Result of the startup ScreenCast-portal probe (reachable, advertised source-type bitflags).
     PipewireProbed(bool, u32),
+    /// DRAGON-718: the pinned-launch portal hold's outer bound expired. Mint the native
+    /// pickers rather than wait on a probe that has not answered.
+    ///
+    /// Linux-only, like the hold itself: the xdg portal this waits on does not exist on
+    /// macOS or Windows, where capture is SCK/WGC and there is nothing to hold for.
+    #[cfg(target_os = "linux")]
+    PortalSeedDeadline,
     /// The in-flight portal ScreenCast request finished — its result is in `pw_slot`.
     // Matched (and handled) cross-platform, but only CONSTRUCTED on Linux (the portal
     // cast path); gating it would fragment the shared `update_capture` match, so allow

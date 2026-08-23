@@ -32,13 +32,14 @@ So "primary + C" means Ctrl+C on Linux and Windows, and Cmd+C on macOS.
 **Esc is a step back, not always a quit.** What it does depends on what is
 happening:
 
-- While a recording is running, it stops the recording and saves it.
+- While a recording is running, it puts the drawing tools back on Pointer. It
+  never stops the recording. Stop and cancel stay on the toolbar and in the
+  tray menu.
 - While a countdown is running, it cancels the countdown and puts you back in
   region select. Your selection is still there.
 - Otherwise it closes the tool.
 
-Esc is the shortcut named **Close** in settings, so changing it there changes
-all three.
+Esc is a fixed shortcut. It cannot be changed.
 
 **primary + C** only fires when all of this is true: you are in region mode, you
 have actually drawn a region, you are not scanning, and no countdown or
@@ -57,15 +58,44 @@ up before you press record and watch the buttons light up as you do.
 
 | Keys | What it does |
 |---|---|
-| Enter | Stops the recording and saves it |
-| M | Turns the microphone on or off |
-| S | Turns system audio on or off |
+| Shift+Alt+Enter | Stops the recording and saves it |
+| Shift+Alt+M | Turns the microphone on or off |
+| Shift+Alt+S | Turns system audio on or off |
+
+These three are the same on every computer. There is no Cmd version on macOS.
+
+They are chords rather than plain keys so they cannot fire while you are
+typing, and so the microphone and stop keys can be registered with your
+desktop's own shortcut service. Where your desktop offers that service, those
+two work even when the app you are recording has the focus, which is what hold
+to talk needs. COSMIC does not offer it yet, so there they work while the
+capture overlay has the focus.
 
 If you have turned on push to talk in
-[Settings, under Audio & Video](../settings/audio-video.md), the microphone key
-stops being a switch and becomes a hold to talk key instead. Your microphone is
-live only while you hold it down. That works before a recording starts too, so
-you can hold the key and watch the microphone button light up as a quick test.
+[Settings, under Audio & Video](../settings/audio-video.md), the microphone
+shortcut stops being a switch and becomes a hold to talk key instead. Your
+microphone is live only while you hold it down. That works before a recording
+starts too, so you can hold the keys and watch the microphone button light up
+as a quick test.
+
+## While you are drawing on a recording
+
+[Live annotation](live-annotation.md) lets you draw on the screen while a
+recording runs, and the drawing is in the video. While a drawing tool is turned
+on the pointer becomes a crosshair and the screen is a drawing, until you put
+the tools back on Pointer.
+
+| Keys | What it does |
+|---|---|
+| Esc | Puts the tools back on Pointer |
+| V | The same thing. It is the key the editor uses for its own Pointer tool |
+| Right click | The same thing again |
+
+All three do exactly the same thing, so use whichever is nearest. None of them
+can stop or cancel the recording.
+
+These three are fixed shortcuts. They cannot be changed, and they do nothing
+while no drawing tool is turned on.
 
 ## While scanning
 

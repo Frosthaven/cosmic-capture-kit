@@ -23,8 +23,8 @@
 //!   [`crate::recording_ui::visible_tray_menu`] model (DRAGON-574 + the hide round),
 //!   so the surfaces can never
 //!   drift. Idle, in three blocks (DRAGON-680 items 22 and 25): the launchers (the scan
-//!   row, the "Colors" submenu, the "Capture" submenu, the "Record" submenu), a
-//!   separator, the "Countdown Timer: NN" radio submenu (persisting `delay_idx`, the
+//!   row, the "Color" submenu, the "Capture" submenu, the "Record" submenu), a
+//!   separator, the "Countdown Timer: NN" radio submenu (persisting `countdown_secs`, the
 //!   same field every capture launch reads) and the "Audio Recording: <state>" radio
 //!   submenu (the DRAGON-558 persistent audio-arm control), a separator, Settings...,
 //!   Quit. While a child records: the three controls lead (Pause/Resume Recording,
@@ -67,17 +67,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// The CLI flag the SIGUSR1 "capture NOW" default spawns (Region). The menu launchers spawn
-/// via [`crate::recording_ui::CaptureAction::spawn_args`] (the ONE shared mapping); this
-/// constant names only the second-launch default so both agree on it.
-const REGION_FLAG: &str = "--region";
+/// The argv the SIGUSR1 "capture NOW" default spawns (a region screenshot). The menu
+/// launchers spawn via [`crate::recording_ui::CaptureAction::spawn_args`] (the ONE shared
+/// mapping); this constant names only the second-launch default so both agree on it.
+/// DRAGON-695 made it two tokens, like every other capture spelling.
+const REGION_ARGV: &[&str] = &["capture", "--region"];
 
-/// Spawn the full app as a DETACHED one-shot child with `flag`. A thin wrapper over the ONE
-/// portable spawn path ([`crate::recording_ui::spawn_capture_child`]) so the resident, the
-/// mac daemon, and the child-owned recording trays launch byte-identical detached children.
-/// Best-effort: a spawn failure just logs (the tray keeps working).
-fn spawn_child(flag: &str) {
-    crate::recording_ui::spawn_capture_child(flag);
+/// Spawn the full app as a DETACHED one-shot child with `args`. A thin wrapper over the ONE
+/// portable spawn path ([`crate::recording_ui::spawn_capture_child_args`]) so the resident,
+/// the mac daemon, and the child-owned recording trays launch byte-identical detached
+/// children. Best-effort: a spawn failure just logs (the tray keeps working).
+fn spawn_child(args: &[&str]) {
+    let _ = crate::recording_ui::spawn_capture_child_args(args, &[]);
 }
 
 // ── SIGUSR1: a second bare launch asks us to capture NOW ─────────────────────
@@ -190,7 +191,7 @@ struct ResidentTray {
     /// directly with the pair it just persisted.
     armed_mic: bool,
     armed_system: bool,
-    /// The persisted countdown preset index (`delay_idx`), the state the "Countdown
+    /// The persisted countdown as a preset INDEX (nearest to `countdown_secs`), the state the "Countdown
     /// Timer: NN" submenu titles and marks itself from (DRAGON-574). Cached and kept
     /// fresh exactly like the audio arms above (mtime tick + the idle pick's own write).
     delay_idx: usize,
@@ -292,7 +293,7 @@ fn audio_pick(t: &mut ResidentTray, choice: crate::recording_ui::AudioArmState) 
 /// The submenu is disabled while a child records, but the guard re-checks a FRESH
 /// snapshot anyway (some hosts still deliver picks into disabled submenus, and a menu
 /// opened idle can be picked after a recording started). Idle: persist the preset index
-/// (`delay_idx`, the same field every capture launch reads) and update the cached render
+/// (`countdown_secs`, the same field every capture launch reads) and update the cached render
 /// state with what was written.
 fn countdown_pick(t: &mut ResidentTray, index: usize) {
     let st = t.ipc.snapshot();
@@ -357,15 +358,15 @@ fn build_menu_items(
                 ),
                 action => {
                     // A launcher / Settings: spawn a one-shot child via the ONE portable
-                    // path. `spawn_args` because a record entry's argv is its capture
-                    // twin's flag plus `--video` (DRAGON-559). A row that spawns a child
+                    // path. `spawn_args` because a record entry's argv is the `record` verb
+                    // plus its target (DRAGON-559, respelled by DRAGON-695). A row that spawns a child
                     // defers past the menu dismiss (DRAGON-574: the dropdown was getting
                     // baked into the fallback's frozen frame; DRAGON-598 derived the set
                     // from `spawn_args` so a new row cannot fall out of it). DRAGON-600
                     // moved WHERE that wait happens: the host owns the dropdown and closes
                     // it only when the launched process takes keyboard focus, so the child
                     // is tagged and does the waiting, and the spawn itself is immediate.
-                    let args = action.spawn_args().unwrap_or(&[REGION_FLAG]);
+                    let args = action.spawn_args().unwrap_or(REGION_ARGV);
                     let from_menu = crate::recording_ui::spawn_waits_for_menu_dismiss(action);
                     items.push(
                         StandardItem {
@@ -396,7 +397,7 @@ fn build_menu_items(
                     submenu: rows
                         .into_iter()
                         .map(|row| {
-                            let args = row.action.spawn_args().unwrap_or(&[REGION_FLAG]);
+                            let args = row.action.spawn_args().unwrap_or(REGION_ARGV);
                             StandardItem {
                                 label: row.label.to_string(),
                                 // Belt and braces: a host that opens a disabled submenu
@@ -429,9 +430,54 @@ fn build_menu_items(
             TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled } => {
                 items.push(countdown_submenu_items(delay_idx, enabled, accent));
             }
+            TrayItem::Radio { menu: RadioSubmenu::Ink, enabled } => {
+                items.extend(ink_flat_items(st.ink, enabled, accent));
+            }
         }
     }
     items
+}
+
+/// The "Live Annotations" block as FOUR TOP-LEVEL ksni rows (DRAGON-757, replacing
+/// DRAGON-693's submenu), the resident's twin of the recording tray's [`crate::tray`]
+/// builder: Pointer, Marker, Magic Marker, Clear Marks, each with the glyph the recording
+/// toolbar's button for it draws, the armed tool marked in its LABEL.
+///
+/// The whole reasoning, including WHY the rows carry no toggle type and what that has to do
+/// with X11, lives on the recording tray's `ink_flat_items` and on
+/// `recording_ui::ink_row_label`. It is not repeated here, because the two Linux surfaces
+/// must render this block identically and one explanation is what keeps them honest.
+///
+/// The block is emitted only while a child records, so every route here is a RELAY: the child
+/// owns the ink selector, the scene and the surface, and the mark comes from the state the
+/// child reports back over IPC (`RecordingState::ink`, the fifth wire field). There is no
+/// idle branch to split on the way [`audio_pick`] has, because there is nothing to draw on
+/// while idle, and nothing is marked locally either: the resident holds no ink state of its
+/// own to update optimistically.
+fn ink_flat_items(
+    current: crate::ink::InkTool,
+    enabled: bool,
+    accent: [u8; 3],
+) -> Vec<ksni::MenuItem<ResidentTray>> {
+    use crate::recording_ui::{ink_items, ink_row_label, InkAction};
+    use ksni::menu::StandardItem;
+    ink_items(current)
+        .into_iter()
+        .map(|row| {
+            let action = row.action;
+            StandardItem {
+                label: ink_row_label(row),
+                enabled,
+                icon_data: crate::tray::menu_icon_png(Some(row.icon), accent),
+                activate: Box::new(move |t: &mut ResidentTray| match action {
+                    InkAction::Pick(tool) => t.ipc.send(Command::InkTool(tool)),
+                    InkAction::Clear => t.ipc.send(Command::InkClear),
+                }),
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
 }
 
 /// The "Audio Recording: <state>" radio SUBMENU as one ksni item (DRAGON-558): the title
@@ -515,6 +561,10 @@ fn countdown_submenu_items(
 /// submenu titles) — so the whole composition is unit-testable without a D-Bus / ksni
 /// host. `#[cfg(test)]` because only the tests consume it; the live menu builds ksni
 /// items directly.
+///
+/// A model entry does NOT map one-to-one onto a rendered row any more (DRAGON-757: the
+/// annotation entry becomes four top-level rows), so this is a `flat_map` and each arm says
+/// how many rows it stands for.
 #[cfg(test)]
 fn resident_menu_shapes(
     st: &RecordingState,
@@ -526,19 +576,31 @@ fn resident_menu_shapes(
     let state = crate::recording_ui::AudioArmState::from_arms(arms.0, arms.1);
     visible_tray_menu(st.recording, st.paused)
         .into_iter()
-        .map(|entry| match entry {
-            TrayItem::Control(c) => (c.label.to_string(), true),
-            TrayItem::Separator => (String::new(), true),
+        .flat_map(|entry| match entry {
+            TrayItem::Control(c) => vec![(c.label.to_string(), true)],
+            TrayItem::Separator => vec![(String::new(), true)],
             TrayItem::Action { item, enabled } => match item.action {
-                CaptureAction::Quit => ("Quit Cosmic Capture Kit Tray".to_string(), enabled),
-                _ => (item.label.to_string(), enabled),
+                CaptureAction::Quit => {
+                    vec![("Quit Cosmic Capture Kit Tray".to_string(), enabled)]
+                }
+                _ => vec![(item.label.to_string(), enabled)],
             },
-            TrayItem::Launchers { menu, enabled, .. } => (menu.label().to_string(), enabled),
+            TrayItem::Launchers { menu, enabled, .. } => {
+                vec![(menu.label().to_string(), enabled)]
+            }
             TrayItem::Radio { menu: RadioSubmenu::Audio, enabled } => {
-                (crate::recording_ui::audio_submenu_title(state), enabled)
+                vec![(crate::recording_ui::audio_submenu_title(state), enabled)]
             }
             TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled } => {
-                (crate::recording_ui::countdown_submenu_title(delay_idx), enabled)
+                vec![(crate::recording_ui::countdown_submenu_title(delay_idx), enabled)]
+            }
+            // The one entry that renders as several rows: four top-level annotation rows,
+            // labelled exactly as [`ink_flat_items`] labels them, armed mark included.
+            TrayItem::Radio { menu: RadioSubmenu::Ink, enabled } => {
+                crate::recording_ui::ink_items(st.ink)
+                    .into_iter()
+                    .map(|row| (crate::recording_ui::ink_row_label(row), enabled))
+                    .collect()
             }
         })
         .collect()
@@ -754,7 +816,7 @@ pub fn run(daemon_intent: bool) -> ! {
     // Linux-only predicate that DRAGON-473 then subsumed).
     if !daemon_intent {
         log::info!("resident: capture-intent launch became the resident; spawning the capture");
-        spawn_child(REGION_FLAG);
+        spawn_child(REGION_ARGV);
     }
 
     // 2b. Repair a STALE autostart entry (DRAGON-628). We are the resident, which is the
@@ -778,7 +840,9 @@ pub fn run(daemon_intent: bool) -> ! {
     // DRAGON-574: the countdown preset (`delay_idx`) rides the same seed + tick.
     let persisted = crate::state::load();
     let arms = (persisted.record_mic, persisted.record_system_audio);
-    let delay_idx = persisted.delay_idx;
+    // DRAGON-695: the persisted countdown is exact SECONDS; the submenu marks the nearest
+    // preset row.
+    let delay_idx = crate::recording_ui::countdown_preset_index(persisted.countdown_secs);
     let tray = ResidentTray {
         ipc: ipc.clone(),
         accent,
@@ -827,8 +891,8 @@ pub fn run(daemon_intent: bool) -> ! {
     // by the macOS one-click installer today; a Linux consume is a no-op until a
     // Linux install flow exists).
     if crate::update::take_post_update_marker() {
-        crate::recording_ui::spawn_capture_child_with_env(
-            "--settings",
+        crate::recording_ui::spawn_capture_child_args(
+            &["settings"],
             &[(crate::update::SETTINGS_TAB_ENV, "about")],
         );
     }
@@ -837,7 +901,7 @@ pub fn run(daemon_intent: bool) -> ! {
         .spawn(|| {
             std::thread::sleep(crate::update::DAEMON_STARTUP_CHECK_DELAY);
             crate::update::notify_daemon_startup_if_update_available(|| {
-                spawn_child("--settings");
+                spawn_child(&["settings"]);
             });
         })
         .expect("spawn resident update-notice thread");
@@ -877,7 +941,7 @@ pub fn run(daemon_intent: bool) -> ! {
         }
         if USR1_PENDING.swap(false, Ordering::SeqCst) {
             log::info!("resident: SIGUSR1 → default capture");
-            spawn_child(REGION_FLAG);
+            spawn_child(REGION_ARGV);
         }
         // DRAGON-179: follow the app's effective accent — when a settings process
         // SAVES the config (Theme override toggled / accent picked), re-tint the
@@ -898,7 +962,7 @@ pub fn run(daemon_intent: bool) -> ! {
                 let now = effective_accent_rgb();
                 let p = crate::state::load();
                 let now_arms = (p.record_mic, p.record_system_audio);
-                let now_delay = p.delay_idx;
+                let now_delay = crate::recording_ui::countdown_preset_index(p.countdown_secs);
                 if now != last_accent || now_arms != last_arms || now_delay != last_delay {
                     last_accent = now;
                     last_arms = now_arms;
@@ -945,32 +1009,32 @@ mod tests {
     use super::*;
 
     fn rec(recording: bool, paused: bool, mic: bool, system: bool) -> RecordingState {
-        RecordingState { recording, paused, mic, system }
+        RecordingState { recording, paused, mic, system, ..Default::default() }
     }
 
     #[test]
-    fn capture_flags_match_the_shared_launch_flags() {
+    fn capture_argvs_match_the_shared_launch_table() {
         // The launchers + Settings map to the exact CLI argv via the ONE shared
-        // `CaptureAction::spawn_args` (the record entries are their capture twins plus
-        // `--video`, DRAGON-559); the SIGUSR1 default is Region.
-        assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["--scan"][..]));
-        assert_eq!(CaptureAction::Region.spawn_args(), Some(&["--region"][..]));
-        assert_eq!(CaptureAction::Window.spawn_args(), Some(&["--window"][..]));
-        assert_eq!(CaptureAction::Monitor.spawn_args(), Some(&["--monitor"][..]));
+        // `CaptureAction::spawn_args` (DRAGON-695: `capture --<target>` for a still,
+        // `record --<target>` for a recording); the SIGUSR1 default is a region screenshot.
+        assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["scan"][..]));
+        assert_eq!(CaptureAction::Region.spawn_args(), Some(&["capture", "--region"][..]));
+        assert_eq!(CaptureAction::Window.spawn_args(), Some(&["capture", "--window"][..]));
+        assert_eq!(CaptureAction::Monitor.spawn_args(), Some(&["capture", "--monitor"][..]));
         assert_eq!(
             CaptureAction::RecordRegion.spawn_args(),
-            Some(&["--region", "--video"][..])
+            Some(&["record", "--region"][..])
         );
         assert_eq!(
             CaptureAction::RecordWindow.spawn_args(),
-            Some(&["--window", "--video"][..])
+            Some(&["record", "--window"][..])
         );
         assert_eq!(
             CaptureAction::RecordMonitor.spawn_args(),
-            Some(&["--monitor", "--video"][..])
+            Some(&["record", "--monitor"][..])
         );
-        assert_eq!(CaptureAction::Settings.spawn_args(), Some(&["--settings"][..]));
-        assert_eq!(REGION_FLAG, "--region");
+        assert_eq!(CaptureAction::Settings.spawn_args(), Some(&["settings"][..]));
+        assert_eq!(REGION_ARGV, ["capture", "--region"]);
     }
 
     #[test]
@@ -986,7 +1050,7 @@ mod tests {
             shapes,
             vec![
                 (crate::recording_ui::SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
                 (String::new(), true), // separator
@@ -1002,25 +1066,37 @@ mod tests {
     #[test]
     fn recording_menu_leads_with_audio_then_the_controls() {
         // While a child records (DRAGON-574 + the recolour-round amendment; hide
-        // round; re-laid-out by DRAGON-680 items 22 and 25): the Audio Recording submenu
-        // leads the WHOLE menu, then the three controls and a separator, then the
+        // round; re-laid-out by DRAGON-680 items 22 and 25, and led by DRAGON-693's Live
+        // Annotations block, FLAT at the top level since DRAGON-757, with its own divider):
+        // then the Audio Recording submenu,
+        // then the three controls and a separator, then the
         // launcher block and Settings. The flagged-off rows are HIDDEN, so no Record, no
         // Countdown Timer and no Quit, and the empty middle block takes its divider with
         // it (the COSMIC applet cannot gray or subdue a dbusmenu row, so the uniform
         // answer everywhere is omission; see `visible_tray_menu`). The audio title
         // carries the LIVE arms (system-only here), not the persisted ones, and a radio
         // pick applies live.
+        //
+        // The annotation rows are the resident's, so they must read EXACTLY as the
+        // recording tray's do, mark and all: `rec` leaves the ink selector at its default,
+        // so Pointer carries it.
         let shapes = resident_menu_shapes(&rec(true, false, false, true), (true, false), 2);
+        let mark = crate::recording_ui::INK_ARMED_MARK;
         assert_eq!(
             shapes,
             vec![
+                (format!("Pointer {mark}"), true),
+                ("Marker".to_string(), true),
+                ("Magic Marker".to_string(), true),
+                (crate::recording_ui::CLEAR_MARKS_LABEL.to_string(), true),
+                (String::new(), true), // the annotation block's own divider
                 ("Audio Recording: System Only".to_string(), true),
                 ("Pause Recording".to_string(), true),
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
                 (crate::recording_ui::SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),

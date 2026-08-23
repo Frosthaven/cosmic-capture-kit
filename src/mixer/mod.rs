@@ -145,6 +145,38 @@ impl Mixer {
         self.tracks[track].stats()
     }
 
+    /// Tell every track that the render just performed was DRAGON-554's opening prime
+    /// (DRAGON-743): the one render this recorder issues ahead of what the sources have
+    /// delivered, so a chunk that lands inside it afterwards is an expected drop rather
+    /// than lost audio. See `Track::mark_opening_prime` and `track`'s module doc.
+    ///
+    /// The pump calls this immediately after priming, so the mark IS the prime's reach
+    /// and no constant has to travel from `record::pump` down into the mixer to say so.
+    /// Nothing else calls it, and a mixer that is never marked classifies drops exactly
+    /// as it did before.
+    pub(crate) fn mark_opening_prime(&mut self) {
+        for track in &mut self.tracks {
+            track.mark_opening_prime();
+        }
+    }
+
+    /// The media position through which EVERY track has contiguous samples: the MINIMUM
+    /// of the tracks' write horizons (`Track::write_horizon`), in seconds.
+    ///
+    /// This is how far `record::pump` may render with NOTHING left to wait for
+    /// (DRAGON-717). Sources stamp contiguously and holes are silence-filled at push
+    /// time, so a position below every track's horizon has already been decided; a
+    /// position above the slowest track's horizon is one that track can still fill.
+    /// Taking the MIN is what makes it safe per track rather than on average.
+    ///
+    /// Renders themselves pad every track to the same frame count, so this never falls
+    /// behind what has already been rendered, and it is therefore monotone except across
+    /// a `truncate_to` (a pause taking placed samples back), where it drops by design.
+    pub(crate) fn delivered_through(&self) -> f64 {
+        let frames = self.tracks.iter().map(|t| t.write_horizon()).min().unwrap_or(0);
+        frames as f64 / SAMPLE_RATE as f64
+    }
+
     /// Take back every track's samples placed at or after media position `media` — what
     /// `record::pump` calls the instant it freezes the clock for a pause, so audio
     /// captured after that instant never reaches the file (see `Track::truncate_to` for

@@ -1,4 +1,4 @@
-//! End-to-end A/V-sync measurement for the `--make-sync-clip` / `--calibrate-sync`
+//! End-to-end A/V-sync measurement for the `debug make-sync-clip` / `debug calibrate-sync`
 //! calibration flow (DRAGON-119).
 //!
 //! Recordings on COSMIC carry a large "audio leads video" offset caused by
@@ -45,7 +45,7 @@ const MIN_LUMA_RANGE: f32 = 16.0;
 /// Minimum RMS swing (0..1) for the series to contain beeps (~ -46 dBFS).
 const MIN_RMS_RANGE: f32 = 0.005;
 
-/// The filename `--make-sync-clip` writes by default.
+/// The filename `debug make-sync-clip` writes by default.
 pub(crate) const SYNC_CLIP_NAME: &str = "cck-sync-reference.mp4";
 
 /// One flash/beep offset measurement over a whole recording.

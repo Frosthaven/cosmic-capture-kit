@@ -359,7 +359,12 @@ fn read_ledgers(runtime_dir: &str, self_pid: u32, live: &dyn Fn(u32) -> bool) ->
 
 /// Whether `name` is a recording temp ([`super::recording_temp_path`]'s shape: a HIDDEN
 /// `.{stem}.recording.mkv` beside the recording it will become).
-fn is_recording_temp(name: &str) -> bool {
+///
+/// **Pure**, unit-tested, and shared with the finalize pass since DRAGON-748
+/// (`finalize::finalize_owns_temp` is the other caller). This is the ONE predicate for that
+/// shape, so "what this sweep may recover" and "what finalize may delete once it has
+/// delivered" cannot drift into disagreeing about what a recording temp even is.
+pub(super) fn is_recording_temp(name: &str) -> bool {
     name.starts_with('.') && name.ends_with(TEMP_SUFFIX) && name.len() > TEMP_SUFFIX.len() + 1
 }
 

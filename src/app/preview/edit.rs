@@ -2205,7 +2205,7 @@ pub fn apply_covermark(base: &mut RgbaImage, cm: Option<&Covermark>) {
 /// copied PNG bytes under the same name. The identical user action therefore produced a
 /// real JPEG or a mislabeled PNG depending on whether they had happened to draw on the
 /// capture first. There is now one answer: PNG, always, through
-/// [`crate::media::png::save_png`] — which is also what carries the `--inspect` `Comment`
+/// [`crate::media::png::save_png`] — which is also what carries the `debug inspect` `Comment`
 /// chunk (DRAGON-445).
 ///
 /// The naming side is [`super::naming::png_name`], which makes every still destination SAY
@@ -2277,7 +2277,7 @@ pub fn bake_image(
             None => super::annotate::apply_annotations(&mut rgba, annotations, curve),
         }
         // DRAGON-445: write through `media::png::save_png`, NOT `save_with_format`, so the
-        // baked file keeps the `Comment` text chunk `--inspect` reads
+        // baked file keeps the `Comment` text chunk `debug inspect` reads
         // (`type/source/mode/cursor`). `save_with_format` writes no ancillary chunks, so
         // every edited save silently lost the provenance a plain capture keeps — and it is
         // exactly the edited files someone is most likely to be asked about later.
@@ -2318,10 +2318,10 @@ fn is_png_file(path: &Path) -> bool {
 /// than something we fell into:
 ///
 /// * a source that already IS a PNG is copied BYTE FOR BYTE. Re-encoding identical pixels
-///   would gain nothing, churn the file, and drop the `--inspect` `Comment` chunk unless we
+///   would gain nothing, churn the file, and drop the `debug inspect` `Comment` chunk unless we
 ///   re-attached it (DRAGON-445) — the original bytes carry it for free. PNG in, the same
 ///   PNG out, is the honest answer.
-/// * a source that is NOT a PNG — an external image opened with `--preview`, since the
+/// * a source that is NOT a PNG — an external image opened with `editor`, since the
 ///   editor reads jpg/webp/gif/… too — is decoded and RE-WRITTEN as a PNG. Copying it would
 ///   put foreign bytes in a file whose name says PNG, which is the same lie from the other
 ///   direction (DRAGON-455).
@@ -3718,7 +3718,7 @@ mod tests {
     const PROVENANCE: &str =
         "Cosmic Capture Kit | type=photo | source=cosmic | mode=region | cursor=off";
 
-    /// THE regression: an edited/baked PNG keeps the `Comment` chunk `--inspect` reads.
+    /// THE regression: an edited/baked PNG keeps the `Comment` chunk `debug inspect` reads.
     ///
     /// `bake_image` wrote through `image::save_with_format`, which emits no ancillary
     /// chunks, so every save that went through the editor silently dropped the provenance a
@@ -3758,7 +3758,7 @@ mod tests {
         assert_eq!(crate::media::png::read_png_metadata(&f.0).as_deref(), Some(PROVENANCE));
     }
 
-    /// A source with NO comment (an imported/external image opened with `--preview`) must
+    /// A source with NO comment (an imported/external image opened with `editor`) must
     /// not gain an invented one. `save_png` writes no chunk for an empty string, which is
     /// the honest answer: we do not know where that file came from.
     #[test]
@@ -3986,7 +3986,7 @@ mod tests {
 
     /// The UNEDITED half, which never reached `bake_image` at all: a PNG source is delivered
     /// BYTE FOR BYTE. That is the deliberate answer, not a shortcut — identical pixels, and
-    /// the `--inspect` chunk carried through for free (DRAGON-445).
+    /// the `debug inspect` chunk carried through for free (DRAGON-445).
     #[test]
     fn dragon455_an_unedited_png_is_delivered_byte_for_byte() {
         let src = tmp_png("copy-src");

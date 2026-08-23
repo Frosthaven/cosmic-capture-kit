@@ -1,4 +1,6 @@
-/// Dispatch the hidden test/diagnostic harnesses behind a single `--test <name> [args]`
+use crate::{err, errln, outln};
+
+/// Dispatch the hidden test/diagnostic harnesses behind a single `debug test <name> [args]`
 /// flag. These are developer tools (benchmarks, capture/encode/audio probes), never part
 /// of the normal capture flow. `rest` is the arguments following the subcommand name.
 pub fn run_test(name: &str, rest: &[String]) {
@@ -45,7 +47,7 @@ pub fn run_test(name: &str, rest: &[String]) {
         #[cfg(target_os = "macos")]
         "mac-list-windows" => {
             for line in crate::platform::mac::dump_windows() {
-                println!("{line}");
+                outln!("{line}");
             }
         }
         #[cfg(target_os = "macos")]
@@ -94,12 +96,12 @@ pub fn run_test(name: &str, rest: &[String]) {
             let w: u32 = arg(0).parse().unwrap_or(3840);
             let h: u32 = arg(1).parse().unwrap_or(2160);
             let cap = arg(2) == "capture" || arg(2) == "pipeline";
-            eprintln!("bench-encoders at {w}x{h} ({})", if cap { "full pipeline (capture+encode)" } else { "encoder-only" });
+            errln!("bench-encoders at {w}x{h} ({})", if cap { "full pipeline (capture+encode)" } else { "encoder-only" });
             for e in crate::encode::available_encoders() {
                 let s = crate::encode::bench_encoder_pipeline(
                     &e.id, w, h, 8000, &crate::encode::Presets::default(), 1.5, cap,
                 );
-                eprintln!("{:<52} => {:.0} fps, ~{:.1} CPU cores", e.label, s.fps, s.cores);
+                errln!("{:<52} => {:.0} fps, ~{:.1} CPU cores", e.label, s.fps, s.cores);
             }
         }
         #[cfg(target_os = "linux")]
@@ -109,7 +111,9 @@ pub fn run_test(name: &str, rest: &[String]) {
             crate::record::bench_record(secs, fps, if arg(2).is_empty() { "gpu" } else { arg(2) });
         }
         #[cfg(target_os = "linux")]
-        "pw" => pw_test(source_type(rest)),
+        "linux-rec-bench" => linux_rec_bench(rest),
+        #[cfg(target_os = "linux")]
+        "pw" => pw_test(source_type(rest), rest),
         #[cfg(target_os = "linux")]
         "linux-focus-probe" => linux_focus_probe(arg(0)),
         #[cfg(target_os = "linux")]
@@ -117,18 +121,18 @@ pub fn run_test(name: &str, rest: &[String]) {
         #[cfg(feature = "zero-copy")]
         "dmabuf" => dmabuf_test(source_type(rest)),
         #[cfg(feature = "zero-copy")]
-        "screencopy-dmabuf" => println!("{}", crate::record::screencopy_dmabuf_test()),
+        "screencopy-dmabuf" => outln!("{}", crate::record::screencopy_dmabuf_test()),
         #[cfg(all(target_os = "linux", feature = "zero-copy"))]
-        "cuda-import" => println!("{}", crate::record::cuda_import_test()),
+        "cuda-import" => outln!("{}", crate::record::cuda_import_test()),
         "" | "help" | "list" => print_test_help(),
         other => {
-            eprintln!("unknown test '{other}'\nbackend                           probe every capture backend (caps + outputs + windows + cursor)\n");
+            errln!("unknown test '{other}'\nbackend                           probe every capture backend (caps + outputs + windows + cursor)\n");
             print_test_help();
         }
     }
 }
 
-/// `--test linux-focus-probe [id|title-substring]` (DRAGON-194): the empirical proof that
+/// `debug test linux-focus-probe [id|title-substring]` (DRAGON-194): the empirical proof that
 /// driving a toplevel's focus state changes its captured client-side decorations. Lists the
 /// toplevels + their `activated` state, grabs the target window's pixels (as-is), activates
 /// it via the cosmic toplevel manager (`compositor::activate`), re-lists, then re-grabs — so
@@ -141,9 +145,9 @@ fn linux_focus_probe(arg0: &str) {
     use crate::platform::compositor;
     let groups = compositor::list_toplevels();
     let all: Vec<_> = groups.values().flatten().cloned().collect();
-    println!("== toplevels (before) ==");
+    outln!("== toplevels (before) ==");
     for t in &all {
-        println!("  active={} id={} title={:?} rect={:?}", t.active, t.id, t.title, t.rect);
+        outln!("  active={} id={} title={:?} rect={:?}", t.active, t.id, t.title, t.rect);
     }
     let target = if !arg0.is_empty() {
         all.iter().find(|t| t.id == arg0 || t.title.contains(arg0)).cloned()
@@ -151,39 +155,39 @@ fn linux_focus_probe(arg0: &str) {
         all.iter().find(|t| !t.active).cloned()
     };
     let Some(t) = target else {
-        eprintln!("linux-focus-probe: no target (pass an id/title substring, or open a second window)");
+        errln!("linux-focus-probe: no target (pass an id/title substring, or open a second window)");
         return;
     };
-    println!("target: id={} title={:?} active={}", t.id, t.title, t.active);
+    outln!("target: id={} title={:?} active={}", t.id, t.title, t.active);
 
     let before = crate::screenshot::windows(std::slice::from_ref(&t.id));
     if let Some(img) = before.get(&t.id) {
         let p = std::env::temp_dir().join("cck-linux-focus-before.png");
         let _ = img.save(&p);
-        println!("BEFORE grab {}x{} -> {}", img.width(), img.height(), p.display());
+        outln!("BEFORE grab {}x{} -> {}", img.width(), img.height(), p.display());
     } else {
-        println!("BEFORE grab: none");
+        outln!("BEFORE grab: none");
     }
 
     // The capture path's VERIFIED activation (DRAGON-194 follow-up): poll-and-reissue
     // until the state sticks, so the probe exercises exactly what a real capture does.
     let confirmed = compositor::activate_until(&t.id, &t.id, true);
-    println!("activate_until confirmed: {confirmed}");
+    outln!("activate_until confirmed: {confirmed}");
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let groups2 = compositor::list_toplevels();
-    println!("== toplevels (after activate) ==");
+    outln!("== toplevels (after activate) ==");
     for t2 in groups2.values().flatten() {
         let marker = if t2.id == t.id { " <== target" } else { "" };
-        println!("  active={} id={} title={:?}{marker}", t2.active, t2.id, t2.title);
+        outln!("  active={} id={} title={:?}{marker}", t2.active, t2.id, t2.title);
     }
     let after = crate::screenshot::windows(std::slice::from_ref(&t.id));
     if let Some(img) = after.get(&t.id) {
         let p = std::env::temp_dir().join("cck-linux-focus-after.png");
         let _ = img.save(&p);
-        println!("AFTER grab {}x{} -> {}", img.width(), img.height(), p.display());
+        outln!("AFTER grab {}x{} -> {}", img.width(), img.height(), p.display());
     } else {
-        println!("AFTER grab: none");
+        outln!("AFTER grab: none");
     }
 
     // DEFOCUS leg (DRAGON-194's Inactive appearance): the target is active from the
@@ -196,23 +200,23 @@ fn linux_focus_probe(arg0: &str) {
         .find(|o| o.id != t.id)
         .cloned();
     let Some(other) = other else {
-        println!("DEFOCUS leg skipped: no second toplevel to hand focus to");
+        outln!("DEFOCUS leg skipped: no second toplevel to hand focus to");
         return;
     };
     let confirmed = compositor::activate_until(&other.id, &t.id, false);
-    println!("defocus via {:?}: activate_until confirmed: {confirmed}", other.title);
+    outln!("defocus via {:?}: activate_until confirmed: {confirmed}", other.title);
     std::thread::sleep(std::time::Duration::from_millis(200));
     let defocused = crate::screenshot::windows(std::slice::from_ref(&t.id));
     if let Some(img) = defocused.get(&t.id) {
         let p = std::env::temp_dir().join("cck-linux-focus-defocused.png");
         let _ = img.save(&p);
-        println!("DEFOCUSED grab {}x{} -> {}", img.width(), img.height(), p.display());
+        outln!("DEFOCUSED grab {}x{} -> {}", img.width(), img.height(), p.display());
     } else {
-        println!("DEFOCUSED grab: none");
+        outln!("DEFOCUSED grab: none");
     }
 }
 
-/// `--test glass-shot [id|title-substring]` (DRAGON-218): the empirical proof that the
+/// `debug test glass-shot [id|title-substring]` (DRAGON-218): the empirical proof that the
 /// frosted-glass reproduction reaches a REAL single-window capture. Runs the actual
 /// `WindowCaptureJob` (transparency + wallpaper-behind on, live grab) against a live
 /// toplevel TWICE — once with the glass reader live (blur + grain within the window's
@@ -231,20 +235,20 @@ fn glass_shot(arg0: &str) {
         all.iter().find(|t| !t.active).cloned().or_else(|| all.first().cloned())
     };
     let Some(t) = target else {
-        eprintln!("glass-shot: no toplevel (pass an id/title substring, or open a window)");
+        errln!("glass-shot: no toplevel (pass an id/title substring, or open a window)");
         return;
     };
-    println!("target: id={} title={:?} rect={:?}", t.id, t.title, t.rect);
+    outln!("target: id={} title={:?} rect={:?}", t.id, t.title, t.rect);
     match crate::app::theme::glass_config() {
-        Some(g) => println!(
+        Some(g) => outln!(
             "glass config: strength_ordinal={} alpha={} frosted_windows={}",
             g.strength_ordinal, g.alpha, g.frosted_windows
         ),
-        None => println!("glass config: None (off COSMIC, v2 theme unreadable, or CCK_NO_GLASS=1)"),
+        None => outln!("glass config: None (off COSMIC, v2 theme unreadable, or CCK_NO_GLASS=1)"),
     }
     // Output geometry for the wallpaper composite (what a real capture snapshots at launch).
     let Some((_conn, _queue, data)) = crate::screencopy::connect(false) else {
-        eprintln!("glass-shot: screencopy unavailable");
+        errln!("glass-shot: screencopy unavailable");
         return;
     };
     let conn_geom: Vec<crate::screenshot::OutputGeom> = crate::screencopy::outputs(&data)
@@ -252,10 +256,10 @@ fn glass_shot(arg0: &str) {
         .map(|(_, name, pos, size)| (name, pos, size))
         .collect();
     if conn_geom.is_empty() {
-        eprintln!("glass-shot: no outputs enumerated");
+        errln!("glass-shot: no outputs enumerated");
         return;
     }
-    println!("outputs: {conn_geom:?}");
+    outln!("outputs: {conn_geom:?}");
     let (wx, wy, ww, wh) = t.rect;
     let sel = crate::selection::Selection {
         x: wx,
@@ -290,9 +294,9 @@ fn glass_shot(arg0: &str) {
             Some(img) => {
                 let p = std::env::temp_dir().join(format!("cck-glass-shot-{label}.png"));
                 let _ = img.save(&p);
-                println!("{label} composite {}x{} -> {}", img.width(), img.height(), p.display());
+                outln!("{label} composite {}x{} -> {}", img.width(), img.height(), p.display());
             }
-            None => println!("{label} composite: grab failed"),
+            None => outln!("{label} composite: grab failed"),
         }
     };
     job("glass-on"); // glass per the live theme (a no-op pair on an unfrosted theme)
@@ -303,27 +307,27 @@ fn glass_shot(arg0: &str) {
     unsafe { std::env::remove_var("CCK_NO_GLASS") };
 }
 
-/// `--test monitor-latency`: point the DRAGON-119 device-latency probe at the current
+/// `debug test monitor-latency`: point the DRAGON-119 device-latency probe at the current
 /// default sink's monitor and print its signed record-stream latency — the value
 /// auto mode folds into a recording's SYSTEM channel. On a real hardware sink this is
 /// ~the device output latency; on a virtual / null / suspended sink it is 0 (no device
 /// buffer — fail-open). Never persisted; sampled live per recording.
 fn monitor_latency_test() {
     let Some(probe) = crate::audio::MonitorLatencyProbe::start() else {
-        eprintln!("monitor-latency: probe unavailable on this platform");
+        errln!("monitor-latency: probe unavailable on this platform");
         return;
     };
-    println!("monitor-latency: sampling the default sink's monitor for ~1.5s…");
+    outln!("monitor-latency: sampling the default sink's monitor for ~1.5s…");
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let ms = probe.stop();
-    println!("monitor-latency: median device latency = {ms:.1} ms");
-    println!(
+    outln!("monitor-latency: median device latency = {ms:.1} ms");
+    outln!(
         "  (0.0 = a virtual/suspended sink with no device buffer, or no reachable pulse \
          server; real hardware reports its output latency here)"
     );
 }
 
-/// `--test capture-relay`: the permanent empirical probe for the DRAGON-126 class of
+/// `debug test capture-relay`: the permanent empirical probe for the DRAGON-126 class of
 /// bug — start a [`crate::audio::capture::MonitorCapture`] on the default sink's monitor,
 /// consume its chunks for ~3s, and report what the server actually negotiated: chunk
 /// cadence (chunks/sec + mean chunk duration), delivery lag (mean + max — wall since the
@@ -334,10 +338,10 @@ fn monitor_latency_test() {
 fn capture_relay_test() {
     use std::time::{Duration, Instant};
     let Some((capture, rx)) = crate::audio::capture::MonitorCapture::start(None, None) else {
-        eprintln!("capture-relay: monitor capture unavailable on this platform / no pulse server");
+        errln!("capture-relay: monitor capture unavailable on this platform / no pulse server");
         return;
     };
-    println!("capture-relay: consuming the default sink's monitor for ~3s…");
+    outln!("capture-relay: consuming the default sink's monitor for ~3s…");
     let start = Instant::now();
     let deadline = start + Duration::from_secs(3);
     let mut chunks = 0u64;
@@ -363,7 +367,7 @@ fn capture_relay_test() {
     }
     let stats = capture.stop();
     if chunks == 0 {
-        println!("capture-relay: NO chunks delivered in 3s (suspended/virtual sink, or no server)");
+        outln!("capture-relay: NO chunks delivered in 3s (suspended/virtual sink, or no server)");
         return;
     }
     let audio_secs = frames_total as f64 / 48000.0;
@@ -372,22 +376,22 @@ fn capture_relay_test() {
     let chunks_per_sec = if window_secs > 0.0 { chunks as f64 / window_secs } else { 0.0 };
     let first_delay_ms =
         first_arrival.map(|f| f.duration_since(start).as_secs_f64() * 1000.0).unwrap_or(0.0);
-    println!("  chunks:            {chunks} ({:.1}/s over {window_secs:.2}s of arrivals)", chunks_per_sec);
-    println!("  mean chunk:        {mean_chunk_ms:.1} ms ({audio_secs:.2}s audio total)");
-    println!(
+    outln!("  chunks:            {chunks} ({:.1}/s over {window_secs:.2}s of arrivals)", chunks_per_sec);
+    outln!("  mean chunk:        {mean_chunk_ms:.1} ms ({audio_secs:.2}s audio total)");
+    outln!(
         "  delivery lag:      mean {:.1} ms, max {:.1} ms (peak in stats {:.1} ms)",
         lag_sum / lag_n as f64 * 1000.0,
         lag_max * 1000.0,
         stats.peak_lag_secs * 1000.0
     );
-    println!("  first-chunk delay: {first_delay_ms:.1} ms after start");
-    println!("  device latency:    {:.1} ms (dropped chunks: {})", stats.device_latency_ms, stats.dropped_chunks);
-    println!(
+    outln!("  first-chunk delay: {first_delay_ms:.1} ms after start");
+    outln!("  device latency:    {:.1} ms (dropped chunks: {})", stats.device_latency_ms, stats.dropped_chunks);
+    outln!(
         "  (healthy: ~25 ms chunks, lag near 0; a ~1.9s lag is the DRAGON-126 default-buffering bug)"
     );
 }
 
-/// `--test backend`: exercise the CaptureBackend seam end-to-end. Print every
+/// `debug test backend`: exercise the CaptureBackend seam end-to-end. Print every
 /// backend's capabilities, and for the capable ones prove the pixel methods
 /// (outputs, a screenshot, the window list + one window grab, the cursor).
 ///
@@ -413,7 +417,7 @@ fn backend_test() {
     let ffmpeg = crate::encode::ffmpeg_available();
     for b in crate::platform::backend::backends(false, ffmpeg) {
         let c = b.caps();
-        println!(
+        outln!(
             "{}: screenshot={} record={} window_list={} window_capture={} cursor={} layer_overlay={} wallpaper={}",
             c.name,
             c.screenshot,
@@ -430,7 +434,7 @@ fn backend_test() {
         // the sprite probe then shows whether a sprite really comes back. Reading all
         // three together is how a portal session reads as coherent (can toggle = yes,
         // by = in-stream, sprite = none) rather than as a contradiction.
-        println!("  cursor delivery: {:?}", b.cursor_delivery());
+        outln!("  cursor delivery: {:?}", b.cursor_delivery());
         // DRAGON-595: say WHERE the pixels would come from before probing for them.
         // A session-driven backend answers empty from every stateless method, which
         // used to print as a working portal with no monitors attached. That is not a
@@ -441,7 +445,7 @@ fn backend_test() {
                 if c.screenshot {
                     let outs = b.outputs();
                     for o in &outs {
-                        println!(
+                        outln!(
                             "  output {} {}x{} at {},{}",
                             o.name,
                             o.logical_size.0,
@@ -452,18 +456,18 @@ fn backend_test() {
                     }
                     if let Some(first) = outs.first() {
                         match b.screenshot_output(&first.name) {
-                            Some(img) => println!(
+                            Some(img) => outln!(
                                 "  screenshot({}): {}x{}",
                                 first.name,
                                 img.width(),
                                 img.height()
                             ),
-                            None => println!("  screenshot({}): FAILED", first.name),
+                            None => outln!("  screenshot({}): FAILED", first.name),
                         }
                     }
                 }
             }
-            crate::platform::backend::Acquisition::Session => println!(
+            crate::platform::backend::Acquisition::Session => outln!(
                 "  acquisition: session-driven (pixels come from a held ScreenCast \
                  grant the GUI negotiates, so there is no stateless grab to probe \
                  here; an empty output list below is that, not a fault)"
@@ -471,13 +475,13 @@ fn backend_test() {
         }
         if c.window_list {
             let wins = b.list_windows();
-            println!("  windows: {}", wins.len());
+            outln!("  windows: {}", wins.len());
             if c.window_capture
                 && let Some(w) = wins.first()
             {
                 match b.screenshot_window(&w.id) {
-                    Some(img) => println!("  window({:?}): {}x{}", w.title, img.width(), img.height()),
-                    None => println!("  window({:?}): FAILED", w.title),
+                    Some(img) => outln!("  window({:?}): {}x{}", w.title, img.width(), img.height()),
+                    None => outln!("  window({:?}): FAILED", w.title),
                 }
             }
         }
@@ -489,11 +493,11 @@ fn backend_test() {
         match b.cursor() {
             // `..` tolerates the macOS `CursorSprite`'s trailing sprite-scale
             // element (DRAGON-156); Linux's is a 3-tuple.
-            Some((img, pos, hot, ..)) => println!(
+            Some((img, pos, hot, ..)) => outln!(
                 "  cursor sprite: {}x{} at {},{} hotspot {},{}",
                 img.width(), img.height(), pos.0, pos.1, hot.0, hot.1
             ),
-            None => println!(
+            None => outln!(
                 "  cursor sprite: none (this backend hands back no sprite, or the \
                  pointer is off every monitor)"
             ),
@@ -501,7 +505,7 @@ fn backend_test() {
     }
 }
 
-/// `--test mac-shot [display-name]`: prove the ScreenCaptureKit still path end to
+/// `debug test mac-shot [display-name]`: prove the ScreenCaptureKit still path end to
 /// end (DRAGON-94 phase 2). Enumerates displays, captures the named one (or the
 /// first), writes a PNG to a temp file, and prints its dimensions. Also lists
 /// windows + the cursor. Requires the Screen Recording TCC grant — if capture
@@ -510,16 +514,16 @@ fn backend_test() {
 fn mac_shot_test(name: &str) {
     let descs = crate::platform::mac::output_descs();
     if descs.is_empty() {
-        eprintln!(
+        errln!(
             "mac-shot: no displays returned. Either Screen Recording permission is not \
              granted (System Settings > Privacy & Security > Screen Recording: enable this \
              binary/terminal, then RESTART it), or SCK returned nothing."
         );
         return;
     }
-    println!("displays ({}):", descs.len());
+    outln!("displays ({}):", descs.len());
     for d in &descs {
-        println!(
+        outln!(
             "  {} {}x{} at {},{}",
             d.name, d.logical_size.0, d.logical_size.1, d.logical_pos.0, d.logical_pos.1
         );
@@ -529,40 +533,40 @@ fn mac_shot_test(name: &str) {
         Some(img) => {
             let path = std::env::temp_dir().join("cosmic-capture-kit-mac-shot.png");
             match img.save(&path) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "captured {}: {}x{} -> {}",
                     target,
                     img.width(),
                     img.height(),
                     path.display()
                 ),
-                Err(e) => eprintln!("mac-shot: capture ok ({}x{}) but save failed: {e}", img.width(), img.height()),
+                Err(e) => errln!("mac-shot: capture ok ({}x{}) but save failed: {e}", img.width(), img.height()),
             }
         }
-        None => eprintln!(
+        None => errln!(
             "mac-shot: capture({target}) returned empty, likely because the Screen Recording TCC \
              grant is missing (grant + restart), not a code fault."
         ),
     }
     let wins = crate::platform::mac::list_windows();
-    println!("windows: {}", wins.len());
+    outln!("windows: {}", wins.len());
     if let Some(w) = wins.first() {
         match crate::screenshot::window(&w.id, false) {
-            Some(img) => println!("  window({:?}): {}x{}", w.title, img.width(), img.height()),
-            None => println!("  window({:?}): FAILED", w.title),
+            Some(img) => outln!("  window({:?}): {}x{}", w.title, img.width(), img.height()),
+            None => outln!("  window({:?}): FAILED", w.title),
         }
     }
     match crate::screenshot::capture_cursor() {
         // `..` tolerates the macOS `CursorSprite`'s trailing sprite-scale element.
-        Some((img, pos, hot, ..)) => println!(
+        Some((img, pos, hot, ..)) => outln!(
             "cursor: {}x{} at {},{} hotspot {},{}",
             img.width(), img.height(), pos.0, pos.1, hot.0, hot.1
         ),
-        None => println!("cursor: none"),
+        None => outln!("cursor: none"),
     }
 }
 
-/// `--test mac-focus-shot [windowID]` (DRAGON-189, extended): the empirical proof for a
+/// `debug test mac-focus-shot [windowID]` (DRAGON-189, extended): the empirical proof for a
 /// USER-PICKED window that was NOT frontmost at capture. Reproduces the failing case:
 /// grab the target window as-is FIRST (it is not key, so its traffic lights are GRAY),
 /// then run the real re-focus-then-grab seam (`capture_window_active`: AX-raise the exact
@@ -581,9 +585,9 @@ fn mac_focus_shot_test(arg0: &str) {
     // Warm up CoreGraphics (first bare-CLI SCK grab aborts otherwise).
     let _ = mac::output_descs();
 
-    println!("Accessibility (AX) granted: {}", mac::focus::accessibility_granted());
+    outln!("Accessibility (AX) granted: {}", mac::focus::accessibility_granted());
     let front_pid = mac::frontmost_app_pid();
-    println!("frontmost app pid: {front_pid:?}");
+    outln!("frontmost app pid: {front_pid:?}");
 
     // The target: an explicit windowID, else a titled window owned by a DIFFERENT app
     // than the frontmost one (the un-focused-pick case the fix targets).
@@ -598,7 +602,7 @@ fn mac_focus_shot_test(arg0: &str) {
             .map(|t| t.id)
     };
     let Some(id) = target_id else {
-        eprintln!(
+        errln!(
             "mac-focus-shot: no window owned by a non-frontmost app found. Open a second \
              app's window (so a DIFFERENT app than the frontmost has a titled window) and \
              re-run, or pass an explicit windowID."
@@ -606,7 +610,7 @@ fn mac_focus_shot_test(arg0: &str) {
         return;
     };
     let owner = mac::window_owner_pid(&id);
-    println!("target window id: {id} (owner pid {owner:?})");
+    outln!("target window id: {id} (owner pid {owner:?})");
 
     // BEFORE: grab the target as-is (it is NOT key → gray traffic lights).
     let before = mac::capture_window(&id);
@@ -614,7 +618,7 @@ fn mac_focus_shot_test(arg0: &str) {
         let p = std::env::temp_dir().join("cck-focus-shot-before.png");
         let _ = img.save(&p);
         let s = mac::traffic_light_colorfulness(img, TL_W, TL_H);
-        println!("BEFORE (no focus): colorfulness={s} -> {}", p.display());
+        outln!("BEFORE (no focus): colorfulness={s} -> {}", p.display());
         s
     });
 
@@ -624,33 +628,33 @@ fn mac_focus_shot_test(arg0: &str) {
         let p = std::env::temp_dir().join("cck-focus-shot-after.png");
         let _ = img.save(&p);
         let s = mac::traffic_light_colorfulness(img, TL_W, TL_H);
-        println!("AFTER (focus+verify+grab): colorfulness={s} -> {}", p.display());
+        outln!("AFTER (focus+verify+grab): colorfulness={s} -> {}", p.display());
         s
     });
 
     match (before_score, after_score) {
         (Some(b), Some(a)) => {
-            println!(
+            outln!(
                 "\nRESULT: before={b} ({}), after={a} ({})",
                 if b < 10 { "GRAY" } else if b > 60 { "COLORED" } else { "ambiguous" },
                 if a > 60 { "COLORED" } else if a < 10 { "GRAY" } else { "ambiguous" },
             );
             if b < 10 && a > 60 {
-                println!("PROOF: the picked window went GRAY->COLORED via the focus step.");
+                outln!("PROOF: the picked window went GRAY->COLORED via the focus step.");
             } else if a > 60 {
-                println!("The after grab is COLORED (active) — the focus step worked.");
+                outln!("The after grab is COLORED (active) — the focus step worked.");
             } else {
-                println!(
+                outln!(
                     "The after grab is NOT colored. If Accessibility is not granted, grant it \
                      under System Settings > Privacy & Security > Accessibility and re-run."
                 );
             }
         }
-        _ => eprintln!("mac-focus-shot: a capture returned None (TCC missing?)."),
+        _ => errln!("mac-focus-shot: a capture returned None (TCC missing?)."),
     }
 }
 
-/// `--test mac-wallpaper [display-name]` (DRAGON-291): the empirical proof for the
+/// `debug test mac-wallpaper [display-name]` (DRAGON-291): the empirical proof for the
 /// wallpaper backdrop behind a window captured from another AeroSpace workspace. For the
 /// named display (or the main display if omitted) it runs BOTH backdrop sources the
 /// `composite_over_wallpaper` ladder uses and reports which one yields a real wallpaper:
@@ -672,16 +676,16 @@ fn mac_wallpaper_test(name: &str) {
     // Warm CoreGraphics (first bare-CLI SCK grab aborts otherwise) + enumerate displays.
     let descs = crate::platform::mac::output_descs();
     if descs.is_empty() {
-        eprintln!(
+        errln!(
             "mac-wallpaper: no displays returned. Screen Recording permission is likely not \
              granted (System Settings > Privacy & Security > Screen Recording: enable this \
              binary, then RESTART it)."
         );
         return;
     }
-    println!("displays ({}):", descs.len());
+    outln!("displays ({}):", descs.len());
     for d in &descs {
-        println!(
+        outln!(
             "  {} {}x{} at {},{}",
             d.name, d.logical_size.0, d.logical_size.1, d.logical_pos.0, d.logical_pos.1
         );
@@ -700,13 +704,13 @@ fn mac_wallpaper_test(name: &str) {
         .find(|d| d.name == target)
         .map(|d| d.logical_size)
         .unwrap_or((0, 0));
-    println!("\ntarget display: {target} ({log_w}x{log_h} logical)");
+    outln!("\ntarget display: {target} ({log_w}x{log_h} logical)");
 
     // Per-channel pixel stats over a full-frame scan (this is a diagnostic; cost is fine).
     fn stats(img: &RgbaImage) {
         let n = (img.width() as u64) * (img.height() as u64);
         if n == 0 {
-            println!("  (empty image)");
+            outln!("  (empty image)");
             return;
         }
         let (mut opaque, mut near_black) = (0u64, 0u64);
@@ -730,36 +734,36 @@ fn mac_wallpaper_test(name: &str) {
         let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
         // Coarse variance proxy: the largest per-channel (max - min) spread.
         let spread = (0..3).map(|c| hi[c].saturating_sub(lo[c])).max().unwrap_or(0);
-        println!(
+        outln!(
             "  pixels={n} opaque={:.4} near_black={:.4}",
             opaque as f64 / n as f64,
             near_black as f64 / n as f64
         );
-        println!("  channel min={lo:?} max={hi:?} mean={mean:?} spread(max-min)={spread}");
+        outln!("  channel min={lo:?} max={hi:?} mean={mean:?} spread(max-min)={spread}");
     }
 
     // (a) The SCK capture_wallpaper grab.
-    println!("\n(a) SCK capture_wallpaper({target}):");
+    outln!("\n(a) SCK capture_wallpaper({target}):");
     match crate::platform::mac::capture_wallpaper(&target) {
         Some(wp) => {
-            println!("  grab: {}x{}", wp.width(), wp.height());
+            outln!("  grab: {}x{}", wp.width(), wp.height());
             stats(&wp);
             let verdict = crate::screenshot::wallpaper_grab_verdict(&wp);
-            println!("  composite verdict: {verdict}  (content => used as backdrop; anything else => file fallback)");
+            outln!("  composite verdict: {verdict}  (content => used as backdrop; anything else => file fallback)");
             let path = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-sck.png");
             match wp.save(&path) {
-                Ok(()) => println!("  saved -> {}", path.display()),
-                Err(e) => eprintln!("  save failed: {e}"),
+                Ok(()) => outln!("  saved -> {}", path.display()),
+                Err(e) => errln!("  save failed: {e}"),
             }
         }
-        None => println!("  capture_wallpaper returned None (Screen Recording grant missing?)"),
+        None => outln!("  capture_wallpaper returned None (Screen Recording grant missing?)"),
     }
 
     // (b) The FILE fallback: NSWorkspace desktop picture -> wallpaper_crop to display size.
-    println!("\n(b) FILE fallback (wallpaper::detect -> wallpaper_crop):");
+    outln!("\n(b) FILE fallback (wallpaper::detect -> wallpaper_crop):");
     match crate::wallpaper::detect() {
         Some(path) => {
-            println!("  desktop-picture file: {}", path.display());
+            outln!("  desktop-picture file: {}", path.display());
             let (pw, ph) = if log_w > 0 && log_h > 0 {
                 (log_w as u32, log_h as u32)
             } else {
@@ -767,23 +771,23 @@ fn mac_wallpaper_test(name: &str) {
             };
             match crate::wallpaper::wallpaper_crop(&path, false, pw, ph, 0, 0, pw, ph) {
                 Some(bg) => {
-                    println!("  wallpaper_crop -> {}x{}", bg.width(), bg.height());
+                    outln!("  wallpaper_crop -> {}x{}", bg.width(), bg.height());
                     stats(&bg);
                     let verdict = crate::screenshot::wallpaper_grab_verdict(&bg);
-                    println!("  (classifier on the FILE result: {verdict} — expect `content` for a real wallpaper)");
+                    outln!("  (classifier on the FILE result: {verdict} — expect `content` for a real wallpaper)");
                     let out = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-file.png");
                     match bg.save(&out) {
-                        Ok(()) => println!("  saved -> {}", out.display()),
-                        Err(e) => eprintln!("  save failed: {e}"),
+                        Ok(()) => outln!("  saved -> {}", out.display()),
+                        Err(e) => errln!("  save failed: {e}"),
                     }
                 }
-                None => println!(
+                None => outln!(
                     "  wallpaper_crop returned None — the file could not be decoded/placed. \
                      If this happens the AeroSpace fix would NOT hold (no backdrop source)."
                 ),
             }
         }
-        None => println!(
+        None => outln!(
             "  wallpaper::detect returned None — no decodable desktop-picture URL \
              (dynamic .heic / rotating folder / solid color resolve to None by design). \
              If this happens the AeroSpace fix would NOT hold."
@@ -794,24 +798,24 @@ fn mac_wallpaper_test(name: &str) {
     //     source that does NOT depend on the wallpaper-window title allow-list matching,
     //     so it can recover a backdrop when (a) misses on an AeroSpace transition and (b)
     //     is unavailable. Verdict + PNG for comparison.
-    println!("\n(c) EXCLUDE-based SCK grab (Phase 5c fallback source):");
+    outln!("\n(c) EXCLUDE-based SCK grab (Phase 5c fallback source):");
     match crate::platform::mac::capture_wallpaper_excluding(&target) {
         Some(wp) => {
-            println!("  grab: {}x{}", wp.width(), wp.height());
+            outln!("  grab: {}x{}", wp.width(), wp.height());
             stats(&wp);
             let verdict = crate::screenshot::wallpaper_grab_verdict(&wp);
-            println!("  composite verdict: {verdict}");
+            outln!("  composite verdict: {verdict}");
             let out = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-exclude.png");
             match wp.save(&out) {
-                Ok(()) => println!("  saved -> {}", out.display()),
-                Err(e) => eprintln!("  save failed: {e}"),
+                Ok(()) => outln!("  saved -> {}", out.display()),
+                Err(e) => errln!("  save failed: {e}"),
             }
         }
-        None => println!("  capture_wallpaper_excluding returned None"),
+        None => outln!("  capture_wallpaper_excluding returned None"),
     }
 }
 
-/// `--test mac-window-composite <window-id>` (DRAGON-268): the non-interactive reproduction
+/// `debug test mac-window-composite <window-id>` (DRAGON-268): the non-interactive reproduction
 /// of the wallpaper-behind-window composite, so the crop/scale math can be inspected with
 /// REAL numbers. Builds a `WindowCaptureJob` for the given window id with wallpaper-compose
 /// ON and transparency ON, runs the real `run()`, and logs EVERY composite number: the
@@ -830,23 +834,23 @@ fn mac_wallpaper_test(name: &str) {
 fn mac_window_composite_test(id: &str) {
     use crate::platform::mac;
     if id.is_empty() {
-        eprintln!("usage: --test mac-window-composite <window-id>  (ids from --test mac-list-windows)");
+        errln!("usage: debug test mac-window-composite <window-id>  (ids from `debug test mac-list-windows`)");
         return;
     }
     // Warm CoreGraphics (first bare-CLI SCK grab aborts otherwise) + enumerate displays.
     let descs = mac::output_descs();
     if descs.is_empty() {
-        eprintln!(
+        errln!(
             "mac-window-composite: no displays returned. Screen Recording permission is likely \
              not granted (grant this binary + RESTART)."
         );
         return;
     }
     let Some((wx, wy, ww, wh)) = mac::window_logical_rect(id) else {
-        eprintln!("mac-window-composite: window id {id} not found (frame lookup failed)");
+        errln!("mac-window-composite: window id {id} not found (frame lookup failed)");
         return;
     };
-    println!("window {id}: logical rect origin=({wx},{wy}) size=({ww}x{wh})");
+    outln!("window {id}: logical rect origin=({wx},{wy}) size=({ww}x{wh})");
     let sel = crate::selection::Selection {
         x: wx,
         y: wy,
@@ -859,11 +863,11 @@ fn mac_window_composite_test(id: &str) {
     // ── Reproduce run()'s decoration math to LOG the geometry (kept in lock-step with
     //    WindowCaptureJob::run + composite_over_wallpaper). ──────────────────────────
     let Some(raw) = crate::screenshot::window(id, false) else {
-        eprintln!("mac-window-composite: raw window grab returned None (grant missing?)");
+        errln!("mac-window-composite: raw window grab returned None (grant missing?)");
         return;
     };
     let scale = raw.width() as f32 / sel.width.max(1) as f32;
-    println!(
+    outln!(
         "raw window grab: {}x{}  derived backing scale = {} / {} = {scale}",
         raw.width(),
         raw.height(),
@@ -888,11 +892,11 @@ fn mac_window_composite_test(id: &str) {
     let margin_px = (margin_logical * scale).round() as i32;
     let decorated_w = raw.width() as i32 + 2 * bw_px + 2 * margin_px;
     let decorated_h = raw.height() as i32 + 2 * bw_px + 2 * margin_px;
-    println!(
+    outln!(
         "decoration: pad_logical={pad_logical} border_logical={bw_logical} margin_logical={margin_logical} \
          total_margin_logical={total_margin_logical}"
     );
-    println!(
+    outln!(
         "decoration (physical): border={bw_px}px margin={margin_px}px -> decorated (crop rw x rh) = {decorated_w}x{decorated_h}"
     );
 
@@ -907,11 +911,11 @@ fn mac_window_composite_test(id: &str) {
         })
         .or_else(|| descs.first());
     let Some(d) = resolved else {
-        eprintln!("mac-window-composite: could not resolve a display for the window centre");
+        errln!("mac-window-composite: could not resolve a display for the window centre");
         return;
     };
     let display = (d.name.clone(), d.logical_pos, d.logical_size);
-    println!(
+    outln!(
         "resolved display: {} logical pos=({},{}) size=({}x{})",
         d.name, d.logical_pos.0, d.logical_pos.1, d.logical_size.0, d.logical_size.1
     );
@@ -924,13 +928,13 @@ fn mac_window_composite_test(id: &str) {
         decorated_w,
         decorated_h,
     );
-    println!("── composite geometry ──");
-    println!("  scale={}", g.scale);
-    println!("  out_w x out_h = {} x {}", g.out_w, g.out_h);
-    println!("  bnd (border_logical rounded) = {}px", g.bnd_physical);
-    println!("  rw x rh (decorated crop) = {} x {}", g.rw, g.rh);
-    println!("  rx_raw,ry_raw = {},{}   rx,ry (nudged) = {},{}", g.rx_raw, g.ry_raw, g.rx, g.ry);
-    println!(
+    outln!("── composite geometry ──");
+    outln!("  scale={}", g.scale);
+    outln!("  out_w x out_h = {} x {}", g.out_w, g.out_h);
+    outln!("  bnd (border_logical rounded) = {}px", g.bnd_physical);
+    outln!("  rw x rh (decorated crop) = {} x {}", g.rw, g.rh);
+    outln!("  rx_raw,ry_raw = {},{}   rx,ry (nudged) = {},{}", g.rx_raw, g.ry_raw, g.rx, g.ry);
+    outln!(
         "  OVERSIZE (decorated exceeds display): {}  ({}x{} vs {}x{})",
         g.oversize, g.rw, g.rh, g.out_w, g.out_h
     );
@@ -941,19 +945,19 @@ fn mac_window_composite_test(id: &str) {
         Some(wp) => {
             let p = std::env::temp_dir().join("cck-window-composite-wallpaper.png");
             let _ = wp.save(&p);
-            println!("  capture_wallpaper: {}x{} -> {}", wp.width(), wp.height(), p.display());
+            outln!("  capture_wallpaper: {}x{} -> {}", wp.width(), wp.height(), p.display());
             if let Some(strip) = crate::screenshot::wallpaper_footprint_ref(
                 &wp, g.out_w, g.out_h, g.rx, g.ry, g.rw as u32, g.rh as u32,
             ) {
                 let sp = std::env::temp_dir().join("cck-window-composite-wp-footprint.png");
                 let _ = strip.save(&sp);
-                println!(
+                outln!(
                     "  direct footprint crop (undistorted reference): {}x{} -> {}",
                     strip.width(), strip.height(), sp.display()
                 );
             }
         }
-        None => println!("  capture_wallpaper returned None (grant missing?)"),
+        None => outln!("  capture_wallpaper returned None (grant missing?)"),
     }
 
     // ── Run the REAL composite through the job. ──────────────────────────────────────
@@ -982,20 +986,20 @@ fn mac_window_composite_test(id: &str) {
         Some(img) => {
             let p = std::env::temp_dir().join(format!("cck-window-composite-{id}.png"));
             match img.save(&p) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "composite output: {}x{} -> {}",
                     img.width(),
                     img.height(),
                     p.display()
                 ),
-                Err(e) => eprintln!("mac-window-composite: save failed: {e}"),
+                Err(e) => errln!("mac-window-composite: save failed: {e}"),
             }
         }
-        None => eprintln!("mac-window-composite({id}): run() returned None (grab failed)"),
+        None => errln!("mac-window-composite({id}): run() returned None (grab failed)"),
     }
 }
 
-/// `--test mac-active-shot` (DRAGON-189): the empirical traffic-light proof. Grabs the
+/// `debug test mac-active-shot` (DRAGON-189): the empirical traffic-light proof. Grabs the
 /// window of the app that is TRULY frontmost RIGHT NOW (NSWorkspace.frontmostApplication,
 /// the same notion the OS uses to color a window's traffic lights) and scores ONLY the
 /// tight top-left traffic-light region. A colored score (>60) means the capture caught the
@@ -1026,7 +1030,7 @@ fn mac_active_shot_test() {
         let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
         ws.frontmostApplication().map(|a| a.processIdentifier())
     };
-    println!("frontmost app pid: {front_pid:?}");
+    outln!("frontmost app pid: {front_pid:?}");
 
     // The frontmost app's on-screen, titled, layer-0 window (its front window). Fall back
     // to SCK's `active` window if we can't resolve the pid's window.
@@ -1035,28 +1039,28 @@ fn mac_active_shot_test() {
         .and_then(|pid| mac::list_windows_owned_by(pid).into_iter().next())
         .or_else(|| wins.iter().find(|t| t.active).cloned());
     let Some(target) = target else {
-        eprintln!(
+        errln!(
             "mac-active-shot: no capturable window for the frontmost app. Activate a normal \
              app window (Finder, a browser) and re-run."
         );
         return;
     };
-    println!("target window: {:?} (id {})", target.title, target.id);
+    outln!("target window: {:?} (id {})", target.title, target.id);
 
     let Some(img) = mac::capture_window(&target.id) else {
-        eprintln!("mac-active-shot: capture_window returned None (TCC missing?)");
+        errln!("mac-active-shot: capture_window returned None (TCC missing?)");
         return;
     };
     let p = std::env::temp_dir().join("cck-active-shot.png");
     let _ = img.save(&p);
     let score = mac::traffic_light_colorfulness(&img, TL_W, TL_H);
-    println!(
+    outln!(
         "traffic-light colorfulness = {score}  ({}x{}) -> {}",
         img.width(),
         img.height(),
         p.display()
     );
-    println!(
+    outln!(
         "  ({})",
         if score > 60 {
             "COLORED traffic lights: the ACTIVE appearance was captured"
@@ -1068,7 +1072,7 @@ fn mac_active_shot_test() {
     );
 }
 
-/// `--test mac-active-window` (DRAGON-295 follow-up): print what `active_window()` resolves as
+/// `debug test mac-active-window` (DRAGON-295 follow-up): print what `active_window()` resolves as
 /// the picker-free "Capture Active Window" target, alongside the frontmost app's `AXFocusedWindow`
 /// id and its full owned-window list (z-order). Proves the resolved id is the FOCUSED window, not
 /// merely the first z-ordered one: open TWO windows of the same app, focus the one that is NOT
@@ -1078,29 +1082,29 @@ fn mac_active_window_test() {
     use crate::platform::mac;
     let _ = mac::output_descs(); // CG warmup
     let front_pid = mac::frontmost_app_pid();
-    println!("frontmost app pid: {front_pid:?}");
+    outln!("frontmost app pid: {front_pid:?}");
     if let Some(pid) = front_pid {
         match mac::focus::app_focused_window_id(pid) {
-            Some(id) => println!("AXFocusedWindow id: {id}  (Accessibility granted)"),
-            None => println!(
+            Some(id) => outln!("AXFocusedWindow id: {id}  (Accessibility granted)"),
+            None => outln!(
                 "AXFocusedWindow id: <none>  (Accessibility not granted, or no focused window)"
             ),
         }
-        println!("owned windows (z-order, front first):");
+        outln!("owned windows (z-order, front first):");
         for (i, w) in mac::list_windows_owned_by(pid).into_iter().enumerate() {
-            println!("  [{i}] id={} title={:?} rect={:?}", w.id, w.title, w.rect);
+            outln!("  [{i}] id={} title={:?} rect={:?}", w.id, w.title, w.rect);
         }
     }
     match mac::active_window() {
-        Some(w) => println!(
+        Some(w) => outln!(
             "active_window() RESOLVED -> id={} title={:?} rect={:?}",
             w.id, w.title, w.rect
         ),
-        None => println!("active_window() RESOLVED -> None"),
+        None => outln!("active_window() RESOLVED -> None"),
     }
 }
 
-/// `--test mac-focus-trace <windowID>` (DRAGON-643): trace, sample by sample, WHAT each
+/// `debug test mac-focus-trace <windowID>` (DRAGON-643): trace, sample by sample, WHAT each
 /// candidate "is the picked window key now" signal reports while the real focus sequence
 /// runs. Three signals side by side:
 ///
@@ -1119,21 +1123,21 @@ fn mac_active_window_test() {
 fn mac_focus_trace_test(arg0: &str) {
     use crate::platform::mac;
     if arg0.is_empty() {
-        eprintln!("mac-focus-trace: usage: --test mac-focus-trace <windowID>");
+        errln!("mac-focus-trace: usage: debug test mac-focus-trace <windowID>");
         return;
     }
     let _ = mac::output_descs(); // CG warmup
     let Ok(target) = arg0.parse::<u32>() else {
-        eprintln!("mac-focus-trace: <windowID> must be a number");
+        errln!("mac-focus-trace: <windowID> must be a number");
         return;
     };
     let Some(pid) = mac::window_owner_pid(arg0) else {
-        eprintln!("mac-focus-trace: no owning app for window {target}");
+        errln!("mac-focus-trace: no owning app for window {target}");
         return;
     };
     let me = std::process::id() as libc::pid_t;
-    println!("target window {target} owned by pid {pid}; this process is pid {me}");
-    println!("Accessibility (AX) granted: {}", mac::focus::accessibility_granted());
+    outln!("target window {target} owned by pid {pid}; this process is pid {me}");
+    outln!("Accessibility (AX) granted: {}", mac::focus::accessibility_granted());
 
     let sample = |label: &str| {
         let front = objc2_app_kit::NSWorkspace::sharedWorkspace()
@@ -1143,29 +1147,29 @@ fn mac_focus_trace_test(arg0: &str) {
         let order = mac::focus::onscreen_window_order();
         let app_front = mac::focus::app_front_window(&order, pid);
         let zorder = mac::focus::zorder_evidence(&order, target, me);
-        println!(
+        outln!(
             "  {label:>12}: front_pid={front:?} ax_focus={ax:?} cg_app_front={app_front:?} zorder={zorder:?}"
         );
     };
 
-    println!("\n-- pre-state (nothing touched yet) --");
+    outln!("\n-- pre-state (nothing touched yet) --");
     sample("pre");
-    println!("  owning app's ordinary windows, front to back:");
+    outln!("  owning app's ordinary windows, front to back:");
     for w in mac::focus::onscreen_window_order().iter().filter(|w| w.pid == pid && w.layer == 0) {
-        println!("    id={} layer={}", w.id, w.layer);
+        outln!("    id={} layer={}", w.id, w.layer);
     }
 
-    println!("\n-- phase 1: AX raise/main/focused writes ONLY (no app activate) --");
+    outln!("\n-- phase 1: AX raise/main/focused writes ONLY (no app activate) --");
     let raised = mac::focus::ax_raise_window(target, pid);
-    println!("  ax_raise_window -> {raised}");
+    outln!("  ax_raise_window -> {raised}");
     sample("t+0ms");
     std::thread::sleep(std::time::Duration::from_millis(150));
     sample("t+150ms");
 
-    println!("\n-- phase 2: the real focus_and_verify_window --");
+    outln!("\n-- phase 2: the real focus_and_verify_window --");
     let t0 = std::time::Instant::now();
     let confirmed = mac::focus::focus_and_verify_window(target, pid);
-    println!(
+    outln!(
         "  focus_and_verify_window -> confirmed={confirmed} after {}ms",
         t0.elapsed().as_millis()
     );
@@ -1175,7 +1179,7 @@ fn mac_focus_trace_test(arg0: &str) {
     }
 }
 
-/// `--test mac-grab-id <windowID> [out.png]` (DRAGON-189): grab ONE specific window by its
+/// `debug test mac-grab-id <windowID> [out.png]` (DRAGON-189): grab ONE specific window by its
 /// `windowID` right now (whatever the current frontmost app is) and score its traffic-light
 /// region. Used to prove a target window renders GRAY when it is NOT the frontmost/key
 /// window (activate a DIFFERENT windowed app first), and COLORED when it is.
@@ -1183,18 +1187,18 @@ fn mac_focus_trace_test(arg0: &str) {
 fn mac_grab_id_test(id: &str, out: &str) {
     use crate::platform::mac;
     if id.is_empty() {
-        eprintln!("mac-grab-id: usage: --test mac-grab-id <windowID> [out.png]");
+        errln!("mac-grab-id: usage: debug test mac-grab-id <windowID> [out.png]");
         return;
     }
     let _ = mac::output_descs(); // CG warmup
-    println!(
+    outln!(
         "frontmost app: {:?}",
         objc2_app_kit::NSWorkspace::sharedWorkspace()
             .frontmostApplication()
             .and_then(|a| a.localizedName().map(|n| n.to_string()))
     );
     let Some(img) = mac::capture_window(id) else {
-        eprintln!("mac-grab-id: capture_window({id}) returned None (bad id or TCC missing)");
+        errln!("mac-grab-id: capture_window({id}) returned None (bad id or TCC missing)");
         return;
     };
     let score = mac::traffic_light_colorfulness(&img, 160, 60);
@@ -1204,7 +1208,7 @@ fn mac_grab_id_test(id: &str, out: &str) {
         std::path::PathBuf::from(out)
     };
     let _ = img.save(&path);
-    println!(
+    outln!(
         "window {id}: traffic_light_colorfulness = {score} ({}) {}x{} -> {}",
         if score > 60 { "COLORED" } else if score < 10 { "GRAY" } else { "ambiguous" },
         img.width(),
@@ -1213,7 +1217,7 @@ fn mac_grab_id_test(id: &str, out: &str) {
     );
 }
 
-/// `--test mac-daemon-repro <AppName> [scratch_dir]` (DRAGON-189): the empirical proof of
+/// `debug test mac-daemon-repro <AppName> [scratch_dir]` (DRAGON-189): the empirical proof of
 /// the RESIDENT daemon bug AND its fix. Reproduces the real daemon->child focus churn in one
 /// observable process:
 ///
@@ -1233,7 +1237,7 @@ fn mac_grab_id_test(id: &str, out: &str) {
 fn mac_daemon_repro_test(app: &str, scratch: &str) {
     use crate::platform::mac::{self, active_window};
     if app.is_empty() {
-        eprintln!("mac-daemon-repro: usage: --test mac-daemon-repro <AppName> [scratch_dir]");
+        errln!("mac-daemon-repro: usage: debug test mac-daemon-repro <AppName> [scratch_dir]");
         return;
     }
     let dir = if scratch.is_empty() {
@@ -1260,26 +1264,26 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
         ws.frontmostApplication()
             .map(|a| (a.processIdentifier(), a.localizedName().map(|n| n.to_string())))
     };
-    println!("frontmost after activate {app:?}: {front_pid:?}");
+    outln!("frontmost after activate {app:?}: {front_pid:?}");
     let Some((pid, _)) = front_pid else {
-        eprintln!("mac-daemon-repro: no frontmost app; is {app:?} installed/running?");
+        errln!("mac-daemon-repro: no frontmost app; is {app:?} installed/running?");
         return;
     };
     let Some(front) = mac::list_windows_owned_by(pid).into_iter().next() else {
-        eprintln!("mac-daemon-repro: {app:?} has no capturable front window (a titled, on-screen, layer-0 window). Open one and re-run.");
+        errln!("mac-daemon-repro: {app:?} has no capturable front window (a titled, on-screen, layer-0 window). Open one and re-run.");
         return;
     };
-    println!("target front window: {:?} (id {})", front.title, front.id);
+    outln!("target front window: {:?} (id {})", front.title, front.id);
 
     // 2. DAEMON-TIME grab (target still frontmost) — the fix's grab point.
     let Some(daemon_img) = mac::capture_window(&front.id) else {
-        eprintln!("mac-daemon-repro: daemon-time capture_window returned None (TCC?)");
+        errln!("mac-daemon-repro: daemon-time capture_window returned None (TCC?)");
         return;
     };
     let daemon_score = score_of(&daemon_img);
     let daemon_png = dir.join("dragon189-daemon-time.png");
     let _ = daemon_img.save(&daemon_png);
-    println!(
+    outln!(
         "DAEMON-TIME  score = {daemon_score:>3}  ({}) -> {}",
         verdict(daemon_score),
         daemon_png.display()
@@ -1296,12 +1300,12 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
     match active_window::load_from_env() {
         Some((id, img)) => {
             let s = score_of(&img);
-            println!(
+            outln!(
                 "HANDOFF      score = {s:>3}  ({}) id={id}  [round-tripped through env + temp PNG]",
                 verdict(s)
             );
         }
-        None => println!("HANDOFF      FAILED to load back (the env handoff is broken)"),
+        None => outln!("HANDOFF      FAILED to load back (the env handoff is broken)"),
     }
 
     // 4. CHILD-TIME grab: steal frontmost the way the spawned child does as it boots, wait a
@@ -1317,7 +1321,7 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
             let s = score_of(&child_img);
             let child_png = dir.join("dragon189-child-time.png");
             let _ = child_img.save(&child_png);
-            println!(
+            outln!(
                 "CHILD-TIME   score = {s:>3}  ({}) -> {}",
                 verdict(s),
                 child_png.display()
@@ -1325,25 +1329,71 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
             s
         }
         None => {
-            println!("CHILD-TIME   capture_window returned None");
+            outln!("CHILD-TIME   capture_window returned None");
             0
         }
     };
 
-    println!("\nsummary:");
-    println!("  daemon-time (the fix's grab point) : {daemon_score} ({})", verdict(daemon_score));
-    println!("  child-time  (the pre-fix bug path) : {child_score} ({})", verdict(child_score));
+    outln!("\nsummary:");
+    outln!("  daemon-time (the fix's grab point) : {daemon_score} ({})", verdict(daemon_score));
+    outln!("  child-time  (the pre-fix bug path) : {child_score} ({})", verdict(child_score));
     if daemon_score > 60 && child_score < 10 {
-        println!("  => REPRODUCED: daemon-time is COLORED, child-time is GRAY. The DRAGON-189 handoff fixes it.");
+        outln!("  => REPRODUCED: daemon-time is COLORED, child-time is GRAY. The DRAGON-189 handoff fixes it.");
     } else if daemon_score > 60 && child_score > 60 {
-        println!("  => both colored on this machine (no focus churn reproduced); the fix is still correct + harmless.");
+        outln!("  => both colored on this machine (no focus churn reproduced); the fix is still correct + harmless.");
     } else {
-        println!("  => inconclusive on this run (target may not have had lit traffic lights; try a normal windowed app).");
+        outln!("  => inconclusive on this run (target may not have had lit traffic lights; try a normal windowed app).");
     }
 }
 
-/// `--test mac-rec-bench [Display-<id>|largest] [secs] [encoder] [fps] [maxside] [nomic]
-/// [nosys] [manualsync]`: drive a
+/// The bench's synthetic drawing (DRAGON-724): one long scribble across the middle of a
+/// `w` x `h` surface, published as a live-ink scene.
+///
+/// Deliberately a BIG stroke, about 80% of the frame wide and half of it tall, because the live
+/// composite's cost is the bounding box of what is on screen and the number worth knowing is the
+/// bad case rather than a signature in a corner. It runs through the same `pen_stroke` fit a real
+/// stroke does, so the point count and the ribbon are the shapes the painter really sees.
+#[cfg(target_os = "macos")]
+fn bench_ink_scene(w: i32, h: i32) -> crate::record::ink_bake::InkBake {
+    /// Raw pointer samples in the synthetic trail, before the smoothing fit.
+    const RAW_POINTS: usize = 600;
+    let (fw, fh) = (w as f32, h as f32);
+    let raw: Vec<(f32, f32)> = (0..RAW_POINTS)
+        .map(|i| {
+            let t = i as f32 / RAW_POINTS as f32;
+            (fw * (0.1 + 0.8 * t), fh * (0.5 + 0.24 * (t * 11.0).sin()))
+        })
+        .collect();
+    let points = crate::pen_stroke::smooth_path(&raw, crate::ink::WIDTH_PT);
+    let speed = crate::pen_stroke::pressure_along(&raw, &points);
+    // One millisecond per fitted point, so the whole stroke is visible at any later instant.
+    let point_ms: Vec<crate::ink::MediaMs> = (0..points.len() as i64).collect();
+    crate::record::ink_bake::InkBake {
+        log: crate::ink::InkLog {
+            clips: vec![crate::ink::InkClip {
+                tool: crate::ink::InkTool::Marker,
+                points,
+                speed,
+                point_ms,
+                width: crate::ink::WIDTH_PT,
+                generation: None,
+            }],
+            gens: Vec::new(),
+            erases: Vec::new(),
+            wipes: Vec::new(),
+        },
+        // The recorded rect is the whole captured surface at its own origin, so a stroke in
+        // surface points maps straight onto the encoded frame: exactly what a window filling
+        // its own recording does.
+        rects: vec![(0, (0, 0, w.max(1), h.max(1)))],
+        origin: (0, 0),
+        point_scale: 1.0,
+        color: [255, 64, 0, 255],
+    }
+}
+
+/// `debug test mac-rec-bench [Display-<id>|largest] [secs] [encoder] [fps] [maxside] [nomic]
+/// [nosys] [manualsync] [ink]`: drive a
 /// REAL recording of a whole display through the production SCK media-clock pipeline
 /// (`start_region_recording`), while forcing on-screen motion, then measure the ACHIEVED
 /// distinct-frame rate of the output — the honest full-pipeline number the DRAGON-163
@@ -1363,8 +1413,20 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
 /// unrepresentative: `auto_device_compensation: false` reproduced the DRAGON-629 pending-sys
 /// deadlock on 4 runs out of 4, so the harness "failed" on a bug the user's own settings
 /// hid. Keyword flags, anywhere in the args, opt back out one at a time (the
-/// `--test windows-record` convention): `nomic` gates the mic track off, `nosys` the system
+/// `debug test windows-record` convention): `nomic` gates the mic track off, `nosys` the system
 /// track, `manualsync` turns automatic device-latency compensation off.
+///
+/// `ink` (DRAGON-724) publishes a synthetic live-annotation scene into `RecordHandle::live_ink`
+/// at 60Hz for the whole run, which is what a user drawing without pause looks like, so the same
+/// harness A/Bs the live composite's cost on the capture path. Run it with and without the word
+/// and compare the WORKER's own `rec/sck video summary` line, its `achieved` and its
+/// `backlog_dropped`; the debug log's `ink:` lines say whether the size gate admitted the session
+/// and how many ticks carried ink.
+///
+/// **Not** the `DISTINCT frames` line below, which is saturated on macOS and always reads 100%
+/// (DRAGON-729): [`distinct_frame_count`] compares consecutive `framemd5` hashes, and
+/// VideoToolbox re-encodes a repeated input frame into a bit-different output frame, so no two
+/// consecutive hashes ever match. That line is honest on Linux and on any bit-exact encoder.
 ///
 /// Prints the resolved encode dims, the container fps/duration, and the distinct-content
 /// frame rate (via `mpdecimate`, which drops near-duplicate frames — so distinct/duration
@@ -1378,7 +1440,7 @@ fn mac_rec_bench(rest: &[String]) {
     // Resolve the target display (largest by pixel area unless a Display-<id> is named).
     let descs = crate::platform::mac::output_descs();
     if descs.is_empty() {
-        eprintln!("mac-rec-bench: no displays (Screen Recording permission missing? grant + restart)");
+        errln!("mac-rec-bench: no displays (Screen Recording permission missing? grant + restart)");
         return;
     }
     let want = arg(0);
@@ -1391,7 +1453,7 @@ fn mac_rec_bench(rest: &[String]) {
         descs.iter().find(|d| d.name == want).cloned()
     };
     let Some(td) = target_desc else {
-        eprintln!("mac-rec-bench: no display named {want:?}; have: {:?}",
+        errln!("mac-rec-bench: no display named {want:?}; have: {:?}",
             descs.iter().map(|d| &d.name).collect::<Vec<_>>());
         return;
     };
@@ -1403,6 +1465,7 @@ fn mac_rec_bench(rest: &[String]) {
     let mic = !rest.iter().any(|a| a == "nomic");
     let system_audio = !rest.iter().any(|a| a == "nosys");
     let auto_sync = !rest.iter().any(|a| a == "manualsync");
+    let ink = rest.iter().any(|a| a == "ink");
 
     // The display's global TOP-LEFT origin + logical size, so the motion source can be
     // spawned centered on it (ffplay places windows by the primary display; we just need
@@ -1411,9 +1474,10 @@ fn mac_rec_bench(rest: &[String]) {
     // for a secondary display we position it into the target's rect).
     let (ox, oy) = td.logical_pos;
     let (lw, lh) = td.logical_size;
-    println!(
+    outln!(
         "mac-rec-bench: target {} {}x{} (logical) at {},{}  encoder={encoder} fps={fps} \
-         secs={secs} maxside={maxside} mic={mic} sys={system_audio} autosync={auto_sync}",
+         secs={secs} maxside={maxside} mic={mic} sys={system_audio} autosync={auto_sync} \
+         ink={ink}",
         td.name, lw, lh, ox, oy
     );
 
@@ -1438,7 +1502,7 @@ fn mac_rec_bench(rest: &[String]) {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("mac-rec-bench: could not spawn ffplay motion source ({e}); \
+            errln!("mac-rec-bench: could not spawn ffplay motion source ({e}); \
                 the achieved-fps number would be meaningless without motion — aborting");
             return;
         }
@@ -1487,11 +1551,28 @@ fn mac_rec_bench(rest: &[String]) {
         mac_target: crate::record::MacRecordTarget::Display(td.name.clone()),
         settings,
     };
-    println!("mac-rec-bench: recording {secs}s through the production SCK pipeline…");
+    outln!("mac-rec-bench: recording {secs}s through the production SCK pipeline…");
     let handle = crate::record::start_region_recording(params);
     let started = Instant::now();
+    // DRAGON-724: stand in for a user drawing continuously. 60Hz is a fast hand, and it is the
+    // rate that matters, because the painter re-rasterizes once per PUBLISHED scene and simply
+    // blends the cached layer on every tick between two publishes.
+    let inker = ink.then(|| {
+        let live = handle.live_ink.clone();
+        let stop = handle.stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Well past the stroke's own stamps, so all of it is on screen every tick.
+                live.publish(bench_ink_scene(lw, lh), 100_000);
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        })
+    });
     std::thread::sleep(Duration::from_secs(secs));
     handle.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(t) = inker {
+        let _ = t.join();
+    }
     // Wait (bounded) for the worker to finalize.
     let deadline = Instant::now() + Duration::from_secs(60);
     let result = loop {
@@ -1510,30 +1591,266 @@ fn mac_rec_bench(rest: &[String]) {
 
     match result {
         Ok(path) => {
-            println!("mac-rec-bench: recording finished -> {}", path.display());
+            outln!("mac-rec-bench: recording finished -> {}", path.display());
             if let Some((cw, ch)) = captured_dims {
-                println!("  captured footprint (pre-cap): {cw}x{ch}");
+                outln!("  captured footprint (pre-cap): {cw}x{ch}");
             }
             report_achieved_fps(&path, fps, wall, secs as f64);
             if std::env::var_os("CCK_KEEP").is_some() {
-                println!("  (kept: {})", path.display());
+                outln!("  (kept: {})", path.display());
             } else {
                 let _ = std::fs::remove_file(&path);
             }
         }
-        Err(e) => eprintln!("mac-rec-bench: recording FAILED: {e}"),
+        Err(e) => errln!("mac-rec-bench: recording FAILED: {e}"),
     }
     // `_guard` drops here, killing ffplay.
+}
+
+/// `debug test linux-rec-bench [<output>|largest] [secs] [encoder] [fps] [maxside] [nomic]
+/// [nosys] [manualsync] [zerocopy]` (DRAGON-714): the Linux twin of `mac-rec-bench`. Drive
+/// a REAL recording of a whole output through the production screencopy media-clock
+/// pipeline (`start_region_recording`), while forcing on-screen motion, then measure the
+/// ACHIEVED distinct-frame rate of the output through the SAME two reporters the mac
+/// harness uses, so the two boxes' numbers mean the same thing.
+///
+/// It exists because this box had no instrument at all: every Linux throughput claim in
+/// every ticket was unbacked, and DRAGON-714's Linux question ("is there anything to gain
+/// from moving the downscale earlier, given ffmpeg would have scaled anyway") cannot be
+/// answered without one.
+///
+/// Args (all optional, positional, then keyword flags anywhere):
+///   output    an output name from `debug test selftest`, or `largest` (the default)
+///   secs      recording duration in seconds (default 6)
+///   encoder   `software` | `nvenc` | `vaapi` | `auto` (default `software`)
+///   fps       configured frame rate (default 60)
+///   maxside   a max-resolution box side to honour (0 = no user cap; default 0)
+///   nomic / nosys / manualsync   opt out of the production audio defaults, one at a time
+///   zerocopy  take the GPU zero-copy path instead of the CPU readback path
+///
+/// The audio settings DEFAULT TO WHAT A REAL RECORDING USES (mic on, system on, automatic
+/// sync compensation on), for the reason the mac harness records: all-three-off is a
+/// configuration no shipped install has, and benching it hides real bugs.
+///
+/// The three runs DRAGON-714's research asked for, on a 5120x1440 output:
+///   A (CPU baseline)  `linux-rec-bench largest 30 software 30 1920`
+///   C (GPU control)   `linux-rec-bench largest 30 nvenc 30 1920 zerocopy`
+///   B (the throwaway experiment: the downscale moved INTO the worker) is deliberately not
+///   here. It is a code change, not a flag, and `encode::command`'s own doc records the
+///   measurement that closed it: a per-frame CPU resize collapsed a 5120-wide recording to
+///   about one real frame per second. Nothing in this harness re-opens that.
+///
+/// Requires ffmpeg + ffprobe, and `ffplay` on PATH for the motion source (a dev-only tool,
+/// deliberately not vendored). It spawns an ffplay window on the desktop and KILLS it
+/// before returning. On Wayland the compositor places that window, so `-left`/`-top` are a
+/// request and not a guarantee: check it landed on the target output before trusting a run.
+#[cfg(target_os = "linux")]
+fn linux_rec_bench(rest: &[String]) {
+    use std::time::{Duration, Instant};
+    let arg = |n: usize| rest.get(n).map(String::as_str).unwrap_or("");
+
+    let descs = crate::screenshot::output_descs();
+    if descs.is_empty() {
+        errln!("linux-rec-bench: no outputs (is this a Wayland session?)");
+        return;
+    }
+    let want = arg(0);
+    let target = if want.is_empty() || want == "largest" {
+        descs
+            .iter()
+            .max_by_key(|d| (d.logical_size.0 as i64) * (d.logical_size.1 as i64))
+            .cloned()
+    } else {
+        descs.iter().find(|d| d.name == want).cloned()
+    };
+    let Some(td) = target else {
+        errln!(
+            "linux-rec-bench: no output named {want:?}; have: {:?}",
+            descs.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+        return;
+    };
+    let secs: u64 = arg(1).parse().unwrap_or(6);
+    let encoder = if arg(2).is_empty() { "software" } else { arg(2) };
+    let fps: u32 = arg(3).parse().unwrap_or(60);
+    let maxside: u32 = arg(4).parse().unwrap_or(0);
+    let mic = !rest.iter().any(|a| a == "nomic");
+    let system_audio = !rest.iter().any(|a| a == "nosys");
+    let auto_sync = !rest.iter().any(|a| a == "manualsync");
+    let zero_copy = rest.iter().any(|a| a == "zerocopy");
+    if zero_copy && !cfg!(feature = "zero-copy") {
+        errln!(
+            "linux-rec-bench: `zerocopy` asked for, but this build has the zero-copy \
+             feature OFF — the run below is the CPU path"
+        );
+    }
+
+    let (ox, oy) = td.logical_pos;
+    let (lw, lh) = td.logical_size;
+    outln!(
+        "linux-rec-bench: target {} {}x{} (logical) at {},{}  encoder={encoder} fps={fps} \
+         secs={secs} maxside={maxside} zerocopy={zero_copy} mic={mic} sys={system_audio} \
+         autosync={auto_sync}",
+        td.name, lw, lh, ox, oy
+    );
+
+    // Motion source, sized to cover most of the output: a small window shrinks to a handful
+    // of pixels after the downscale and reads as a near-static frame, which would flatter
+    // the achieved-fps number for no reason. `testsrc2` animates every frame.
+    let (win_w, win_h) = (((lw * 9 / 10).max(640)) as u32, ((lh * 9 / 10).max(360)) as u32);
+    let motion = match std::process::Command::new("ffplay")
+        .args(["-loglevel", "quiet", "-noborder"])
+        .args(["-x", &win_w.to_string(), "-y", &win_h.to_string()])
+        .args(["-left", &(ox + 20).to_string(), "-top", &(oy + 20).to_string()])
+        .args(["-f", "lavfi", "-i", &format!("testsrc2=size={win_w}x{win_h}:rate={fps}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            errln!(
+                "linux-rec-bench: could not spawn the ffplay motion source ({e}); the \
+                 achieved-fps number would be meaningless without motion — aborting"
+            );
+            return;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Whatever happens below, ffplay must not leak: a stray full-screen window on the
+    // owner's desktop is nobody's idea of a clean diagnostic.
+    struct MotionGuard(std::process::Child);
+    impl Drop for MotionGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = MotionGuard(motion);
+
+    let out = std::env::temp_dir().join(format!("cck-linux-rec-bench-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let settings = crate::record::RecordSettings {
+        fps,
+        preferred_encoder: encoder.to_string(),
+        encoder_hint: None,
+        presets: crate::encode::Presets::default(),
+        zero_copy,
+        mic,
+        system_audio,
+        bitrate_kbps: 8000,
+        audio_offset_ms: 0,
+        auto_device_compensation: auto_sync,
+        max_res: (maxside, maxside),
+        metadata: String::new(),
+        out_path: out.clone(),
+        // No countdown here, so media 0 is the settled pipeline with no gate to hold for.
+        start_gate: None,
+    };
+    let params = crate::record::RegionRecordParams {
+        x: ox,
+        y: oy,
+        w: lw as u32,
+        h: lh as u32,
+        cursor: false,
+        settings,
+    };
+    outln!("linux-rec-bench: recording {secs}s through the production screencopy pipeline…");
+    let handle = crate::record::start_region_recording(params);
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(secs));
+    handle.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Bounded wait for the worker to finalize (DRAGON-118 applies to diagnostics too).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let result = loop {
+        if let Ok(g) = handle.done.lock()
+            && let Some(r) = g.as_ref()
+        {
+            break r.clone();
+        }
+        if Instant::now() > deadline {
+            break Err("timed out waiting for the recording to finalize".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let wall = started.elapsed().as_secs_f64();
+    let captured_dims = handle.dims.lock().ok().and_then(|g| *g);
+
+    match result {
+        Ok(path) => {
+            outln!("linux-rec-bench: recording finished -> {}", path.display());
+            if let Some((cw, ch)) = captured_dims {
+                outln!("  captured footprint (pre-cap): {cw}x{ch}");
+            }
+            report_achieved_fps(&path, fps, wall, secs as f64);
+            // DRAGON-714's headline ratio: how many captured pixels the encoder threw away.
+            // On Linux no source will deliver fewer, so this is the size of the question,
+            // not a number the run can improve.
+            if let Some((cw, ch)) = captured_dims
+                && let Some((ew, eh)) = probe_encode_dims(&path)
+                && ew > 0
+                && eh > 0
+            {
+                let cap_px = cw as f64 * ch as f64;
+                let enc_px = ew as f64 * eh as f64;
+                outln!(
+                    "  captured / encoded pixels: {cap_px:.0} / {enc_px:.0} = {:.1}x \
+                     (the per-frame waste this ticket is about; on Linux every source is \
+                     pinned to the compositor's buffer size, so it is paid in the pipe and \
+                     in ffmpeg's scaler, never avoided at the source)",
+                    cap_px / enc_px.max(1.0)
+                );
+            }
+            if std::env::var_os("CCK_KEEP").is_some() {
+                outln!("  (kept: {})", path.display());
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Err(e) => errln!("linux-rec-bench: recording FAILED: {e}"),
+    }
+    // `_guard` drops here, killing ffplay.
+}
+
+/// The encoded video stream's dimensions, for the captured-vs-encoded ratio above.
+/// `None` when ffprobe is missing or the file has no video stream.
+#[cfg(target_os = "linux")]
+fn probe_encode_dims(path: &std::path::Path) -> Option<(u32, u32)> {
+    let out = std::process::Command::new(crate::util::ffprobe_path())
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+            "-of", "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut w, mut h) = (0u32, 0u32);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("width=") {
+            w = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = line.strip_prefix("height=") {
+            h = v.trim().parse().unwrap_or(0);
+        }
+    }
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// Probe an output recording for its encode dims, container duration/fps, and the
 /// ACHIEVED distinct-content frame rate (frames whose content differs from the previous
 /// frame — real motion, past the CFR re-feed) over the container duration. This is the
 /// number that must approach the configured `fps` for a healthy recording (DRAGON-168).
-#[cfg(target_os = "macos")]
+///
+/// Shared by the mac and Linux benches (DRAGON-714) so a number measured on one box means
+/// the same thing on the other; the mac arm is unchanged.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn report_achieved_fps(path: &std::path::Path, configured_fps: u32, wall_secs: f64, requested_secs: f64) {
     // Encode dims + duration + nominal fps from ffprobe.
-    let probe = std::process::Command::new(crate::util::ffprobe_path())
+    let probe = crate::util::ffprobe_command()
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries",
                "stream=width,height,avg_frame_rate,nb_read_frames:format=duration",
                "-count_frames", "-of", "default=noprint_wrappers=1", ])
@@ -1557,17 +1874,39 @@ fn report_achieved_fps(path: &std::path::Path, configured_fps: u32, wall_secs: f
     let achieved = if dur > 0.0 { distinct as f64 / dur } else { 0.0 };
     let pct = if configured_fps > 0 { 100.0 * achieved / configured_fps as f64 } else { 0.0 };
     let dur_pct = if requested_secs > 0.0 { 100.0 * dur / requested_secs } else { 0.0 };
-    println!("  encode dims:        {w}x{h}");
-    println!(
+    outln!("  encode dims:        {w}x{h}");
+    outln!("  configured fps:     {configured_fps} (what the session was asked for)");
+    outln!(
         "  duration:           {dur:.2}s of {requested_secs:.0}s requested = {dur_pct:.0}% (wall {wall_secs:.2}s)  {}",
         if dur_pct >= 90.0 { "OK" } else { "TRUNCATED (backlog stole capture time)" }
     );
-    println!("  container frames:   {nb} ({nominal:.1} fps nominal — CFR re-fed)");
-    println!("  DISTINCT frames:    {distinct} ({achieved:.1} distinct fps)");
-    println!(
+    outln!("  container frames:   {nb} ({nominal:.1} fps nominal — CFR re-fed)");
+    outln!("  DISTINCT frames:    {distinct} ({achieved:.1} distinct fps)");
+    outln!(
         "  achieved / config:  {achieved:.1} / {configured_fps} = {pct:.0}%   {}",
-        if pct >= 70.0 { "OK (>=70%)" } else { "LOW (<70% — throughput bottleneck)" }
+        achieved_verdict(pct)
     );
+}
+
+/// The verdict line's wording for an achieved/configured percentage.
+///
+/// **Pure**, unit-tested, and it exists for the third case. The pipeline is CFR and
+/// index-stamped, so distinct content frames CANNOT outrun the configured rate: anything
+/// meaningfully over 100% is the instrument lying, not the recording excelling. It printed
+/// "256%" once (audio frames counted as video, see [`distinct_frame_count`]) and read as a
+/// wonderful result. A number that cannot happen must say so rather than be admired.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn achieved_verdict(pct: f64) -> &'static str {
+    // A little slack over 100: rounding, and a container duration a hair under the media
+    // length, can land a healthy run at 101-102% honestly.
+    if pct > 110.0 {
+        "IMPOSSIBLE (>110% — the measurement is wrong, not the recording; see distinct_frame_count)"
+    } else if pct >= 70.0 {
+        "OK (>=70%)"
+    } else {
+        "LOW (<70% — throughput bottleneck)"
+    }
 }
 
 /// Count `(distinct, total)` decoded frames of a recording. `distinct` is the number of
@@ -1577,11 +1916,22 @@ fn report_achieved_fps(path: &std::path::Path, configured_fps: u32, wall_secs: f
 /// grayscale downscale (robust, exact, threshold-free — unlike `mpdecimate`, whose block
 /// heuristic reads a downscaled synthetic pattern's small per-frame deltas as duplicates
 /// and undercounts wildly). `distinct/duration` is the true achieved motion frame rate.
-#[cfg(target_os = "macos")]
+///
+/// Shared by the mac and Linux benches (DRAGON-714); the mac arm is unchanged.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn distinct_frame_count(path: &std::path::Path) -> (u64, u64) {
-    let out = std::process::Command::new(crate::util::ffmpeg_path())
+    let out = crate::util::ffmpeg_command()
         .args(["-loglevel", "error", "-i"])
         .arg(path)
+        // VIDEO ONLY, and this is load-bearing (DRAGON-714 live QA). Without the map,
+        // ffmpeg's default stream selection also picks the best AUDIO stream, framemd5
+        // writes a line per audio frame too, and the counter below reads every one of them
+        // as a video frame. Measured: a 5s 30fps clip emitted 150 video lines and 235 audio
+        // lines. In the field that turned a healthy 30fps recording into "76.8 distinct fps,
+        // 256% of configured", because 48kHz audio in ~1024-sample frames is ~47 more
+        // "frames" a second. `-an` says the same thing twice on purpose: the map is the
+        // rule, and a file whose first stream is audio must not sneak past it.
+        .args(["-map", "0:v:0", "-an"])
         // A tiny grayscale downscale makes the per-frame hash cheap while still capturing
         // any real content change; identical frames hash identically.
         .args(["-vf", "scale=160:90,format=gray", "-f", "framemd5", "-"])
@@ -1606,7 +1956,7 @@ fn distinct_frame_count(path: &std::path::Path) -> (u64, u64) {
     (distinct, total)
 }
 
-/// `--test cursor-capture`: grab the mouse cursor via the ext-image-copy-capture cursor session,
+/// `debug test cursor-capture`: grab the mouse cursor via the ext-image-copy-capture cursor session,
 /// save the sprite (real alpha) to a PNG, and print the path + dimensions + position + hotspot.
 /// Verifies the clean cursor-capture path before building the cursor-over-transparent feature.
 fn cursor_capture_test() {
@@ -1616,9 +1966,9 @@ fn cursor_capture_test() {
     // divided by the output's buffer scale), so it must land inside exactly one of these
     // rects, at the visible pointer's spot, on any scale (1x / fractional / mixed).
     let descs = crate::screenshot::output_descs();
-    println!("outputs ({}):", descs.len());
+    outln!("outputs ({}):", descs.len());
     for d in &descs {
-        println!(
+        outln!(
             "  {} logical {},{} {}x{}",
             d.name, d.logical_pos.0, d.logical_pos.1, d.logical_size.0, d.logical_size.1
         );
@@ -1628,30 +1978,30 @@ fn cursor_capture_test() {
         Some((img, pos, hotspot, ..)) => {
             let path = std::env::temp_dir().join("cosmic-capture-kit-cursor.png");
             match img.save(&path) {
-                Ok(()) => println!("saved: {}", path.display()),
-                Err(e) => eprintln!("cursor-capture: failed to save {}: {e}", path.display()),
+                Ok(()) => outln!("saved: {}", path.display()),
+                Err(e) => errln!("cursor-capture: failed to save {}: {e}", path.display()),
             }
-            println!("size: {}x{}", img.width(), img.height());
-            println!("position (global logical): {},{}", pos.0, pos.1);
-            println!("hotspot (sprite px): {},{}", hotspot.0, hotspot.1);
+            outln!("size: {}x{}", img.width(), img.height());
+            outln!("position (global logical): {},{}", pos.0, pos.1);
+            outln!("hotspot (sprite px): {},{}", hotspot.0, hotspot.1);
             // Which output contains the resolved position (the correctness check).
             match descs.iter().find(|d| {
                 let (ox, oy) = d.logical_pos;
                 let (ow, oh) = d.logical_size;
                 pos.0 >= ox && pos.0 < ox + ow && pos.1 >= oy && pos.1 < oy + oh
             }) {
-                Some(d) => println!("resolved onto output: {}", d.name),
-                None => println!("resolved onto output: NONE (position outside every output!)"),
+                Some(d) => outln!("resolved onto output: {}", d.name),
+                None => outln!("resolved onto output: NONE (position outside every output!)"),
             }
         }
-        None => eprintln!("cursor-capture: no cursor captured (is the pointer on a monitor?)"),
+        None => errln!("cursor-capture: no cursor captured (is the pointer on a monitor?)"),
     }
 }
 
-/// List the available `--test` subcommands.
+/// List the available `debug test` subcommands.
 fn print_test_help() {
-    eprint!(
-        "usage: cosmic-capture-kit --test <name> [args]\n\n\
+    err!(
+        "usage: cosmic-capture-kit debug test <name> [args]\n\n\
          selftest                          gather outputs + screencopy probe\n\
          audio                             mic input-processing chain on the live mic\n\
          mic-rec                           record cleaned mic + system to /tmp/cck-rectest.mp4\n\
@@ -1664,20 +2014,22 @@ fn print_test_help() {
          cursor-capture                    grab the mouse cursor sprite (alpha + position + hotspot)\n\
          bench-encoders [w h [capture]]    fps + CPU cores per encoder (default 4K; `capture` adds the capture-thread cost)\n\
          bench-record [secs] [fps] [back]  end-to-end record benchmark\n\
-         pw [window]                       PipeWire screencast probe (monitor|window)\n"
+         pw [window] [secs]                PipeWire screencast probe (monitor|window; secs default 3)\n"
     );
     #[cfg(target_os = "linux")]
-    eprintln!(
-        "linux-focus-probe [id|title]      activate a toplevel + re-grab; before/after CSD focus proof (DRAGON-194)\n\
+    errln!(
+        "linux-rec-bench [out] [secs] [enc] [fps] [maxside] [nomic] [nosys] [manualsync] [zerocopy]\n\
+        \x20                                 real recording of one output -> achieved DISTINCT fps (DRAGON-714)\n\
+         linux-focus-probe [id|title]      activate a toplevel + re-grab; before/after CSD focus proof (DRAGON-194)\n\
          glass-shot [id|title]             window capture with frosted-glass compositing on vs off -> PNG pair (DRAGON-218)"
     );
     #[cfg(feature = "zero-copy")]
-    eprint!(
+    err!(
         "dmabuf [window]                   zero-copy dmabuf capture probe\n\
          screencopy-dmabuf                 wlr-screencopy dmabuf probe\n"
     );
     #[cfg(target_os = "macos")]
-    eprint!(
+    err!(
         "mac-shot [display-name]           SCK still + window/cursor probe -> PNG in tmp\n\
          mac-active-shot                   grab the frontmost app's window + score its traffic lights (DRAGON-189)\n\
          mac-focus-shot [windowID]         focus a non-front window, verify, re-grab; before/after traffic-light score (DRAGON-189)\n\
@@ -1688,7 +2040,7 @@ fn print_test_help() {
     // DRAGON-229/241: the Windows capture + recording checkpoints (W1-SPEC §7 / W3-SPEC §8),
     // one line per `windows-*` match arm above.
     #[cfg(target_os = "windows")]
-    eprint!(
+    err!(
         "windows-monitors                  DPI awareness + each monitor's geometry + DPI\n\
          windows-shot-output [name]        a full-monitor BitBlt flat -> PNG\n\
          windows-list                      the toplevel window list (id, rect, active, title)\n\
@@ -1700,22 +2052,22 @@ fn print_test_help() {
          windows-shot-region <x> <y> <w> <h>  a stitched region flat -> PNG\n\
          windows-wgc-frame <monitor|window|region> [args]  grab one WGC frame -> PNG\n\
          windows-window-leak <hwnd>        DRAGON-426: does a window grab carry what is BEHIND the window? -> PNGs + verdict\n\
-         windows-record <secs> [mic] [nosys] [pause] [enc]  record via the owned media-clock pipeline -> mp4\n\
+         windows-record <secs> [mic] [nosys] [pause] [region] [res=<W>x<H>] [auto|nvenc|amf|qsv|mf|software]  record via the owned media-clock pipeline -> mp4\n\
          windows-audio-endpoints           list the ACTIVE WASAPI render endpoints (id + name) the Output picker offers\n"
     );
 }
 
-/// Run code + text detection on an image and print the results (`--test scan <image>`).
+/// Run code + text detection on an image and print the results (`debug test scan <image>`).
 fn scan_test(path: &str) {
     let path = std::path::Path::new(path);
     let Ok(img) = image::open(path) else {
-        eprintln!("scan: could not open {}", path.display());
+        errln!("scan: could not open {}", path.display());
         return;
     };
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     for m in crate::detect::scan_codes(&rgba, 0, 0, w, h) {
-        eprintln!(
+        errln!(
             "Code rect={:?} poly={:?} action={:?} label={:?}",
             m.rect, m.poly, m.action, m.label
         );
@@ -1723,13 +2075,13 @@ fn scan_test(path: &str) {
     let conf = std::env::var("CCK_CONF").ok().and_then(|s| s.parse().ok()).unwrap_or(25.0);
     let words = crate::detect::scan_text(&rgba, 0, 0, w, h, conf);
     for word in &words {
-        eprintln!(
+        errln!(
             "Word line={} rect={:?} poly={:?} text={:?}",
             word.line, word.rect, word.poly, word.text
         );
     }
     if std::env::var_os("CCK_JOIN").is_some() {
-        eprintln!("\n--- joined ---\n{}", crate::detect::join_words(&words));
+        errln!("\n--- joined ---\n{}", crate::detect::join_words(&words));
     }
 }
 
@@ -1745,7 +2097,7 @@ fn ocr_bench(dir: &std::path::Path) {
     collect_ocr_cases(dir, &mut cases);
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     if cases.is_empty() {
-        eprintln!(
+        errln!(
             "No OCR cases under {} (need an image + a sibling .txt or expected.txt)",
             dir.display()
         );
@@ -1762,7 +2114,7 @@ fn ocr_bench(dir: &std::path::Path) {
                 norm_ws(&crate::detect::join_words(&crate::detect::scan_text(&rgba, 0, 0, w, h, conf)))
             }
             Err(_) => {
-                println!("ERR  ----  {} (could not open)", img_path.display());
+                outln!("ERR  ----  {} (could not open)", img_path.display());
                 continue;
             }
         };
@@ -1773,14 +2125,14 @@ fn ocr_bench(dir: &std::path::Path) {
         }
         let tag = if sim >= 0.90 { "ok  " } else { "DIFF" };
         let name = img_path.strip_prefix(dir).unwrap_or(img_path);
-        println!("{tag} {:.3}  {}", sim, name.display());
+        outln!("{tag} {:.3}  {}", sim, name.display());
         if sim < 0.999 {
-            println!("        got:  {got:?}");
-            println!("        want: {want:?}");
+            outln!("        got:  {got:?}");
+            outln!("        want: {want:?}");
         }
     }
     let n = cases.len();
-    println!(
+    outln!(
         "\n{n} cases | mean similarity {:.3} | pass(>=0.90) {passing}/{n}",
         sum / n as f64
     );
@@ -1861,17 +2213,23 @@ fn similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Diagnostic: request a ScreenCast session for `src` (monitor by default, or
-/// `--pw-test window`), then consume its PipeWire stream for ~3s and print the
-/// frames received. Validates the portal + in-process PipeWire path end to end
-/// without the recording UI. The portal dialog appears — pick a source.
+/// `debug test pw window`), then consume its PipeWire stream and print the frames
+/// received. Validates the portal + in-process PipeWire path end to end without the
+/// recording UI. The portal dialog appears — pick a source.
+///
+/// A bare numeric argument sets how long to consume for (default 3 seconds). It exists so
+/// the DRAGON-714 negotiation watch can be exercised here rather than only through a real
+/// recording: the watch's budget is 5s, so the run has to outlast it. With
+/// `CCK_TEST_PW_BREAK_NEGOTIATION=1` set, `debug test pw 10` should end with a NAMED error
+/// at about 5 seconds instead of counting frames.
 #[cfg(target_os = "linux")]
-fn pw_test(src: ashpd::desktop::screencast::SourceType) {
+fn pw_test(src: ashpd::desktop::screencast::SourceType, rest: &[String]) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("pw-test: tokio runtime: {e}");
+            errln!("pw-test: tokio runtime: {e}");
             return;
         }
     };
@@ -1883,41 +2241,43 @@ fn pw_test(src: ashpd::desktop::screencast::SourceType) {
     let cursor = crate::platform::screencast::CursorRequest::Keep;
     match rt.block_on(crate::platform::screencast::request(src, None, cursor)) {
         Ok(session) => {
-            eprintln!(
+            errln!(
                 "pw-test: granted {} stream(s), restore_token={}",
                 session.streams.len(),
                 session.restore_token.is_some()
             );
             let Some(stream) = session.streams.first() else {
-                eprintln!("pw-test: no streams returned");
+                errln!("pw-test: no streams returned");
                 return;
             };
-            eprintln!(
+            errln!(
                 "pw-test: node={} position={:?} size={:?}",
                 stream.node_id, stream.position, stream.size
             );
             let node = stream.node_id;
+            // How long to consume for: the first bare number in the args, else 3s.
+            let secs: u64 = rest.iter().find_map(|a| a.parse::<u64>().ok()).unwrap_or(3);
             let stop = Arc::new(AtomicBool::new(false));
             let stop2 = stop.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::thread::sleep(std::time::Duration::from_secs(secs));
                 stop2.store(true, Ordering::Relaxed);
             });
             let mut n = 0u32;
             let r = crate::platform::pipewire::consume_frames(session.fd, node, None, stop, move |rgba, w, h, pts, pw_delay| {
                 n += 1;
                 if n <= 3 || n.is_multiple_of(60) {
-                    eprintln!(
+                    errln!(
                         "pw-test: frame {n}: {w}x{h} ({} bytes) pts={pts} pw_delay_ms={}",
                         rgba.len(),
                         pw_delay / 1_000_000
                     );
                 }
             });
-            eprintln!("pw-test: capture ended: {r:?}");
+            errln!("pw-test: capture ended: {r:?}");
         }
-        Err(crate::platform::screencast::CastError::Cancelled) => eprintln!("pw-test: cancelled by user"),
-        Err(crate::platform::screencast::CastError::Unavailable(e)) => eprintln!("pw-test: unavailable: {e}"),
+        Err(crate::platform::screencast::CastError::Cancelled) => errln!("pw-test: cancelled by user"),
+        Err(crate::platform::screencast::CastError::Unavailable(e)) => errln!("pw-test: unavailable: {e}"),
     }
 }
 
@@ -1933,7 +2293,7 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("dmabuf-test: tokio runtime: {e}");
+            errln!("dmabuf-test: tokio runtime: {e}");
             return;
         }
     };
@@ -1944,10 +2304,10 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
     match rt.block_on(crate::platform::screencast::request(src, None, cursor)) {
         Ok(session) => {
             let Some(stream) = session.streams.first() else {
-                eprintln!("dmabuf-test: no streams returned");
+                errln!("dmabuf-test: no streams returned");
                 return;
             };
-            eprintln!("dmabuf-test: node={}, requesting DMA-BUF for ~5s...", stream.node_id);
+            errln!("dmabuf-test: node={}, requesting DMA-BUF for ~5s...", stream.node_id);
             let node = stream.node_id;
             let stop = Arc::new(AtomicBool::new(false));
             let got = Arc::new(AtomicBool::new(false));
@@ -1974,7 +2334,7 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
                     // decision can never disagree about who made a frame. Output unchanged.
                     let vendor = crate::encode::modifier_vendor_label(f.modifier);
                     let fds: Vec<i32> = f.planes.iter().map(|p| p.0).collect();
-                    eprintln!(
+                    errln!(
                         "dmabuf-test: frame {n}: {}x{} fourcc={fourcc:?} modifier=0x{:016x} \
                          (source GPU: {vendor}) planes={} fds={fds:?}",
                         f.width, f.height, f.modifier, f.planes.len()
@@ -1985,20 +2345,20 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
                 }
             });
             if got.load(Ordering::Relaxed) {
-                eprintln!(
+                errln!(
                     "dmabuf-test: SUCCESS. Cosmic delivered DMA-BUF frames. Zero-copy is \
                      possible; the source GPU above decides NVENC (NVIDIA) vs VAAPI (AMD/Intel)."
                 );
             } else {
-                eprintln!(
+                errln!(
                     "dmabuf-test: NO dmabuf frames in 5s. Cosmic declined DMA-BUF over the \
                      portal, so portal zero-copy isn't possible (the CPU path is used)."
                 );
             }
-            eprintln!("dmabuf-test: ended: {r:?}");
+            errln!("dmabuf-test: ended: {r:?}");
         }
-        Err(crate::platform::screencast::CastError::Cancelled) => eprintln!("dmabuf-test: cancelled by user"),
-        Err(crate::platform::screencast::CastError::Unavailable(e)) => eprintln!("dmabuf-test: unavailable: {e}"),
+        Err(crate::platform::screencast::CastError::Cancelled) => errln!("dmabuf-test: cancelled by user"),
+        Err(crate::platform::screencast::CastError::Unavailable(e)) => errln!("dmabuf-test: unavailable: {e}"),
     }
 }
 
@@ -2012,7 +2372,7 @@ fn denoise_test(in_path: &str, out_prefix: &str) {
     use sonora::{AudioProcessing, Config, StreamConfig};
 
     let Ok(bytes) = std::fs::read(in_path) else {
-        eprintln!("denoise-test: cannot read {in_path}");
+        errln!("denoise-test: cannot read {in_path}");
         return;
     };
     let input: Vec<f32> = bytes
@@ -2071,7 +2431,7 @@ fn denoise_test(in_path: &str, out_prefix: &str) {
     write("webrtc", &out_w);
     write("rnnoise", &out_r);
     write("cascade", &out_c);
-    eprintln!(
+    errln!(
         "denoise-test: {} frames -> {out_prefix}.{{webrtc,rnnoise,cascade}}.raw",
         input.len() / nf
     );
@@ -2147,13 +2507,13 @@ fn audio_input_test() {
             },
         ),
     ];
-    println!("audio-test: synthetic 4 s, 0.5 s silence/voice alternating @ 48 kHz");
-    println!("levels are 0..1 on the meter dBFS scale (raw=input, clean=after chain)\n");
-    println!(
+    outln!("audio-test: synthetic 4 s, 0.5 s silence/voice alternating @ 48 kHz");
+    outln!("levels are 0..1 on the meter dBFS scale (raw=input, clean=after chain)\n");
+    outln!(
         "{:<32} | {:^24} | {:^24}",
         "config", "VOICE segments", "SILENCE segments"
     );
-    println!(
+    outln!(
         "{:<32} | {:>5} {:>5} {:>5} {:>4} | {:>5} {:>5} {:>5} {:>4}",
         "", "raw", "clean", "open", "vad", "raw", "clean", "open", "vad"
     );
@@ -2187,13 +2547,13 @@ fn audio_input_test() {
                 avg(vad[k], cnt[k])
             )
         };
-        println!("{:<32} | {} | {}", name, cell(1), cell(0));
+        outln!("{:<32} | {} | {}", name, cell(1), cell(0));
     }
 
     // AGC ramp test: a QUIET continuous voice (~-32 dBFS), 6 s, so the gain has time to ramp.
     // Print the PEAK clean level per second (what the meter's bars show) so the climb into the
     // green band (0.80..0.90) is visible; a quiet mic should rise toward it and hold there.
-    println!("\nAGC ramp (continuous quiet voice ~-32 dBFS, PEAK clean level per second):");
+    outln!("\nAGC ramp (continuous quiet voice ~-32 dBFS, PEAK clean level per second):");
     let secs_voice = 6;
     let mut quiet: Vec<f32> = Vec::with_capacity(SR * secs_voice);
     for n in 0..SR * secs_voice {
@@ -2221,7 +2581,7 @@ fn audio_input_test() {
             i += FRAME;
         }
         let cols: Vec<String> = per_sec.iter().map(|s| format!("{s:.2}")).collect();
-        println!("  {:<8} {}", label, cols.join("  "));
+        outln!("  {:<8} {}", label, cols.join("  "));
     }
 }
 
@@ -2259,7 +2619,7 @@ fn mic_rec_test() {
     // No external far-end ring: this diagnostic runs no system capture of its own,
     // so echo cancellation (off here anyway) would use the dedicated capture.
     let Some((handle, rx)) = crate::audio::clean_mic::setup_clean_mic_tap(cfg, "", None) else {
-        eprintln!("mic-rec-test: setup_clean_mic_tap failed (no mic?)");
+        errln!("mic-rec-test: setup_clean_mic_tap failed (no mic?)");
         return;
     };
     const SECS: f64 = 3.0;
@@ -2275,7 +2635,7 @@ fn mic_rec_test() {
     }
     drop(handle); // teardown: kill the mic/monitor captures
     if samples.is_empty() {
-        eprintln!("mic-rec-test: no cleaned mic audio captured");
+        errln!("mic-rec-test: no cleaned mic audio captured");
         return;
     }
     let dur = samples.len() as f64 / SR as f64;
@@ -2287,7 +2647,7 @@ fn mic_rec_test() {
     let mic_raw = mic_raw_buf.as_path();
     let raw_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
     if let Err(e) = std::fs::write(mic_raw, &raw_bytes) {
-        eprintln!("mic-rec-test: could not write the cleaned mic's raw PCM temp file: {e}");
+        errln!("mic-rec-test: could not write the cleaned mic's raw PCM temp file: {e}");
         return;
     }
 
@@ -2318,7 +2678,7 @@ fn mic_rec_test() {
         let sys_raw = std::env::temp_dir().join("cck-sys-loopback-raw.f32");
         match capture_system_loopback(&sys_raw, dur) {
             Some(peak) => {
-                eprintln!(
+                errln!(
                     "mic-rec-test: WASAPI loopback captured system audio (peak {peak:.4}, {})",
                     if peak > 0.0001 { "non-silent" } else { "silent — nothing was playing" }
                 );
@@ -2331,7 +2691,7 @@ fn mic_rec_test() {
                 ]);
             }
             None => {
-                eprintln!("mic-rec-test: WASAPI loopback unavailable; writing a mic-only mux");
+                errln!("mic-rec-test: WASAPI loopback unavailable; writing a mic-only mux");
                 cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
                 cmd.args([
                     "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k",
@@ -2346,7 +2706,7 @@ fn mic_rec_test() {
     // this diagnostic muxes the synthetic video + cleaned mic only.
     #[cfg(target_os = "macos")]
     {
-        eprintln!("mic-rec-test: no pulse system monitor on macOS; writing a mic-only mux");
+        errln!("mic-rec-test: no pulse system monitor on macOS; writing a mic-only mux");
         cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
         cmd.args([
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k",
@@ -2357,7 +2717,7 @@ fn mic_rec_test() {
     cmd.arg(out);
     let status = cmd.status();
     let _ = std::fs::remove_file(mic_raw);
-    eprintln!("mic-rec-test: ffmpeg exited {status:?} ({dur:.2}s of cleaned mic captured)");
+    errln!("mic-rec-test: ffmpeg exited {status:?} ({dur:.2}s of cleaned mic captured)");
     let probe = crate::util::ffprobe_command()
         .args([
             "-v", "error", "-show_entries",
@@ -2366,8 +2726,8 @@ fn mic_rec_test() {
         ])
         .output();
     match probe {
-        Ok(o) => println!("{}", String::from_utf8_lossy(&o.stdout)),
-        Err(e) => eprintln!("mic-rec-test: ffprobe failed: {e}"),
+        Ok(o) => outln!("{}", String::from_utf8_lossy(&o.stdout)),
+        Err(e) => errln!("mic-rec-test: ffprobe failed: {e}"),
     }
 }
 
@@ -2406,15 +2766,16 @@ fn capture_system_loopback(path: &std::path::Path, secs: f64) -> Option<f32> {
 fn selftest() {
     let t0 = std::time::Instant::now();
     let groups = crate::platform::compositor::list_toplevels();
-    eprintln!(
+    errln!(
         "gather: {} output group(s) in {}ms",
         groups.len(),
         t0.elapsed().as_millis()
     );
     let mut ids = Vec::new();
     for (name, wins) in &groups {
-        eprintln!("  output {name}: {} window(s)", wins.len());
+        errln!("  output {name}: {} window(s)", wins.len());
         for w in wins {
+            errln!("    rect={:?} id={} title={:?}", w.rect, w.id, w.title);
             ids.push(w.id.clone());
         }
     }
@@ -2423,14 +2784,14 @@ fn selftest() {
 
     let t1 = std::time::Instant::now();
     let thumbs = crate::screenshot::windows(&ids);
-    eprintln!(
+    errln!(
         "capture_toplevels: {}/{} in {}ms",
         thumbs.len(),
         ids.len(),
         t1.elapsed().as_millis()
     );
     for (id, img) in &thumbs {
-        eprintln!("    thumb id={id:?} {}x{}", img.width(), img.height());
+        errln!("    thumb id={id:?} {}x{}", img.width(), img.height());
     }
 
     // Try a full-resolution capture of the first toplevel directly, then apply
@@ -2444,13 +2805,13 @@ fn selftest() {
                 let black = crate::compose::on_black(bordered.clone());
                 crate::media::png::save_png(&bordered, std::path::Path::new("/tmp/cck-window-bordered.png"), "");
                 crate::media::png::save_png(&black, std::path::Path::new("/tmp/cck-window-black.png"), "");
-                eprintln!(
+                errln!(
                     "capture_toplevel({id:?}): {}x{} -> bordered & black-bg saved",
                     bordered.width(),
                     bordered.height()
                 );
             }
-            None => eprintln!("capture_toplevel({id:?}): FAILED (no image)"),
+            None => errln!("capture_toplevel({id:?}): FAILED (no image)"),
         }
     }
 
@@ -2475,9 +2836,9 @@ fn selftest() {
         match crate::wallpaper::wallpaper_crop(&wp, false, 5120, 1440, x, y, w as u32, h as u32) {
             Some(c) => {
                 crate::media::png::save_png(&c, std::path::Path::new("/tmp/cck-wpcrop.png"), "");
-                eprintln!("wallpaper_crop: {}x{} (from {:?})", c.width(), c.height(), wp);
+                errln!("wallpaper_crop: {}x{} (from {:?})", c.width(), c.height(), wp);
             }
-            None => eprintln!("wallpaper_crop FAILED"),
+            None => errln!("wallpaper_crop FAILED"),
         }
     }
 
@@ -2487,9 +2848,9 @@ fn selftest() {
             Some(img) => {
                 let p = std::path::Path::new("/tmp/cck-selftest-output.png");
                 let ok = crate::media::png::save_png(&img, p, "");
-                eprintln!("capture_output({name}): {}x{} saved={ok} -> {}", img.width(), img.height(), p.display());
+                errln!("capture_output({name}): {}x{} saved={ok} -> {}", img.width(), img.height(), p.display());
             }
-            None => eprintln!("capture_output({name}): FAILED (no image)"),
+            None => errln!("capture_output({name}): FAILED (no image)"),
         }
     }
 }
@@ -2505,24 +2866,24 @@ fn win_slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-/// `--test windows-monitors`: DPI awareness + every monitor's physical geometry + DPI.
+/// `debug test windows-monitors`: DPI awareness + every monitor's physical geometry + DPI.
 #[cfg(target_os = "windows")]
 fn windows_monitors_test() {
-    println!(
+    outln!(
         "thread DPI awareness: {} (want per-monitor)",
         crate::platform::windows::dpi::thread_dpi_awareness_str()
     );
     let lines = crate::platform::windows::monitor_report();
-    println!("monitors ({}):", lines.len());
+    outln!("monitors ({}):", lines.len());
     for line in &lines {
-        println!("  {line}");
+        outln!("  {line}");
     }
     if lines.is_empty() {
-        println!("(no monitors — headless session?)");
+        outln!("(no monitors — headless session?)");
     }
 }
 
-/// `--test windows-shot-output [name]`: a full-monitor BitBlt flat → PNG.
+/// `debug test windows-shot-output [name]`: a full-monitor BitBlt flat → PNG.
 #[cfg(target_os = "windows")]
 fn windows_shot_output_test(name: &str) {
     let descs = crate::screenshot::output_descs();
@@ -2536,68 +2897,68 @@ fn windows_shot_output_test(name: &str) {
         Some(name.to_string())
     };
     let Some(target) = target else {
-        eprintln!("windows-shot-output: no monitors");
+        errln!("windows-shot-output: no monitors");
         return;
     };
     match crate::screenshot::output(&target, None) {
         Some(img) => {
             let p = std::env::temp_dir().join(format!("cck-win-output-{}.png", win_slug(&target)));
             match img.save(&p) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "captured {target}: {}x{} -> {}",
                     img.width(),
                     img.height(),
                     p.display()
                 ),
-                Err(e) => eprintln!("windows-shot-output: save failed: {e}"),
+                Err(e) => errln!("windows-shot-output: save failed: {e}"),
             }
         }
-        None => eprintln!("windows-shot-output({target}): FAILED"),
+        None => errln!("windows-shot-output({target}): FAILED"),
     }
 }
 
-/// `--test windows-list`: the toplevel window list (id, rect, active, title).
+/// `debug test windows-list`: the toplevel window list (id, rect, active, title).
 #[cfg(target_os = "windows")]
 fn windows_list_test() {
     let wins = crate::platform::windows::list_windows();
-    println!("windows ({}):", wins.len());
+    outln!("windows ({}):", wins.len());
     for w in &wins {
         let (x, y, ww, wh) = w.rect;
-        println!(
+        outln!(
             "  id={} rect=({x},{y},{ww},{wh}) active={} title={:?}",
             w.id, w.active, w.title
         );
     }
 }
 
-/// `--test windows-shot-window <hwnd>`: one window's pixels (PrintWindow ladder) → PNG.
+/// `debug test windows-shot-window <hwnd>`: one window's pixels (PrintWindow ladder) → PNG.
 #[cfg(target_os = "windows")]
 fn windows_shot_window_test(id: &str) {
     if id.is_empty() {
-        eprintln!("usage: --test windows-shot-window <hwnd-decimal>");
+        errln!("usage: debug test windows-shot-window <hwnd-decimal>");
         return;
     }
     match crate::screenshot::window(id, false) {
         Some(img) => {
             let p = std::env::temp_dir().join(format!("cck-win-window-{id}.png"));
             match img.save(&p) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "captured window {id}: {}x{} -> {}",
                     img.width(),
                     img.height(),
                     p.display()
                 ),
-                Err(e) => eprintln!("windows-shot-window: save failed: {e}"),
+                Err(e) => errln!("windows-shot-window: save failed: {e}"),
             }
         }
-        None => eprintln!(
+        None => errln!(
             "windows-shot-window({id}): None — bad grab on an OCCLUDED GPU-composited \
              window (WGC rescue is M3), or an invalid hwnd. See the DRAGON-229 log line."
         ),
     }
 }
 
-/// `--test windows-thumbs`: run the FULL window pre-capture enumeration
+/// `debug test windows-thumbs`: run the FULL window pre-capture enumeration
 /// (`screenshot::windows` over every listed toplevel) — the exact path window MODE runs
 /// at launch, and the one that used to hang forever on a single uncooperative window
 /// (DRAGON-232). Times the whole bounded grab and reports each window as OK (real pixels)
@@ -2608,12 +2969,12 @@ fn windows_shot_window_test(id: &str) {
 fn windows_thumbs_test() {
     let wins = crate::platform::windows::list_windows();
     let ids: Vec<String> = wins.iter().map(|w| w.id.clone()).collect();
-    println!("enumerating {} windows; running the bounded per-window grab...", ids.len());
+    outln!("enumerating {} windows; running the bounded per-window grab...", ids.len());
     let t0 = std::time::Instant::now();
     let raw = crate::screenshot::windows(&ids);
     let elapsed = t0.elapsed();
     let skipped = ids.len().saturating_sub(raw.len());
-    println!(
+    outln!(
         "screenshot::windows: {} grabbed / {skipped} skipped in {:.2}s",
         raw.len(),
         elapsed.as_secs_f64()
@@ -2621,21 +2982,21 @@ fn windows_thumbs_test() {
     for w in &wins {
         match raw.get(&w.id) {
             Some(img) => {
-                println!("  OK   id={} {}x{} title={:?}", w.id, img.width(), img.height(), w.title)
+                outln!("  OK   id={} {}x{} title={:?}", w.id, img.width(), img.height(), w.title)
             }
-            None => println!("  SKIP id={} -> placeholder tile title={:?}", w.id, w.title),
+            None => outln!("  SKIP id={} -> placeholder tile title={:?}", w.id, w.title),
         }
     }
 }
 
-/// `--test windows-cursor`: the cursor sprite (real alpha) → PNG + position/hotspot/scale.
+/// `debug test windows-cursor`: the cursor sprite (real alpha) → PNG + position/hotspot/scale.
 #[cfg(target_os = "windows")]
 fn windows_cursor_test() {
     match crate::screenshot::capture_cursor() {
         Some((img, pos, hot, scale)) => {
             let p = std::env::temp_dir().join("cck-win-cursor.png");
             let ok = img.save(&p).is_ok();
-            println!(
+            outln!(
                 "cursor: {}x{} at {:?} hotspot {:?} sprite_scale={:.3} saved={ok} -> {}",
                 img.width(),
                 img.height(),
@@ -2645,15 +3006,15 @@ fn windows_cursor_test() {
                 p.display()
             );
         }
-        None => println!("cursor: none (hidden?)"),
+        None => outln!("cursor: none (hidden?)"),
     }
 }
 
-/// `--test windows-wallpaper [name]`: `detect()` + the per-output resolver (honest None
+/// `debug test windows-wallpaper [name]`: `detect()` + the per-output resolver (honest None
 /// under slideshow / solid color / undecodable), decoding a copy to confirm.
 #[cfg(target_os = "windows")]
 fn windows_wallpaper_test(name: &str) {
-    println!("detect() (primary / cap): {:?}", crate::wallpaper::detect());
+    outln!("detect() (primary / cap): {:?}", crate::wallpaper::detect());
     let descs = crate::screenshot::output_descs();
     let target = if name.is_empty() {
         descs.first().map(|d| d.name.clone())
@@ -2661,36 +3022,36 @@ fn windows_wallpaper_test(name: &str) {
         Some(name.to_string())
     };
     let Some(target) = target else {
-        eprintln!("windows-wallpaper: no monitors");
+        errln!("windows-wallpaper: no monitors");
         return;
     };
     match crate::platform::windows::wallpaper::wallpaper_for_output(&target) {
         Some((path, stretch)) => {
-            println!("wallpaper_for_output({target}): {} (stretch={stretch})", path.display());
+            outln!("wallpaper_for_output({target}): {} (stretch={stretch})", path.display());
             if let Some(wp) = crate::wallpaper::decode_wallpaper(&path) {
                 let p = std::env::temp_dir()
                     .join(format!("cck-win-wallpaper-{}.png", win_slug(&target)));
                 let ok = wp.save(&p).is_ok();
-                println!("  decoded {}x{} saved={ok} -> {}", wp.width(), wp.height(), p.display());
+                outln!("  decoded {}x{} saved={ok} -> {}", wp.width(), wp.height(), p.display());
             }
         }
-        None => println!(
+        None => outln!(
             "wallpaper_for_output({target}): None (slideshow / solid color / undecodable — honest)"
         ),
     }
 }
 
-/// `--test windows-window-composite <hwnd> [black]`: the FINAL PROOF — the full
+/// `debug test windows-window-composite <hwnd> [black]`: the FINAL PROOF — the full
 /// decorate/compose/wallpaper pipeline (single-window-on-wallpaper). `black` = the
 /// wallpaper-OFF variant (window over black).
 #[cfg(target_os = "windows")]
 fn windows_window_composite_test(id: &str, mode: &str) {
     if id.is_empty() {
-        eprintln!("usage: --test windows-window-composite <hwnd> [black]");
+        errln!("usage: debug test windows-window-composite <hwnd> [black]");
         return;
     }
     let Some(win) = crate::platform::windows::list_windows().into_iter().find(|w| w.id == id) else {
-        eprintln!("windows-window-composite: hwnd {id} not in the window list");
+        errln!("windows-window-composite: hwnd {id} not in the window list");
         return;
     };
     let (x, y, w, h) = win.rect;
@@ -2710,7 +3071,7 @@ fn windows_window_composite_test(id: &str, mode: &str) {
     // faithful. An explicit `active_border_color` in config would win in the app; the
     // diag proves the auto/default path.
     let active_default = crate::app::theme::resolved_appearance_accent_rgba();
-    println!("windows-window-composite: resolved active-border accent = {active_default:?}");
+    outln!("windows-window-composite: resolved active-border accent = {active_default:?}");
     let borders =
         crate::decoration::WindowBorders::resolve(Some(active_default), 3, [65, 69, 80, 255], 1);
     let frozen_geom: Vec<_> = crate::screenshot::output_descs()
@@ -2739,20 +3100,20 @@ fn windows_window_composite_test(id: &str, mode: &str) {
             let tag = if wallpaper { "wp" } else { "black" };
             let p = std::env::temp_dir().join(format!("cck-win-composite-{id}-{tag}.png"));
             match img.save(&p) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "composite {id} (wallpaper={wallpaper}): {}x{} -> {}",
                     img.width(),
                     img.height(),
                     p.display()
                 ),
-                Err(e) => eprintln!("windows-window-composite: save failed: {e}"),
+                Err(e) => errln!("windows-window-composite: save failed: {e}"),
             }
         }
-        None => eprintln!("windows-window-composite({id}): FAILED (window grab returned None)"),
+        None => errln!("windows-window-composite({id}): FAILED (window grab returned None)"),
     }
 }
 
-/// `--test windows-wgc-frame <monitor|window|region> [args]`: grab ONE WGC frame and save
+/// `debug test windows-wgc-frame <monitor|window|region> [args]`: grab ONE WGC frame and save
 /// it as a PNG — the S1 checkpoint (isolated WGC video de-risk). `monitor [name]` (default
 /// primary), `window <hwnd>`, or `region <x> <y> <w> <h>`.
 #[cfg(target_os = "windows")]
@@ -2761,7 +3122,7 @@ fn windows_wgc_frame_test(kind: &str, a: &str, b: &str, c: &str, d: &str) {
     let (target, x, y, w, h) = match kind {
         "window" => {
             if a.is_empty() {
-                eprintln!("usage: --test windows-wgc-frame window <hwnd-decimal>");
+                errln!("usage: debug test windows-wgc-frame window <hwnd-decimal>");
                 return;
             }
             (WinRecordTarget::Window(a.to_string()), 0, 0, 0, 0)
@@ -2772,7 +3133,7 @@ fn windows_wgc_frame_test(kind: &str, a: &str, b: &str, c: &str, d: &str) {
             let w: u32 = c.parse().unwrap_or(0);
             let h: u32 = d.parse().unwrap_or(0);
             if w == 0 || h == 0 {
-                eprintln!("usage: --test windows-wgc-frame region <x> <y> <w> <h>");
+                errln!("usage: debug test windows-wgc-frame region <x> <y> <w> <h>");
                 return;
             }
             (WinRecordTarget::Region, x, y, w, h)
@@ -2789,7 +3150,7 @@ fn windows_wgc_frame_test(kind: &str, a: &str, b: &str, c: &str, d: &str) {
                 Some(a.to_string())
             };
             let Some(name) = name else {
-                eprintln!("windows-wgc-frame: no monitors");
+                errln!("windows-wgc-frame: no monitors");
                 return;
             };
             (WinRecordTarget::Display(name), 0, 0, 0, 0)
@@ -2798,26 +3159,125 @@ fn windows_wgc_frame_test(kind: &str, a: &str, b: &str, c: &str, d: &str) {
     match crate::record::wgc_capture_one_frame(target, x, y, w, h, false) {
         Ok((fw, fh, bytes)) => {
             let Some(img) = image::RgbaImage::from_raw(fw, fh, bytes) else {
-                eprintln!("windows-wgc-frame: malformed frame buffer");
+                errln!("windows-wgc-frame: malformed frame buffer");
                 return;
             };
             let p = std::env::temp_dir().join(format!("cck-wgc-frame-{kind}.png"));
             match img.save(&p) {
-                Ok(()) => println!("wgc frame ({kind}): {fw}x{fh} -> {}", p.display()),
-                Err(e) => eprintln!("windows-wgc-frame: save failed: {e}"),
+                Ok(()) => outln!("wgc frame ({kind}): {fw}x{fh} -> {}", p.display()),
+                Err(e) => errln!("windows-wgc-frame: save failed: {e}"),
             }
         }
-        Err(e) => eprintln!("windows-wgc-frame({kind}): FAILED — {e}"),
+        Err(e) => errln!("windows-wgc-frame({kind}): FAILED — {e}"),
     }
 }
 
-/// `--test windows-record <secs> [mic] [nosys] [pause] [nvenc|amf|qsv|software]`: record the
+/// The encoder ids `windows-record` accepts. `auto` is here since DRAGON-708: it is the mode
+/// the app actually ships in, `EncodePlan::resolve_encoder_id` has always handled it (it walks
+/// the ranked ladder), and the harness was the only thing that could not say the word.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RECORD_ENCODERS: [&str; 6] = ["auto", "nvenc", "amf", "qsv", "mf", "software"];
+
+/// The non-encoder words `windows-record` accepts, beside the leading duration.
+///
+/// `region` is here since DRAGON-710. It has driven the region worker since DRAGON-272, but
+/// DRAGON-708 built this list from the doc comment rather than from the body and left it
+/// out, so the refuse-an-unknown-word check it added rejected the one flag that was already
+/// implemented. A vocabulary list and the code that reads it have to come from the same
+/// place; `every_flag_the_body_reads_is_in_the_vocabulary` now pins that they do.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RECORD_FLAGS: [&str; 4] = ["mic", "nosys", "pause", "region"];
+
+/// The `res=<W>x<H>` token's prefix: the recording's max-resolution box, which is the
+/// harness's spelling of the `record_max_height` setting the app persists (DRAGON-710).
+///
+/// WHY IT EXISTS. The harness passed `max_res: (0, 0)`, so a run always encoded the whole
+/// captured display at whatever size it is. Every reproduction of the Media Foundation
+/// wedge was therefore at the dev box's 5120x1440, with no way to ask the cheap question
+/// the diagnosis needed: does the wedge depend on the frame SIZE? A typical ARM64 laptop,
+/// the machine the tier exists for, is 1920x1200.
+///
+/// It deliberately does NOT read the user's persisted cap instead. A diagnostic whose
+/// answer changes with a setting cannot be compared between two machines or two runs, and
+/// uncapped is the honest worst case for a default. Naming the box is the escape hatch.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RECORD_RES_PREFIX: &str = "res=";
+
+/// **Pure**, unit-tested: the `res=<W>x<H>` max-resolution box a `windows-record` run was
+/// asked for, or `None` for the historical uncapped default (DRAGON-710).
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_record_max_res(rest: &[String]) -> Option<(u32, u32)> {
+    rest.iter().find_map(|a| parse_res_token(a))
+}
+
+/// The `res=<W>x<H>` parse itself, on ONE token, so the vocabulary check and the value the
+/// run uses cannot disagree about what a well-formed token is.
+///
+/// A MALFORMED `res=` (`res=`, `res=1080`, `res=axb`, `res=0x0`) returns `None` and is
+/// therefore reported as an unknown word rather than silently recording uncapped. That is
+/// the same rule the encoder ids follow, and for the same DRAGON-708 reason: a diagnostic
+/// that answers a different question than the one asked is worse than no diagnostic.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_res_token(tok: &str) -> Option<(u32, u32)> {
+    let (w, h) = tok.strip_prefix(WINDOWS_RECORD_RES_PREFIX)?.split_once('x')?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// **Pure**, unit-tested: which encoder `windows-record` was asked for, and every argument it
+/// did not understand (DRAGON-708).
+///
+/// Returns the requested encoder (defaulting to `software`, the historical DRAGON-238
+/// default when none is named) and the unknown tokens, which the caller REFUSES on rather
+/// than recording anyway. Splitting the decision out is what lets the Linux gate test a
+/// Windows-only harness, the same treatment `mf_plan_with` gets.
+///
+/// A token is understood if it is an encoder id, a flag, a well-formed `res=<W>x<H>` box,
+/// or parses as a duration. Everything
+/// else is a mistake worth stopping for: the previous code silently substituted `software`
+/// for anything it did not recognise, so `nvnec` and `auto` both produced a software
+/// recording that reported itself as a software recording, which reads exactly like a
+/// successful test of something else.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_record_encoder(rest: &[String]) -> (String, Vec<String>) {
+    let mut enc: Option<String> = None;
+    let mut unknown = Vec::new();
+    for a in rest {
+        let s = a.as_str();
+        if WINDOWS_RECORD_ENCODERS.contains(&s) {
+            // A second encoder id is a contradiction, not a refinement: keep the first and
+            // report the rest, so `mf software` cannot quietly run as one of the two.
+            match enc {
+                None => enc = Some(s.to_string()),
+                Some(_) => unknown.push(a.clone()),
+            }
+        } else if !WINDOWS_RECORD_FLAGS.contains(&s)
+            && parse_res_token(s).is_none()
+            && s.parse::<u64>().is_err()
+        {
+            unknown.push(a.clone());
+        }
+    }
+    (enc.unwrap_or_else(|| "software".to_string()), unknown)
+}
+
+/// `debug test windows-record <secs> [mic] [nosys] [pause] [region] [res=<W>x<H>]
+/// [auto|nvenc|amf|qsv|mf|software]`: record the
 /// primary monitor for `secs` through the full owned pipeline (WGC + named-pipe audio +
 /// WASAPI system + the chosen encoder) and print the finalized file. S2/S4 checkpoint (+
 /// DRAGON-238 encoder-tier proof). `mic` enables the mic track, `nosys` gates the system
 /// track OFF (it is still captured for the pre-flight), `pause` pauses at the midpoint for
-/// 2s (the media-clock freeze check). The trailing encoder id (default `software`) sets the
-/// preferred encoder; the RESOLVED id is logged so "picks nvenc when preferred" is provable
+/// 2s (the media-clock freeze check), `region` records a fixed 800x600 crop through the
+/// REGION worker, and `res=<W>x<H>` caps the encode size the way the persisted
+/// `record_max_height` setting does (DRAGON-710). The trailing encoder id (default
+/// `software`) sets the preferred
+/// encoder; the RESOLVED id is logged so "picks nvenc when preferred" is provable
 /// headlessly (a machine without the hardware degrades honestly to software).
 #[cfg(target_os = "windows")]
 fn windows_record_test(rest: &[String]) {
@@ -2829,14 +3289,27 @@ fn windows_record_test(rest: &[String]) {
     let sys = !rest.iter().any(|a| a == "nosys");
     // Optional trailing encoder id (DRAGON-238); default software. Log what `resolve`
     // actually picks — the honest availability gate degrades an unusable encoder to software.
-    let enc = rest
-        .iter()
-        .find(|a| matches!(a.as_str(), "nvenc" | "amf" | "qsv" | "software"))
-        .cloned()
-        .unwrap_or_else(|| "software".to_string());
+    let (enc, unknown) = windows_record_encoder(rest);
+    // DRAGON-708: refuse a word we do not understand instead of quietly recording with
+    // something else. This used to `find` a known id and `unwrap_or("software")`, so a typo
+    // (`nvnec`) or an untaught word (`auto`) silently became a SOFTWARE run that then
+    // announced itself as `preferred encoder=software`. A diagnostic that answers a
+    // different question than the one asked is worse than no diagnostic: the whole point of
+    // this harness is proving which tier ran, and a QA pass could "prove" a tier it never
+    // touched. Same lesson as the MF probe this ticket fixes.
+    if !unknown.is_empty() {
+        errln!(
+            "windows-record: unknown argument(s): {}\n  encoders: {}\n  flags:    {} (plus the leading duration in seconds)",
+            unknown.join(", "),
+            WINDOWS_RECORD_ENCODERS.join(" | "),
+            WINDOWS_RECORD_FLAGS.join(" | "),
+        );
+        return;
+    }
     let presets = crate::encode::Presets::default();
     let resolved = crate::encode::EncodePlan::resolve_encoder_id(&enc, &presets);
-    eprintln!("windows-record: preferred encoder={enc} -> resolved={resolved}");
+    let max_res = windows_record_max_res(rest).unwrap_or((0, 0));
+    errln!("windows-record: preferred encoder={enc} -> resolved={resolved}");
     let descs = crate::screenshot::output_descs();
     let Some(name) = descs
         .iter()
@@ -2844,7 +3317,7 @@ fn windows_record_test(rest: &[String]) {
         .or_else(|| descs.first())
         .map(|d| d.name.clone())
     else {
-        eprintln!("windows-record: no monitors");
+        errln!("windows-record: no monitors");
         return;
     };
     let out = std::env::temp_dir().join(format!("cck-winrec-{}.mp4", std::process::id()));
@@ -2878,14 +3351,16 @@ fn windows_record_test(rest: &[String]) {
             bitrate_kbps: 8000,
             audio_offset_ms: 0,
             auto_device_compensation: true,
-            max_res: (0, 0),
+            // DRAGON-710: `res=<W>x<H>` when asked for, else the historical uncapped box.
+            max_res,
             metadata: "Cosmic Capture Kit | windows-record test".to_string(),
             out_path: out.clone(),
         },
     };
-    eprintln!(
-        "windows-record: {}, {secs}s, mic={mic} sys={sys} pause={want_pause} -> {}",
+    errln!(
+        "windows-record: {}, {secs}s, mic={mic} sys={sys} pause={want_pause} res={} -> {}",
         if region { format!("REGION {rw}x{rh}@({rx},{ry}) of {name}") } else { format!("monitor {name}") },
+        if max_res == (0, 0) { "uncapped".to_string() } else { format!("{}x{}", max_res.0, max_res.1) },
         out.display()
     );
     let handle = crate::record::start_region_recording(params);
@@ -2897,11 +3372,11 @@ fn windows_record_test(rest: &[String]) {
         }
         if want_pause && !did_pause && start.elapsed().as_secs_f64() >= secs as f64 / 2.0 {
             handle.paused.store(true, Ordering::Relaxed);
-            eprintln!("windows-record: paused at {:.1}s", start.elapsed().as_secs_f64());
+            errln!("windows-record: paused at {:.1}s", start.elapsed().as_secs_f64());
             std::thread::sleep(Duration::from_secs(2));
             handle.paused.store(false, Ordering::Relaxed);
             did_pause = true;
-            eprintln!("windows-record: resumed");
+            errln!("windows-record: resumed");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2912,36 +3387,36 @@ fn windows_record_test(rest: &[String]) {
             && let Some(res) = g.as_ref()
         {
             match res {
-                Ok(p) => println!("windows-record: DONE -> {}", p.display()),
-                Err(e) => eprintln!("windows-record: FAILED — {e}"),
+                Ok(p) => outln!("windows-record: DONE -> {}", p.display()),
+                Err(e) => errln!("windows-record: FAILED — {e}"),
             }
             return;
         }
         if Instant::now() >= deadline {
-            eprintln!("windows-record: TIMEOUT waiting for finalize");
+            errln!("windows-record: TIMEOUT waiting for finalize");
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// `--test windows-audio-endpoints` (DRAGON-282): list every ACTIVE WASAPI render endpoint
+/// `debug test windows-audio-endpoints` (DRAGON-282): list every ACTIVE WASAPI render endpoint
 /// (`id`, friendly name) the Output-device picker offers and `MonitorCapture` loops back.
 /// The enumeration proof — and a live picker of what a persisted `speaker_device` id can be.
 #[cfg(target_os = "windows")]
 fn windows_audio_endpoints_test() {
     let eps = crate::platform::windows::wasapi_loopback::render_endpoints();
-    println!("active render endpoints ({}):", eps.len());
+    outln!("active render endpoints ({}):", eps.len());
     for (id, name) in &eps {
-        println!("  {name}\n      id = {id}");
+        outln!("  {name}\n      id = {id}");
     }
     if eps.is_empty() {
-        println!("(none — COM enumeration failed or no active render devices)");
+        outln!("(none — COM enumeration failed or no active render devices)");
     }
-    println!("\n\"System (automatic)\" (empty id) records the OS default endpoint.");
+    outln!("\n\"System (automatic)\" (empty id) records the OS default endpoint.");
 }
 
-/// `--test windows-shot-region <x> <y> <w> <h>`: a stitched region flat → PNG (for
+/// `debug test windows-shot-region <x> <y> <w> <h>`: a stitched region flat → PNG (for
 /// mixed-DPI / negative-origin cross-monitor stitch verification).
 #[cfg(target_os = "windows")]
 fn windows_shot_region_test(xs: &str, ys: &str, ws: &str, hs: &str) {
@@ -2950,22 +3425,162 @@ fn windows_shot_region_test(xs: &str, ys: &str, ws: &str, hs: &str) {
     let w: u32 = ws.parse().unwrap_or(0);
     let h: u32 = hs.parse().unwrap_or(0);
     if w == 0 || h == 0 {
-        eprintln!("usage: --test windows-shot-region <x> <y> <w> <h>");
+        errln!("usage: debug test windows-shot-region <x> <y> <w> <h>");
         return;
     }
     match crate::screenshot::region(x, y, w, h, None) {
         Some(img) => {
             let p = std::env::temp_dir().join(format!("cck-win-region-{x}_{y}_{w}x{h}.png"));
             match img.save(&p) {
-                Ok(()) => println!(
+                Ok(()) => outln!(
                     "region ({x},{y},{w},{h}): {}x{} -> {}",
                     img.width(),
                     img.height(),
                     p.display()
                 ),
-                Err(e) => eprintln!("windows-shot-region: save failed: {e}"),
+                Err(e) => errln!("windows-shot-region: save failed: {e}"),
             }
         }
-        None => eprintln!("windows-shot-region: FAILED (off every monitor?)"),
+        None => errln!("windows-shot-region: FAILED (off every monitor?)"),
+    }
+}
+
+/// DRAGON-708: the `windows-record` harness's argument vocabulary. Pure, so a Windows-only
+/// diagnostic is provable from the Linux and macOS gates too.
+/// DRAGON-714 live QA: the bench reported 256% of the configured frame rate and the number
+/// looked like good news. The pipeline is CFR and index-stamped, so it was not.
+#[cfg(test)]
+mod achieved_verdict_tests {
+    use super::achieved_verdict;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(256.0, "IMPOSSIBLE")] // the measured bug: audio frames counted as video
+    #[case(111.0, "IMPOSSIBLE")]
+    #[case(102.0, "OK")] // rounding slack: a healthy run can sit just over 100
+    #[case(100.0, "OK")]
+    #[case(70.0, "OK")]
+    #[case(69.9, "LOW")]
+    #[case(0.0, "LOW")]
+    fn the_verdict_bands(#[case] pct: f64, #[case] want: &str) {
+        assert!(
+            achieved_verdict(pct).contains(want),
+            "{pct}% said {:?}, wanted {want}",
+            achieved_verdict(pct)
+        );
+    }
+
+    /// The impossible band must say the INSTRUMENT is wrong, not the recording. Whoever
+    /// reads it next should go to the counter, not to the encoder.
+    #[test]
+    fn the_impossible_band_blames_the_measurement() {
+        let v = achieved_verdict(256.0);
+        assert!(v.contains("measurement is wrong"), "{v}");
+        assert!(v.contains("distinct_frame_count"), "{v}");
+    }
+}
+
+#[cfg(test)]
+mod windows_record_arg_tests {
+    use super::{windows_record_encoder, windows_record_max_res};
+    use rstest::rstest;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE bug. `auto` is the mode the app ships in, and the harness used to swallow it and
+    /// record with software while printing `preferred encoder=software`, which reads like a
+    /// successful test of the software tier rather than a silently ignored request.
+    #[test]
+    fn auto_is_a_word_the_harness_can_say() {
+        let (enc, unknown) = windows_record_encoder(&args(&["5", "auto"]));
+        assert_eq!(enc, "auto");
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// A typo must STOP the run, not quietly become a software recording. This is the same
+    /// failure shape as the MF probe: answering a different question than the one asked.
+    #[test]
+    fn a_misspelled_encoder_is_reported_not_substituted() {
+        let (_, unknown) = windows_record_encoder(&args(&["5", "nvnec"]));
+        assert_eq!(unknown, vec!["nvnec".to_string()]);
+    }
+
+    /// Every id the ladder knows is accepted, so the harness can prove any tier.
+    #[test]
+    fn every_encoder_id_is_accepted() {
+        for id in ["auto", "nvenc", "amf", "qsv", "mf", "software"] {
+            let (enc, unknown) = windows_record_encoder(&args(&["5", id]));
+            assert_eq!(enc, id);
+            assert!(unknown.is_empty(), "id={id} unknown={unknown:?}");
+        }
+    }
+
+    /// The flags and the leading duration keep working, in any order, and none of them reads
+    /// as an unknown word.
+    #[test]
+    fn the_duration_and_flags_are_understood() {
+        let (enc, unknown) = windows_record_encoder(&args(&["12", "mic", "nosys", "pause", "mf"]));
+        assert_eq!(enc, "mf");
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// No encoder named keeps the historical DRAGON-238 default rather than becoming an
+    /// error, because that spelling has always meant "the software tier".
+    #[test]
+    fn naming_no_encoder_still_means_software() {
+        let (enc, unknown) = windows_record_encoder(&args(&["5", "mic"]));
+        assert_eq!(enc, "software");
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// Two encoder ids is a contradiction. Keeping the first and reporting the second is the
+    /// only reading that cannot silently run as the one the user did not mean.
+    #[test]
+    fn a_second_encoder_id_is_a_contradiction_not_a_refinement() {
+        let (enc, unknown) = windows_record_encoder(&args(&["5", "mf", "software"]));
+        assert_eq!(enc, "mf");
+        assert_eq!(unknown, vec!["software".to_string()]);
+    }
+
+    /// DRAGON-710. `region` has driven the region worker since DRAGON-272, but DRAGON-708
+    /// wrote the flag vocabulary from the doc comment and left it out, so the new
+    /// refuse-an-unknown-word check rejected an implemented flag. Every word the BODY reads
+    /// must be in the list the check consults.
+    #[test]
+    fn every_flag_the_body_reads_is_in_the_vocabulary() {
+        for flag in ["mic", "nosys", "pause", "region"] {
+            let (_, unknown) = windows_record_encoder(&args(&["5", flag]));
+            assert!(unknown.is_empty(), "flag={flag} was refused: {unknown:?}");
+        }
+    }
+
+    /// The max-resolution box the run is asked for, and the historical uncapped default when
+    /// it is not asked for (DRAGON-710).
+    #[test]
+    fn a_res_box_is_understood_and_defaults_to_uncapped() {
+        let with = args(&["15", "mf", "res=1920x1080"]);
+        assert_eq!(windows_record_max_res(&with), Some((1920, 1080)));
+        let (enc, unknown) = windows_record_encoder(&with);
+        assert_eq!(enc, "mf");
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(windows_record_max_res(&args(&["15", "mf"])), None);
+    }
+
+    /// A malformed `res=` is REPORTED, not silently rounded down to "uncapped". Recording the
+    /// whole 5120x1440 display because `res=1080` was mistyped would answer a different
+    /// question than the one asked, which is the DRAGON-708 lesson this harness exists to
+    /// stop repeating.
+    #[rstest]
+    #[case("res=")]
+    #[case("res=1080")]
+    #[case("res=axb")]
+    #[case("res=0x0")]
+    #[case("res=1920x")]
+    fn a_malformed_res_box_is_an_unknown_word(#[case] tok: &str) {
+        assert_eq!(super::parse_res_token(tok), None, "{tok} parsed");
+        let (_, unknown) = windows_record_encoder(&args(&["15", tok]));
+        assert_eq!(unknown, vec![tok.to_string()]);
     }
 }

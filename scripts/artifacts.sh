@@ -11,9 +11,9 @@
 # target/release, `just dist` in target-dist, `just appimage` in target-appimage,
 # `just flatpak` nowhere at all (an installed app). So a desktop shortcut had to
 # name ONE of them, and the day a fix was rebuilt into one artifact but not the
-# other, the owner's PrintScreen key and their --active-window key were running
-# different code. That looked exactly like a live bug for as long as it took to
-# read the `package:` field in the debug log.
+# other, the owner's PrintScreen key and their `capture --active-window` key
+# were running different code. That looked exactly like a live bug for as long
+# as it took to read the `package:` field in the debug log.
 #
 # So: ONE directory, the same relative path on Linux, macOS and Windows, with
 # every kind of artifact side by side, plus ONE stable name inside it that always
@@ -181,7 +181,7 @@ cck_say_use() {
     if [ -t 1 ]; then c=$'\033[1;36m'; r=$'\033[0m'; fi
     printf '%s==> Use this path for shortcuts and CLI commands:%s\n' "$c" "$r"
     printf '%s       %s%s\n' "$c" "$link" "$r"
-    printf '%s       e.g.  %s --region%s\n' "$c" "$link" "$r"
+    printf '%s       e.g.  %s capture --region%s\n' "$c" "$link" "$r"
 }
 
 # cck_say_artifact <path> — for a recipe that produced an artifact THIS machine

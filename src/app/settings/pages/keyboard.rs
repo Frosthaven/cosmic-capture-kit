@@ -353,12 +353,18 @@ impl crate::app::App {
     /// The Global Recording rows, and how many of them are COMMAND rows.
     ///
     /// All of them, today: no platform registers a global RECORDING hotkey, so there is no
-    /// chord to edit anywhere. The five are the whole recording-control vocabulary the tray
-    /// menu carries, named the way the tray menu and the in-app shortcuts name them
-    /// (`RecordingFlag::label`).
+    /// chord to edit anywhere. They are the whole in-session command vocabulary a desktop key
+    /// can reach, named the way the tray menu and the in-app shortcuts name them
+    /// (`RecordingCommand::label`), plus the scanner's refresh, which is the same shape of
+    /// thing on the same transport.
+    ///
+    /// DRAGON-695 grew the list from five to twelve, and that is the subcommand grammar
+    /// paying off rather than a decision made here: the two audio verbs used to be TOGGLES,
+    /// one row each, and are now four absolute states, and the four live-annotation tools had
+    /// no CLI spelling at all before. Every row still comes from ONE table.
     ///
     /// Absent entirely on a build without the transport: macOS and Windows compile a
-    /// `run_recording_command` that only prints "Linux-only", so a command row there would
+    /// `run_recording_commands` that only prints "Linux-only", so a command row there would
     /// advertise a shortcut that cannot work. Those platforms keep the in-app Recording tab
     /// instead, which is where their chords really do reach a live recording.
     fn global_recording_items(&self) -> (Vec<Item<'_>>, usize) {
@@ -368,10 +374,14 @@ impl crate::app::App {
         if kind != GlobalRow::Command {
             return (Vec::new(), 0);
         }
-        let items: Vec<Item<'_>> = crate::cli::RECORDING_FLAGS
+        let mut items: Vec<Item<'_>> = crate::cli::RECORDING_COMMANDS
             .iter()
-            .map(|rf| self.global_command_item(rf.label, std::slice::from_ref(&rf.flag)))
+            .map(|rc| self.global_command_item(rc.label, rc.argv))
             .collect();
+        // The scanner refresh rides the same gate: it is the same Linux-only per-pid socket
+        // transport, so a build that cannot reach a recording cannot reach a scanner either.
+        let (scan_argv, scan_label) = crate::cli::SCAN_REFRESH_COMMAND;
+        items.push(self.global_command_item(scan_label, scan_argv));
         let n = items.len();
         (items, n)
     }
@@ -386,7 +396,7 @@ impl crate::app::App {
     /// or the resolved executable path) and quotes what needs quoting.
     ///
     /// The command is also the row's plain `desc`, which is what the settings search reads, so
-    /// a user searching for `--toggle-mic` finds the row that shows it.
+    /// a user searching for `--sound` finds the rows that show it.
     ///
     /// `flush` because the control slot is empty here: the whole row is a label and a helper
     /// line, so the reserved unit and reset slots would only add trailing air (DRAGON-495).

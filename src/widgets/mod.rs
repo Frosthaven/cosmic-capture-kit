@@ -29,6 +29,10 @@ pub mod hide_when_clipped;
 /// straight to the next left the highlight where it was.
 pub mod hover_redraw;
 pub mod icons;
+/// The live recording ink surface's canvas (DRAGON-691): fills the surface, draws the
+/// finished ink it is handed, and reports the press / move / release a stroke is made of.
+/// Deliberately NOT the preview editor's annotation canvas; see its module doc.
+pub mod ink_canvas;
 pub mod notched_slider;
 pub mod output_selection;
 /// Requests the frame a captured press earned (DRAGON-648): wraps every

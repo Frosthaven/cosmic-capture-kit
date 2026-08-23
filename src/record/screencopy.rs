@@ -9,7 +9,7 @@ use crate::screencopy::{ScreencopyClient, connect, grab_cropped, grab_frame, out
 use super::ToggleEvent;
 use super::owned::{
     OwnedAudioStart, make_frame_writer, mark_first_frame, mark_settled, media_zero,
-    run_video_stop_tail,
+    run_video_stop_tail, SessionVideoSink,
     try_start_owned_audio, MuteIntervals,
 };
 use std::path::PathBuf;
@@ -114,6 +114,7 @@ pub(crate) fn record_screencopy(
     events: &Mutex<Vec<ToggleEvent>>,
     dims: &Mutex<Option<(u32, u32)>>,
     warm_at: &Mutex<Option<Instant>>,
+    media_zero_at: &Mutex<Option<Instant>>,
     settled_at: &Mutex<Option<Instant>>,
     metadata: &str,
     zero_copy: bool,
@@ -198,12 +199,13 @@ pub(crate) fn record_screencopy(
             events,
             dims,
             warm_at,
+            media_zero_at,
             settled_at,
             metadata,
         ) {
             ZcOutcome::Done(r) => return r,
             ZcOutcome::Fallback(e) => {
-                eprintln!(
+                crate::errln!(
                     "screencopy zero-copy unavailable ({e}); using the readback path, \
                      still hardware-encoded by ffmpeg"
                 );
@@ -310,7 +312,8 @@ pub(crate) fn record_screencopy(
     };
     record_screencopy_owned(
         video, fps, plan, ew, eh, bitrate_kbps, audio_offset_ms, auto_device_compensation,
-        start_gate, mic, system_audio, out_path, stop, paused, events, settled_at, metadata, owned,
+        start_gate, mic, system_audio, out_path, stop, paused, events, media_zero_at, settled_at,
+        metadata, owned,
     )
 }
 
@@ -344,6 +347,7 @@ fn record_screencopy_owned(
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
+    media_zero_at: &Mutex<Option<Instant>>,
     settled_at: &Mutex<Option<Instant>>,
     metadata: &str,
     owned: OwnedAudioStart,
@@ -372,7 +376,7 @@ fn record_screencopy_owned(
             return Err(e);
         }
     };
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(raw_stdin) = child.stdin.take() else {
         let _ = child.kill();
         drop(mic_tap);
         let _ = monitor.stop();
@@ -380,15 +384,21 @@ fn record_screencopy_owned(
         let _ = std::fs::remove_file(&sys_fifo_path);
         return Err("ffmpeg stdin unavailable".to_string());
     };
+    // DRAGON-712: the capture loop's frames go through the ABANDONABLE sink, not the raw
+    // blocking pipe. A blocking write here parks in the kernel on a jammed ffmpeg, and the
+    // loop can then never reach the stdin EOF that is the only thing that unjams it. See
+    // `owned::SessionVideoSink`.
+    let mut stdin = SessionVideoSink::new(raw_stdin, &stop);
 
     let mut write_frame = make_frame_writer(bw, bh, nv12);
     // The frame that fixed the crop, already cropped to the recorded region: the frame
     // the CFR contract re-feeds until a fresh grab replaces it.
     let mut last: Vec<u8> = first;
-    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
-    // the warming spinner clears, which is the same instant the user is told recording
-    // started. See `owned::media_zero` for the whole argument.
-    let session_start = media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672), and the slot below is how
+    // the UI learns it (DRAGON-725): the spinner does NOT clear here, the opening phase
+    // still follows. See `owned::media_zero` for the whole argument.
+    let session_start =
+        media_zero(media_zero_at, capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
     let pump_cfg = super::pump::PumpConfig {
         fps: fps.max(1),
         audio_offset_ms,
@@ -507,7 +517,7 @@ fn record_screencopy_owned(
             // the whole pipeline is steady, and it is what the UI's live declaration waits
             // for. Inside the `opening_ok` test on purpose: a failed write means ffmpeg is
             // not taking frames, so that session is dying rather than settling.
-            mark_settled(settled_at, Instant::now());
+            mark_settled(settled_at, Instant::now(), session_start);
             'grab: loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -617,11 +627,14 @@ fn record_screencopy_owned(
         // Shared stop tail (DRAGON-161): NON-BLOCKING covering-tick writes (see
         // `owned::run_video_stop_tail` / `NonblockingStdin` for the DRAGON-160 wedge
         // this closes) + the bounded reap + the shared salvage decision — the SAME
-        // implementation the SCK and PipeWire workers run. A covering-write failure is
-        // benign (the video is already long enough) and no longer marks the muxer
-        // wedged or deletes the temp.
+        // implementation the SCK and PipeWire workers run. A FULL pipe is retried on a
+        // bounded deadline rather than given up on (DRAGON-711 — these writes are what
+        // makes the video reach the audio's media end); a write that fails anyway still
+        // never marks the muxer wedged or deletes the temp.
         let more = ticker.ticks_to_cover(pump_out.final_media);
-        let outcome = run_video_stop_tail(stdin, &mut child, &temp, muxer_wedged, more, |sd| {
+        let truncated = stdin.truncated();
+        let stdin = stdin.into_stdin();
+        let outcome = run_video_stop_tail(stdin, &mut child, &temp, muxer_wedged, truncated, more, |sd| {
             write_frame(bw, bh, &last, sd)
         });
         stop.store(true, Ordering::Relaxed);

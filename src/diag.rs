@@ -114,6 +114,13 @@
 //! logs folder" means this one. The durable parts of that instrument were kept as `log::warn!`
 //! at their call sites (a refused `DwmSetWindowAttribute`, an ex-style read-back mismatch), so
 //! they land HERE when this log is on.
+//!
+//! # The other sink: the console (DRAGON-709)
+//!
+//! This module also owns the one rule that applies to every OTHER diagnostic channel: a
+//! diagnostic that cannot be delivered must never take the process down. [`outln`] and its
+//! three siblings are the non-panicking `println!` family that follows from it. They live
+//! here rather than in `util` because the reason is this module's reason, not a utility.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -287,16 +294,16 @@ pub enum Component {
     Daemon = 1,
     /// A capture launch — a hotkey, a daemon child, or a CLI capture flag.
     Capture = 2,
-    /// The settings window (`--settings`).
+    /// The settings window (`settings`).
     Settings = 3,
-    /// A preview-only launch (`--preview <file>`).
+    /// A preview-only launch (`editor <file>`).
     Preview = 4,
-    /// The macOS permission-checker window (`--permissions`).
+    /// The macOS permission-checker window (`permissions`).
     Permissions = 5,
     /// A small detached helper child: clipboard copy, notify, reveal, open-uri, ducking,
     /// the AeroSpace babysitter, the Windows update swap.
     Helper = 6,
-    /// A non-GUI CLI subcommand (`--test`, `--inspect`, `--help`, the sync-calibration
+    /// A non-GUI CLI subcommand (`debug test`, `debug inspect`, `--help`, the sync-calibration
     /// tools).
     Cli = 7,
 }
@@ -345,15 +352,21 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
     let has = |flag: &str| args.iter().skip(1).any(|a| a.as_ref() == flag);
     // Detached helper children first: they are the shortest-lived and most numerous, and a
     // reader scanning for the capture story wants them labelled out of the way.
+    //
+    // DRAGON-695: sourced from `share::reexec` rather than retyped. This list held raw
+    // literals and was one edit away from disagreeing with the flags `main` actually reads,
+    // which would mislabel a helper as an ordinary GUI launch in the one file that exists to
+    // untangle them.
     const HELPER_FLAGS: &[&str] = &[
-        "--copy-image",
-        "--copy-file",
-        "--copy-text",
-        "--open-uri",
-        "--reveal",
-        "--notify-copied",
-        "--notify-saved",
-        "--duck",
+        crate::share::reexec::COPY_IMAGE,
+        crate::share::reexec::COPY_FILE,
+        crate::share::reexec::COPY_TEXT,
+        crate::share::reexec::OPEN_URI,
+        crate::share::reexec::REVEAL,
+        crate::share::reexec::NOTIFY_COPIED,
+        crate::share::reexec::NOTIFY_SAVED,
+        crate::share::reexec::CLOUD_UPLOAD,
+        crate::audio::ducking::DUCK_FLAG,
         "--focus-settings",
         "--update-swap",
         "--restore-aerospace",
@@ -372,52 +385,42 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
     {
         return Component::Helper;
     }
-    const CLI_FLAGS: &[&str] =
-        &["--test", "--inspect", "--help", "-h", "--make-sync-clip", "--calibrate-sync"];
-    if CLI_FLAGS.iter().any(|f| has(f)) {
+    // DRAGON-695: the COMMAND word decides everything below, because the grammar starts with
+    // one. `argv[1]` and nothing else, so a value that happens to spell a command (a file
+    // named `settings`, say) cannot re-tag the process that opens it.
+    //
+    // This is a short word list rather than a read of `cli::parse`, and deliberately: this
+    // runs as the FIRST statement of `main`, before the parser, precisely so a launch that
+    // the parser is about to REJECT is still tagged in the log. It is pinned to the grammar
+    // by the tests below rather than by sharing a table.
+    let command = args.get(1).map(|a| a.as_ref()).unwrap_or("");
+    match command {
+        // The hidden debug namespace plus the two flags that answer without a command.
+        "debug" => return Component::Cli,
+        // A capture-shaped launch: it mints per-output overlays. The colour picker mints the
+        // same ones (DRAGON-586), and the palette viewer shares the tag on purpose, because
+        // the tag is what groups a FEATURE's processes for a reader and the two launches are
+        // one feature (DRAGON-680). Falling through to `app` would be the tag a bare launch
+        // wears, which is exactly the mislabel that hid DRAGON-586.
+        "capture" | "record" | "scan" | "color" => return Component::Capture,
+        "settings" => return Component::Settings,
+        "editor" => return Component::Preview,
+        "permissions" => return Component::Permissions,
+        _ => {}
+    }
+    if has("--help") || has("-h") || has("--version") || has("-V") {
         return Component::Cli;
     }
-    const CAPTURE_FLAGS: &[&str] = &[
-        "--region",
-        "--window",
-        "--monitor",
-        "--all-in-one",
-        "--active-window",
-        "--active-monitor",
-        "--no-editor",
-        "--image",
-        "--video",
-        "--scan",
-        "--scanner",
-        "--countdown",
-        // DRAGON-586: the colour picker mints the same per-output overlays a capture
-        // does, so it reads as `capture` in the shared log. Without it the picker's
-        // lines said `app`, which is the tag a BARE launch wears, and that mislabel is
-        // exactly what made the real bug (the picker being treated as bare) hard to see.
-        "--color-picker",
-        // DRAGON-680: the palette viewer opens the picker's own window and grabs nothing,
-        // so it is not a capture in the ordinary sense. It reads as `capture` anyway,
-        // deliberately, for the reason the picker's own line above gives: the tag is what
-        // groups a feature's processes for someone reading the shared file, and the two
-        // launches are one feature. Falling through to `app` would ALSO be the tag a bare
-        // launch wears, which is exactly the mislabel that hid DRAGON-586.
-        "--palette-viewer",
-    ];
-    if CAPTURE_FLAGS.iter().any(|f| has(f)) {
+    // The hidden internal picker spelling is a capture launch by any other name.
+    if has(crate::cli::parse::INTERNAL_ALL_IN_ONE) {
         return Component::Capture;
-    }
-    if has("--settings") {
-        return Component::Settings;
     }
     // DRAGON-427: `--preview-handoff` is a preview process too — the editor child a Windows 10
     // capture spawns so the editor keeps the GPU renderer the capture overlay gave up. It must
     // read as `preview` in the shared log, not as the generic `app`, or the two halves of one
     // capture cannot be told apart by a reader.
-    if has("--preview") || has("--preview-handoff") {
+    if has("--preview-handoff") {
         return Component::Preview;
-    }
-    if has("--permissions") {
-        return Component::Permissions;
     }
     Component::App
 }
@@ -935,6 +938,94 @@ fn install_panic_hook() {
     }));
 }
 
+// ── Best-effort console output (DRAGON-709) ──────────────────────────────────
+
+/// Write one line to stdout. The `println!` of this codebase, minus the panic.
+///
+/// # Why this exists
+///
+/// `println!` and `eprintln!` PANIC when their write fails. std's own message for it is
+/// `failed printing to stderr: The pipe is being closed. (os error 232)`, and on Windows an
+/// ordinary user causes that without doing anything wrong: piping a run into a consumer that
+/// stops reading early (`… | Select-Object -First 3`) closes the pipe underneath us, and so
+/// does closing the terminal a capture was launched from.
+///
+/// DRAGON-709 found seventeen of those panics in `panic.log` across four days. Each one had
+/// killed a capture that was WORKING, and then put a crash dialog on screen reading "The
+/// capture did not complete and nothing was saved" over a recording that had completed and
+/// been written to disk. A progress note that cannot be delivered must never be able to do
+/// that.
+///
+/// So the write is best effort and a failure is dropped, the same `let _ =` shape this
+/// codebase already uses for syscalls that are allowed to fail. Nothing is logged about the
+/// loss on purpose: the caller is mid-session, and the only channel that could report a
+/// broken console is the console.
+///
+/// # When to use which
+///
+/// These four, and their macros [`outln!`](crate::outln) / [`out!`](crate::out) /
+/// [`errln!`](crate::errln) / [`err!`](crate::err), are for anything printed WHILE the
+/// process is doing work: the `debug test` harnesses, the capture and recording paths, the
+/// `CCK_TIMING` marks. Plain `println!` stays right for the program's own product, printed
+/// before any work starts and finished within milliseconds of launch (`--help`, `--version`,
+/// an argv parse error), where there is no session for a panic to destroy.
+///
+/// The lock is held across the text and the newline so two threads cannot interleave inside
+/// one line, which is what `println!` also guarantees.
+pub fn outln(args: std::fmt::Arguments<'_>) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_fmt(args);
+    let _ = out.write_all(b"\n");
+}
+
+/// [`outln`] without the trailing newline. The `print!` of this codebase.
+///
+/// Dead on every target today: nothing builds a partial line on STDOUT, and the harnesses
+/// that do build one build it on stderr ([`err`]). It stays because an incomplete family is
+/// an invitation to reach for `print!`, which is the panic this whole section removes.
+#[allow(dead_code)]
+pub fn out(args: std::fmt::Arguments<'_>) {
+    let _ = std::io::stdout().lock().write_fmt(args);
+}
+
+/// [`outln`] for stderr. The `eprintln!` of this codebase.
+pub fn errln(args: std::fmt::Arguments<'_>) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_fmt(args);
+    let _ = err.write_all(b"\n");
+}
+
+/// [`errln`] without the trailing newline. The `eprint!` of this codebase.
+pub fn err(args: std::fmt::Arguments<'_>) {
+    let _ = std::io::stderr().lock().write_fmt(args);
+}
+
+/// `println!` that cannot panic. See [`diag::outln`](outln) for why it exists.
+#[macro_export]
+macro_rules! outln {
+    () => { $crate::diag::outln(format_args!("")) };
+    ($($arg:tt)*) => { $crate::diag::outln(format_args!($($arg)*)) };
+}
+
+/// `print!` that cannot panic. See [`diag::outln`](outln) for why it exists.
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => { $crate::diag::out(format_args!($($arg)*)) };
+}
+
+/// `eprintln!` that cannot panic. See [`diag::outln`](outln) for why it exists.
+#[macro_export]
+macro_rules! errln {
+    () => { $crate::diag::errln(format_args!("")) };
+    ($($arg:tt)*) => { $crate::diag::errln(format_args!($($arg)*)) };
+}
+
+/// `eprint!` that cannot panic. See [`diag::outln`](outln) for why it exists.
+#[macro_export]
+macro_rules! err {
+    ($($arg:tt)*) => { $crate::diag::err(format_args!($($arg)*)) };
+}
+
 /// Create the folder and rotate a full file, once per process.
 fn prepare_file() {
     let path = PATH.get_or_init(log_path).clone();
@@ -1219,14 +1310,36 @@ pub fn log_line(timestamp: &str, pid: u32, component: &str, message: &str) -> St
     format!("[{timestamp} pid={pid} {component}] {flat}\n")
 }
 
-/// Whether an argv token is safe to log verbatim: a flag (`-x` / `--flag`), or a short bare
-/// word with no path shape. Everything else is a value that could be a file path, a save
-/// target, or a window title.
+/// Every bare WORD the command grammar itself uses (DRAGON-695): the commands, and the option
+/// values that are a fixed vocabulary. These are ours, not the user's, so they log verbatim.
+///
+/// The list is small and closed on purpose. It would be tempting to let `cli::parse` answer
+/// this, but the rule here is the opposite of a parser's: a parser asks "is this word in the
+/// right POSITION", and redaction has to answer "could this word possibly be private" with no
+/// position at all, because it also redacts argv it never parsed. A closed list of words that
+/// are not the user's is the only shape that stays safe when the grammar grows.
+const GRAMMAR_WORDS: &[&str] = &[
+    // Commands.
+    "scan", "color", "capture", "record", "editor", "timer", "sound", "settings", "permissions",
+    "tray", "debug",
+    // The `debug` verbs.
+    "test", "inspect", "make-sync-clip", "calibrate-sync", "cloud-upload",
+    // Option values.
+    "both", "mic", "system", "none", "pause", "save", "cancel", "pointer", "marker",
+    "magic-marker", "erase", "refresh",
+];
+
+/// Whether an argv token is safe to log verbatim: a flag (`-x` / `--flag`), one of the
+/// grammar's own words, or a short bare word with no path shape. Everything else is a value
+/// that could be a file path, a save target, or a window title.
 fn arg_is_safe(token: &str) -> bool {
     if token.starts_with('-') {
         // `--flag=<path>` is split by the caller, so a `-`-led token with no separator left in
         // it is a flag and nothing else.
         return !token.contains(['/', '\\', ':']);
+    }
+    if GRAMMAR_WORDS.contains(&token) {
+        return true;
     }
     token.len() <= 24
         && !token.is_empty()
@@ -1692,10 +1805,22 @@ mod tests {
     fn redaction_keeps_flags_and_drops_paths() {
         // argv[0] (the exe path) is dropped outright; flags and short bare words survive,
         // because "which launch path was this?" is exactly what the log must answer.
-        let args = ["/Applications/CCK.app/Contents/MacOS/cck".to_string(), "resident".to_string()];
-        assert_eq!(redact_args(&args), "resident");
-        let args = ["cck".to_string(), "--region".to_string(), "--image".to_string()];
-        assert_eq!(redact_args(&args), "--region --image");
+        let args = ["/Applications/CCK.app/Contents/MacOS/cck".to_string(), "tray".to_string()];
+        assert_eq!(redact_args(&args), "tray");
+        let args = ["cck".to_string(), "capture".to_string(), "--region".to_string()];
+        assert_eq!(redact_args(&args), "capture --region");
+        // DRAGON-695: every word the grammar itself uses survives, including the option values
+        // that are a fixed vocabulary. A log that says `<value>` where the user typed `mic`
+        // cannot answer "which launch path was this?", which is the whole job of the line.
+        let args = ["cck".to_string(), "record".to_string(), "--sound".to_string(),
+                    "mic".to_string(), "--action".to_string(), "save".to_string()];
+        assert_eq!(redact_args(&args), "record --sound mic --action save");
+        let args = ["cck".to_string(), "scan".to_string(), "--action".to_string(),
+                    "refresh".to_string()];
+        assert_eq!(redact_args(&args), "scan --action refresh");
+        let args = ["cck".to_string(), "record".to_string(), "--tool".to_string(),
+                    "magic-marker".to_string()];
+        assert_eq!(redact_args(&args), "record --tool magic-marker");
         assert_eq!(redact_args(&["cck".to_string()]), "(none)");
         assert_eq!(redact_args::<String>(&[]), "(none)");
     }
@@ -1709,11 +1834,11 @@ mod tests {
             "--reveal".to_string(),
             "/Users/jane/Pictures/Q4 layoffs.png".to_string(),
             "--out=C:\\Users\\jane\\secret.mp4".to_string(),
-            "--preview".to_string(),
+            "editor".to_string(),
             "\\\\server\\share\\board minutes.png".to_string(),
         ];
         let out = redact_args(&args);
-        assert_eq!(out, "--reveal <value> --out=<value> --preview <value>");
+        assert_eq!(out, "--reveal <value> --out=<value> editor <value>");
         assert!(!out.contains("jane"));
         assert!(!out.contains("layoffs"));
         assert!(!out.contains("secret"));
@@ -2038,20 +2163,33 @@ mod tests {
         let c = |v: &[&str]| component_from_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         // A bare launch is `app` until the resident branch re-stamps it.
         assert_eq!(c(&["cck"]), Component::App);
+        // DRAGON-695: `tray` is a COMMAND now, and it is still `app` here, because `main`
+        // re-stamps it `daemon` the moment it takes that branch. The legacy word reads the
+        // same, as does a launch this parser will go on to reject.
+        assert_eq!(c(&["cck", "tray"]), Component::App);
         assert_eq!(c(&["cck", "resident"]), Component::App);
-        assert_eq!(c(&["cck", "--region"]), Component::Capture);
-        assert_eq!(c(&["cck", "--video", "--monitor"]), Component::Capture);
+        assert_eq!(c(&["cck", "nonsense"]), Component::App);
+        assert_eq!(c(&["cck", "capture", "--region"]), Component::Capture);
+        assert_eq!(c(&["cck", "record", "--monitor"]), Component::Capture);
+        assert_eq!(c(&["cck", "scan"]), Component::Capture);
         // DRAGON-586: the colour picker is a capture-shaped launch, NOT the `app` tag a
         // bare launch wears. It read as `app` while the launch itself was mis-sorted as
         // bare, so the log agreed with the bug instead of exposing it.
-        assert_eq!(c(&["cck", "--color-picker"]), Component::Capture);
-        // DRAGON-680: the palette viewer shares that tag on purpose (see the flag list).
-        assert_eq!(c(&["cck", "--palette-viewer"]), Component::Capture);
-        assert_eq!(c(&["cck", "--settings"]), Component::Settings);
-        assert_eq!(c(&["cck", "--preview", "/x/y.png"]), Component::Preview);
-        assert_eq!(c(&["cck", "--permissions"]), Component::Permissions);
+        assert_eq!(c(&["cck", "color", "--picker"]), Component::Capture);
+        // DRAGON-680: the palette viewer shares that tag on purpose (see the word list).
+        assert_eq!(c(&["cck", "color", "--viewer"]), Component::Capture);
+        // The hidden picker spelling is a capture by any other name.
+        assert_eq!(c(&["cck", crate::cli::parse::INTERNAL_ALL_IN_ONE]), Component::Capture);
+        assert_eq!(c(&["cck", "settings"]), Component::Settings);
+        assert_eq!(c(&["cck", "editor", "/x/y.png"]), Component::Preview);
+        assert_eq!(c(&["cck", "permissions"]), Component::Permissions);
         assert_eq!(c(&["cck", "--copy-image", "/x/y.png"]), Component::Helper);
-        assert_eq!(c(&["cck", "--test", "mac-shot"]), Component::Cli);
+        assert_eq!(c(&["cck", "debug", "test", "mac-shot"]), Component::Cli);
+        assert_eq!(c(&["cck", "--help"]), Component::Cli);
+        assert_eq!(c(&["cck", "--version"]), Component::Cli);
+        // The command word is read from argv[1] and ONLY argv[1], so a file that happens to
+        // be named like a command cannot re-tag the process that opens it.
+        assert_eq!(c(&["cck", "editor", "settings"]), Component::Preview);
     }
 
     #[test]

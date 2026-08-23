@@ -17,7 +17,8 @@
 //! 2. **Pseudo-pressure → width** ([`width_profile`]) — see below.
 //! 3. **Fill geometry** ([`stroke_fill_polygons`]) — a variable-width ribbon can't be a stroked
 //!    polyline, so it is emitted as FILLED polygons: one quad per segment plus round discs at
-//!    the caps and at genuinely sharp turns. Each quad is offset along the SHARED VERTEX
+//!    the caps (at the FULL half-width, which is what makes both ends read as round rather than
+//!    chopped) and at genuinely sharp turns. Each quad is offset along the SHARED VERTEX
 //!    normals of its two endpoints ([`vertex_normals`]) — never its own segment normal, which
 //!    leaves a wedge crack at every joint (DRAGON-345) — so consecutive quads abut exactly and
 //!    the ribbon is watertight at any zoom. Every polygon is wound the SAME way and the whole
@@ -47,10 +48,11 @@
 //! the ribbon swells organically instead of jittering, and map to a width multiplier bounded by
 //! `1 - `[`PRESSURE_LIGHT_DROP`] … `1 + `[`PRESSURE_HEAVY_GAIN`] — the stroke never balloons and
 //! never collapses mid-stroke, and the selected 2/4/6px preset is always the nominal weight
-//! (neutral pressure on a straight run renders EXACTLY the preset). On top of that, both tips
-//! ramp through [`taper_factor`] to [`TIP_WIDTH_FRAC`] of the preset, which is the pressure
-//! building as the nib lands and releasing as it lifts. A TAP is a single-point stroke: a firm
-//! press, [`dot_width`] (a touch heavier than the preset, matching a heavy stroke's body).
+//! (neutral pressure on a straight run renders EXACTLY the preset). The ends carry that FULL
+//! weight and finish in a ROUND CAP, at any thickness: the tips used to ease down to a fraction
+//! of the preset, and DRAGON-691's amendment 2 removed that by owner decision (see the
+//! tombstone where its constants were). A TAP is a single-point stroke: a firm press,
+//! [`dot_width`] (a touch heavier than the preset, matching a heavy stroke's body).
 //! Everything is deterministic — a pure function of the stored geometry and the stored
 //! pressure, no randomness, no wall-clock.
 //!
@@ -69,9 +71,12 @@
 //! moment it settles through the commit. (The classic global Ramer-Douglas-Peucker fit is
 //! prettier per-point but re-decimates the WHOLE stroke every time the far end moves, which
 //! reads as the ink wriggling behind the cursor.) Two deliberate exceptions, both bounded and
-//! both invisible in practice: [`taper_len`] shrinks with a stroke's own length, so a stroke
-//! still shorter than ~8 pen widths re-profiles its width as it grows, and a stroke long
-//! enough to exceed [`MAX_POINTS`] resamples at a proportionally coarser step.
+//! both invisible in practice: [`blended_pressure`] smooths over a window and measures
+//! curvature across a fixed arc-length stencil, so the last stretch behind the cursor keeps
+//! settling, and a stroke long enough to exceed [`MAX_POINTS`] resamples at a proportionally
+//! coarser step. (There used to be a third, the end taper, whose ramp length shrank with the
+//! stroke's own length; removing the taper removed that one with it, so the causal contract is
+//! now strictly tighter than it was.)
 //!
 //! Display and bake differ ONLY in the mapping handed to [`stroke_fill_polygons`]: the canvas
 //! passes its image→screen map and zoom scale, the bake passes `p * scale` and `scale`. Same
@@ -113,20 +118,29 @@ const MAX_SPAN_STEPS: usize = 24;
 
 /// The soft ceiling on a resampled stroke's point count. A stroke long enough to hit it is
 /// resampled at a proportionally coarser step instead of being truncated (never lose ink).
-const MAX_POINTS: usize = 4096;
+///
+/// `pub` since DRAGON-691: the live recording ink caps its RAW trail here too, so a scribble
+/// that never lifts cannot grow without bound on a surface that is up for the whole of a
+/// recording. Same budget, one number.
+pub const MAX_POINTS: usize = 4096;
 
-/// How thin a stroke gets at its very tips, as a fraction of the nominal width. NOT zero: a
-/// literal point leaves anti-aliasing crumbs and a tapped dot must stay a dot. 18% reads as
-/// pressure building as the nib lands and releasing as it lifts.
-pub const TIP_WIDTH_FRAC: f32 = 0.18;
-
-/// The taper RAMP length, in multiples of the base width — how far in from each tip the stroke
-/// reaches full weight.
-const TAPER_SPAN_W: f32 = 2.5;
-
-/// …but never more than this fraction of the stroke's own length, per end. A short flick still
-/// shows full weight in the middle instead of being taper all the way through.
-const TAPER_SPAN_FRAC: f32 = 0.3;
+// ── The end TAPER, removed (DRAGON-691 amendment 2, item 3) ───────────────────────────────
+//
+// A stroke used to pinch at both tips, easing down to 18% of its nominal width over a ramp
+// 2.5 widths long (`TIP_WIDTH_FRAC`, `TAPER_SPAN_W`, `TAPER_SPAN_FRAC`, `taper_len`,
+// `taper_factor`). It was DRAGON-342's reading of a nib landing and lifting, and it is gone by
+// owner decision: strokes now hold their full weight to the very end and finish in the ROUND
+// CAP `stroke_fill_polygons` already draws there, at any thickness.
+//
+// This is a VISUAL CHANGE that was asked for, not a simplification that fell out of one, and
+// the reason it is recorded rather than just deleted is that the taper was not arbitrary: the
+// tips are where a variable-width ribbon is most likely to show its seams, and pinching them
+// hid that. What replaces it is not "no cap" but a disc of the FULL half-width, which is why
+// the ends read as deliberate rather than chopped.
+//
+// It applied to the preview editor's pencil and, since DRAGON-691, to the live recording
+// markers as well. Both draw through this one profile, so both changed together, which is the
+// whole point of the shared module.
 
 /// The pressure a stroke has with NO speed signal and no curvature — the value that renders
 /// EXACTLY the selected preset width. Both proxies swing around it.
@@ -451,26 +465,6 @@ pub fn pressure_along(raw: &[(f32, f32)], out: &[(f32, f32)]) -> Vec<f32> {
         .collect()
 }
 
-/// How far in from each tip (SOURCE px) the taper ramps to full weight, for a stroke of base
-/// width `base_w` and total arc length `total_len`: [`TAPER_SPAN_W`] widths, capped at
-/// [`TAPER_SPAN_FRAC`] of the stroke so a short flick still reaches full weight mid-stroke.
-/// Pure — unit-tested.
-pub fn taper_len(base_w: f32, total_len: f32) -> f32 {
-    (base_w.max(0.0) * TAPER_SPAN_W).min(total_len.max(0.0) * TAPER_SPAN_FRAC)
-}
-
-/// The taper RAMP at `d` arc-px from the nearer tip: `0` exactly at the tip, `1` at and beyond
-/// `len`, eased in between — the pressure building as the nib lands and releasing as it lifts.
-/// The width it drives never actually reaches zero: a tip renders at [`TIP_WIDTH_FRAC`] of the
-/// nominal width, so a stroke pinches without vanishing. A non-positive `len` (a zero-length
-/// stroke) is "already full weight". Pure — unit-tested.
-pub fn taper_factor(d: f32, len: f32) -> f32 {
-    if len <= 0.0 {
-        return 1.0;
-    }
-    smoothstep01(d / len)
-}
-
 /// The width MULTIPLIER a 0..1 pseudo-pressure inks at: [`NEUTRAL_PRESSURE`] is exactly `1`
 /// (the selected preset), full pressure is `1 + `[`PRESSURE_HEAVY_GAIN`], zero pressure is
 /// `1 - `[`PRESSURE_LIGHT_DROP`]. Linear either side of neutral, so the two swings stay
@@ -542,12 +536,15 @@ pub fn blended_pressure(points: &[(f32, f32)], base_w: f32, speed: &[f32]) -> Ve
 }
 
 /// The per-point WIDTH (SOURCE px) of a stroke: the selected preset scaled by the pseudo-
-/// pressure ([`blended_pressure`] → [`pressure_multiplier`]) and by the end taper. A straight
-/// neutral-pressure sample is EXACTLY `base_w`; the tips ease down to `base_w × `
-/// [`TIP_WIDTH_FRAC`]; nothing ever exceeds [`max_width`] or drops below
-/// `base_w × (1 - `[`PRESSURE_LIGHT_DROP`]`)` between the tapers. A single point is a TAP —
-/// [`dot_width`], a firm press. Pure and deterministic (stored geometry + stored speed signal
-/// only) — unit-tested.
+/// pressure ([`blended_pressure`] → [`pressure_multiplier`]). A straight neutral-pressure
+/// sample is EXACTLY `base_w`; nothing ever exceeds [`max_width`] or drops below
+/// `base_w × (1 - `[`PRESSURE_LIGHT_DROP`]`)`. A single point is a TAP, [`dot_width`], a firm
+/// press. Pure and deterministic (stored geometry + stored speed signal only), unit-tested.
+///
+/// **The ends carry FULL weight** (DRAGON-691 amendment 2, item 3). A stroke used to ease down
+/// to a fraction of its width over a ramp at each tip; it now holds its weight to the last
+/// point and finishes in the ROUND CAP [`stroke_fill_polygons`] draws there. See the tombstone
+/// where the taper constants used to live.
 pub fn width_profile(points: &[(f32, f32)], base_w: f32, speed: &[f32]) -> Vec<f32> {
     let n = points.len();
     let base_w = base_w.max(0.1);
@@ -557,16 +554,9 @@ pub fn width_profile(points: &[(f32, f32)], base_w: f32, speed: &[f32]) -> Vec<f
     if n == 1 {
         return vec![dot_width(base_w)];
     }
-    let s = arc_lengths(points);
-    let total = s[n - 1];
     let pressure = blended_pressure(points, base_w, speed);
-    let tl = taper_len(base_w, total);
     (0..n)
-        .map(|i| {
-            let d = s[i].min(total - s[i]);
-            let taper = TIP_WIDTH_FRAC + (1.0 - TIP_WIDTH_FRAC) * taper_factor(d, tl);
-            base_w * pressure_multiplier(pressure[i]) * taper
-        })
+        .map(|i| base_w * pressure_multiplier(pressure[i]))
         .collect()
 }
 
@@ -647,7 +637,12 @@ fn vertex_normals(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
 
 /// A closed disc polygon (`segs`-gon) at `c`, wound to match the segment quads below — every
 /// piece of a stroke must share one winding direction for the non-zero fill to UNION them.
-fn disc(c: (f32, f32), r: f32, out: &mut Vec<Vec<(f32, f32)>>) {
+///
+/// Returns the polygon rather than pushing it (DRAGON-691): the fill core now tags every
+/// piece with where along the stroke it sits, and a helper that appends to the list on its
+/// own has no way to carry the tag. The geometry is unchanged, so the polygon list
+/// [`stroke_fill_polygons`] produces is byte-identical to before.
+fn disc(c: (f32, f32), r: f32) -> Vec<(f32, f32)> {
     let r = r.max(MIN_HALF);
     let segs = ((r * 2.0) as usize).clamp(8, 24);
     let mut poly = Vec::with_capacity(segs);
@@ -656,7 +651,7 @@ fn disc(c: (f32, f32), r: f32, out: &mut Vec<Vec<(f32, f32)>>) {
         let a = -std::f32::consts::TAU * (i as f32) / (segs as f32);
         poly.push((c.0 + r * a.cos(), c.1 + r * a.sin()));
     }
-    out.push(poly);
+    poly
 }
 
 /// The FILLED polygons of one freehand stroke, in TARGET space — the geometry BOTH the live
@@ -683,6 +678,86 @@ pub fn stroke_fill_polygons(
     map: impl Fn((f32, f32)) -> (f32, f32),
     scale: f32,
 ) -> Vec<Vec<(f32, f32)>> {
+    fill_polygons_tagged(points, base_w, speed, map, scale)
+        .into_iter()
+        .map(|(_, poly)| poly)
+        .collect()
+}
+
+/// The closed polygons of one fill: every piece wound alike, so filling them as ONE path with
+/// the non-zero rule unions them instead of cancelling into holes. What
+/// [`stroke_fill_polygons`] returns, named so [`stroke_fill_runs`]'s own return type stays
+/// readable.
+pub type FillPolygons = Vec<Vec<(f32, f32)>>;
+
+/// One RUN of a split ribbon (DRAGON-691): the key the caller's own `run_at` answered, and the
+/// pieces that belong to it.
+pub type FillRun = (usize, FillPolygons);
+
+/// The SAME ribbon [`stroke_fill_polygons`] builds, split into RUNS that can each be filled
+/// at a different colour (DRAGON-691, the live recording ink's dissolve).
+///
+/// `run_at` is handed each piece's position along the stroke as a fraction `0.0..=1.0` of its
+/// arc length and answers which run the piece belongs to. Pieces are grouped by that answer
+/// and returned in ascending run order, so a caller drawing runs in order paints its faintest
+/// ink first.
+///
+/// **Why this exists rather than calling [`stroke_fill_polygons`] on slices of the stroke.**
+/// A run is a stretch of ONE stroke, and every quantity that gives the ribbon its shape is a
+/// property of the WHOLE stroke: the width profile tapers from the two real ends, the
+/// pressure smooths across a window, and the vertex normals are central differences. Fitting
+/// each run separately re-tapers it, so the ribbon pinches to
+/// [`TIP_WIDTH_FRAC`] of its weight at every run boundary and the stroke reads as a chain of
+/// beads. Building the geometry ONCE and only sorting the finished pieces keeps the ribbon
+/// exactly the shape it would have been at one colour, which is the point: a dissolving
+/// stroke must be the same stroke, just fading.
+///
+/// The runs ABUT rather than overlap, because each quad belongs to exactly one of them, so
+/// two neighbouring runs composite once each and there is no darker seam between them. The
+/// one exception is a round JOIN or CAP disc, which does overlap its neighbouring quads by up
+/// to half a stroke width: where those land in different runs the overlap composites twice.
+/// It is invisible at full strength (two opaque fills are one opaque fill) and, with the
+/// caller quantizing finely, a fraction of a percent darker mid-dissolve. Discs are rare on a
+/// smoothed stroke; the alternative is re-fitting per run, which is the bead chain above.
+///
+/// Pure, and unit-tested. Same arguments as [`stroke_fill_polygons`] otherwise, and the union of
+/// every run is exactly that function's output.
+pub fn stroke_fill_runs(
+    points: &[(f32, f32)],
+    base_w: f32,
+    speed: &[f32],
+    map: impl Fn((f32, f32)) -> (f32, f32),
+    scale: f32,
+    run_at: impl Fn(f32) -> usize,
+) -> Vec<FillRun> {
+    let mut runs: Vec<FillRun> = Vec::new();
+    for (frac, poly) in fill_polygons_tagged(points, base_w, speed, map, scale) {
+        let run = run_at(frac);
+        match runs.iter_mut().find(|(r, _)| *r == run) {
+            Some((_, polys)) => polys.push(poly),
+            None => runs.push((run, vec![poly])),
+        }
+    }
+    runs.sort_by_key(|(r, _)| *r);
+    runs
+}
+
+/// The ribbon builder both public entry points share: every polygon, each tagged with its
+/// position along the stroke as a fraction `0.0..=1.0` of the arc length.
+///
+/// The fraction is measured on the SOURCE centerline (before `map`), so it is a property of
+/// the stroke rather than of the zoom it is being drawn at, and a quad is tagged at its
+/// LEADING vertex while a disc takes the fraction of the vertex it sits on.
+///
+/// [`stroke_fill_polygons`] drops the tags and is byte-identical to the single function this
+/// was extracted from; [`stroke_fill_runs`] groups by them.
+fn fill_polygons_tagged(
+    points: &[(f32, f32)],
+    base_w: f32,
+    speed: &[f32],
+    map: impl Fn((f32, f32)) -> (f32, f32),
+    scale: f32,
+) -> Vec<(f32, Vec<(f32, f32)>)> {
     // Dedup must not silently desync the parallel speed signal: only drop it if it shifted.
     let deduped = dedup(points);
     let speed = if speed.len() == points.len() && deduped.len() == points.len() { speed } else { &[] };
@@ -696,10 +771,23 @@ pub fn stroke_fill_polygons(
     let widths = width_profile(&pts, base_w, &speed);
     let tp: Vec<(f32, f32)> = pts.iter().map(|p| map(*p)).collect();
     let half: Vec<f32> = widths.iter().map(|w| (w * 0.5 * scale.abs()).max(MIN_HALF)).collect();
-    let mut out: Vec<Vec<(f32, f32)>> = Vec::with_capacity(tp.len() * 2);
+    // DRAGON-691: where each piece sits along the stroke, `0.0` at the first point and `1.0`
+    // at the last. Measured on the SOURCE centerline so the tag survives any `map`, and on
+    // the DENSIFIED points because that is what the pieces are built from. A stroke with no
+    // length (a tap, or one that never moved) is all one position, `0.0`.
+    let frac: Vec<f32> = {
+        let s = arc_lengths(&pts);
+        let total = s.last().copied().unwrap_or(0.0);
+        if total > 0.0 {
+            s.iter().map(|v| (v / total).clamp(0.0, 1.0)).collect()
+        } else {
+            vec![0.0; pts.len()]
+        }
+    };
+    let mut out: Vec<(f32, Vec<(f32, f32)>)> = Vec::with_capacity(tp.len() * 2);
     if tp.len() == 1 {
         // A tap: a firm-press dot (the profile never tapers a single point away).
-        disc(tp[0], half[0], &mut out);
+        out.push((frac[0], disc(tp[0], half[0])));
         return out;
     }
     // ONE normal per VERTEX, shared by the two quads that meet there — the whole reason the
@@ -724,22 +812,26 @@ pub fn stroke_fill_polygons(
         let side = |n: (f32, f32)| if n.0 * sn.0 + n.1 * sn.1 >= 0.0 { n } else { (-n.0, -n.1) };
         let (na, nb) = (side(norms[i]), side(norms[i + 1]));
         let (ha, hb) = (half[i], half[i + 1]);
-        out.push(vec![
-            (a.0 + na.0 * ha, a.1 + na.1 * ha),
-            (b.0 + nb.0 * hb, b.1 + nb.1 * hb),
-            (b.0 - nb.0 * hb, b.1 - nb.1 * hb),
-            (a.0 - na.0 * ha, a.1 - na.1 * ha),
-        ]);
+        out.push((
+            frac[i],
+            vec![
+                (a.0 + na.0 * ha, a.1 + na.1 * ha),
+                (b.0 + nb.0 * hb, b.1 + nb.1 * hb),
+                (b.0 - nb.0 * hb, b.1 - nb.1 * hb),
+                (a.0 - na.0 * ha, a.1 - na.1 * ha),
+            ],
+        ));
     }
     if out.is_empty() {
         // Every segment was degenerate (a stroke that never moved): still a dot.
-        disc(tp[0], half[0], &mut out);
+        out.push((frac[0], disc(tp[0], half[0])));
         return out;
     }
     // Round CAPS at both ends — with the taper they are tiny, and they are what makes the
     // pinch read as a nib landing and lifting rather than a chopped-off rectangle.
-    disc(tp[0], half[0], &mut out);
-    disc(tp[tp.len() - 1], half[tp.len() - 1], &mut out);
+    out.push((frac[0], disc(tp[0], half[0])));
+    let last = tp.len() - 1;
+    out.push((frac[last], disc(tp[last], half[last])));
     // Round JOINS where a turn is sharp enough that the flat cross-section falls short of the
     // true round join (deficit ≈ h·(1 − cos(θ/2)) on the outside of the bend). With shared
     // vertex normals this is now the ONLY defect left at a joint — a genuine under-cover, not
@@ -748,14 +840,14 @@ pub fn stroke_fill_polygons(
     for i in 1..tp.len() - 1 {
         let (Some(d0), Some(d1)) = (dirs[i - 1], dirs[i]) else {
             // A degenerate neighbour leaves the tangent guesswork; a round join is always safe.
-            disc(tp[i], half[i], &mut out);
+            out.push((frac[i], disc(tp[i], half[i])));
             continue;
         };
         let cos_t = (d0.0 * d1.0 + d0.1 * d1.1).clamp(-1.0, 1.0);
         // cos(θ/2) from the half-angle identity, guarding the reversal case.
         let half_cos = ((1.0 + cos_t) * 0.5).max(0.0).sqrt();
         if half[i] * (1.0 - half_cos) > JOINT_WEDGE_TOL {
-            disc(tp[i], half[i], &mut out);
+            out.push((frac[i], disc(tp[i], half[i])));
         }
     }
     out
@@ -925,30 +1017,35 @@ mod tests {
         assert_eq!(pressure_multiplier(-9.0), pressure_multiplier(0.0));
     }
 
+    /// DRAGON-691 amendment 2, item 3: the ends carry FULL weight. This replaces the test
+    /// that pinned the old pinch, and it is the deliberate visual change the owner asked
+    /// for, so it is stated from both sides: the tip equals the middle, and it equals the
+    /// preset.
     #[test]
-    fn taper_is_zero_at_the_tips_and_full_in_the_middle() {
-        assert_eq!(taper_factor(0.0, 10.0), 0.0, "exactly at the tip the ramp is 0");
-        assert_eq!(taper_factor(10.0, 10.0), 1.0);
-        assert_eq!(taper_factor(50.0, 10.0), 1.0, "past the ramp it stays full");
-        assert!(taper_factor(5.0, 10.0) > 0.0 && taper_factor(5.0, 10.0) < 1.0);
-        assert!(taper_factor(3.0, 10.0) < taper_factor(7.0, 10.0), "monotone in between");
-        // A zero-length stroke has no ramp to walk — full weight, never a divide by zero.
-        assert_eq!(taper_factor(0.0, 0.0), 1.0);
-        // The ramp is width-scaled but never eats more than its share of a short stroke.
-        assert_eq!(taper_len(4.0, 1000.0), 10.0);
-        assert!((taper_len(4.0, 20.0) - 6.0).abs() < 1e-4, "short stroke: capped at 30%");
+    fn the_ends_carry_the_same_weight_as_the_middle() {
+        let pts = line(40, 200.0);
+        let w = width_profile(&pts, 4.0, &[]);
+        let mid = w[w.len() / 2];
+        assert!((w[0] - mid).abs() < 1e-3, "the first point is thinner than the body: {}", w[0]);
+        assert!(
+            (*w.last().expect("width") - mid).abs() < 1e-3,
+            "the last point is thinner than the body"
+        );
+        assert!((w[0] - 4.0).abs() < 1e-3, "and the end IS the preset, not a fraction of it");
+        // A SHORT stroke too: the old ramp shrank with the stroke's own length, so this is
+        // where a leftover taper would still show.
+        let short = width_profile(&line(6, 8.0), 4.0, &[]);
+        let short_mid = short[short.len() / 2];
+        assert!((short[0] - short_mid).abs() < 1e-3, "a short stroke still ends at full weight");
     }
 
     #[test]
-    fn width_is_the_preset_in_a_straight_neutral_middle_and_pinched_at_both_ends() {
+    fn width_is_the_preset_in_a_straight_neutral_run() {
         let pts = line(40, 200.0);
         let w = width_profile(&pts, 4.0, &[]);
         assert_eq!(w.len(), pts.len());
         let mid = w[w.len() / 2];
         assert!((mid - 4.0).abs() < 1e-3, "straight + neutral is exactly the preset: {mid}");
-        assert!((w[0] - 4.0 * TIP_WIDTH_FRAC).abs() < 1e-3, "the tip is the pinch fraction");
-        assert!((*w.last().expect("width") - 4.0 * TIP_WIDTH_FRAC).abs() < 1e-3);
-        assert!(w[1] > w[0] && w[2] > w[1], "monotone ramp out of the tip");
         // Degeneracies stay well-defined.
         assert!(width_profile(&[], 4.0, &[]).is_empty());
         assert_eq!(width_profile(&[(1.0, 1.0)], 4.0, &[]), vec![dot_width(4.0)], "a tap is a firm dot");
@@ -997,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_polygons_cover_the_centerline_and_pinch_at_the_tips() {
+    fn fill_polygons_cover_the_centerline_and_round_off_at_the_tips() {
         let pts = line(30, 300.0);
         let polys = stroke_fill_polygons(&pts, 6.0, &[], ident, 1.0);
         assert!(!polys.is_empty());
@@ -1007,10 +1104,15 @@ mod tests {
         for t in [0.1f32, 0.3, 0.5, 0.7, 0.9] {
             assert!(covered(&polys, (300.0 * t, 50.0)), "centerline uncovered at {t}");
         }
-        // …and is thinner at the tip than mid-stroke: 2px off the centerline is inside the
-        // body mid-stroke but outside the pinched tip.
+        // DRAGON-691 amendment 2, item 3: the END is as thick as the body, so 2px off the
+        // centerline is inside the ribbon AT the tip too, where the old pinch left it outside.
         assert!(covered(&polys, (150.0, 52.0)), "mid-stroke is at least 2px half-width");
-        assert!(!covered(&polys, (0.5, 52.0)), "the tip is pinched well under 2px");
+        assert!(covered(&polys, (0.5, 52.0)), "the tip carries the body's weight");
+        // And the cap is ROUND, not square: it reaches PAST the last point along the stroke by
+        // about the half-width, and falls away diagonally.
+        assert!(covered(&polys, (301.5, 50.0)), "the cap does not stop at the last point");
+        assert!(!covered(&polys, (305.0, 50.0)), "…but it is a cap, not an extension");
+        assert!(!covered(&polys, (302.6, 52.6)), "the corner is rounded off, not square");
         // Nothing spills past the width ceiling.
         let ceiling = max_width(6.0) * 0.5;
         assert!(
@@ -1045,10 +1147,11 @@ mod tests {
     }
 
     #[test]
-    fn coarse_paths_are_densified_so_the_taper_has_somewhere_to_ramp() {
+    fn coarse_paths_are_densified_so_the_width_profile_has_samples() {
         // A two-point path (a test fixture, a resized stroke, one flick span) has no interior
-        // samples — without densifying, BOTH its points are tips and the whole thing would ink
-        // at the pinch width. It must still show a full-weight body.
+        // samples at all, so the pressure smoothing and the curvature stencil would have
+        // nothing to work over and the whole span would ink as one flat quad. Densifying is
+        // what gives the profile somewhere to live.
         let (pts, pr) = densify(&[(0.0, 0.0), (60.0, 0.0)], &[], 2.0);
         assert!(pts.len() >= 30, "a 60px span at a 2px step: {}", pts.len());
         assert_eq!(pts.first().copied(), Some((0.0, 0.0)), "endpoints are exact");
@@ -1064,7 +1167,8 @@ mod tests {
         // …and the ribbon it feeds really does reach full weight in the middle.
         let polys = stroke_fill_polygons(&[(0.0, 50.0), (60.0, 50.0)], 8.0, &[], ident, 1.0);
         assert!(covered(&polys, (30.0, 53.0)), "the body of a two-point stroke is full weight");
-        assert!(!covered(&polys, (0.5, 53.0)), "…and its tips still pinch");
+        // DRAGON-691 amendment 2, item 3: and so are its ENDS, which used to pinch here.
+        assert!(covered(&polys, (0.5, 53.0)), "…and so are its ends");
     }
 
     #[test]
@@ -1228,9 +1332,32 @@ mod tests {
         let src = stroke_fill_polygons(&pts, 4.0, &speed, ident, 1.0);
         let k = 2.5;
         let scaled = stroke_fill_polygons(&pts, 4.0, &speed, |p| (p.0 * k, p.1 * k), k);
-        assert_eq!(src.len(), scaled.len());
+        assert_eq!(src.len(), scaled.len(), "the same pieces, at both resolutions");
+        // Centroids scale exactly, piece for piece, which is the claim: same drawing, other
+        // resolution.
+        let centroid = |poly: &Vec<(f32, f32)>| {
+            let n = poly.len() as f32;
+            (
+                poly.iter().map(|p| p.0).sum::<f32>() / n,
+                poly.iter().map(|p| p.1).sum::<f32>() / n,
+            )
+        };
         for (a, b) in src.iter().zip(&scaled) {
-            assert_eq!(a.len(), b.len(), "the same pieces, at both resolutions");
+            let (ca, cb) = (centroid(a), centroid(b));
+            assert!(
+                (ca.0 * k - cb.0).abs() < 1e-2 && (ca.1 * k - cb.1).abs() < 1e-2,
+                "{ca:?} scaled by {k} != {cb:?}"
+            );
+        }
+        // The ribbon BODY is vertex-for-vertex identical: a quad has four corners at both
+        // resolutions, and each one is the other times `k`.
+        let quads = |v: &Vec<Vec<(f32, f32)>>| -> Vec<Vec<(f32, f32)>> {
+            v.iter().filter(|p| p.len() == 4).cloned().collect()
+        };
+        let (qa, qb) = (quads(&src), quads(&scaled));
+        assert!(!qa.is_empty(), "a long stroke should be mostly quads");
+        assert_eq!(qa.len(), qb.len());
+        for (a, b) in qa.iter().zip(&qb) {
             for (p, q) in a.iter().zip(b) {
                 assert!(
                     (p.0 * k - q.0).abs() < 1e-2 && (p.1 * k - q.1).abs() < 1e-2,
@@ -1238,5 +1365,127 @@ mod tests {
                 );
             }
         }
+        // The round CAPS and joins are the one deliberate difference, and it is not a drift:
+        // `disc` picks its segment count from the RADIUS, so a bake at 2.5x tessellates its
+        // circles more finely. That is the same circle drawn better, which is what a higher
+        // resolution is for. Since the caps now carry the stroke's full weight (DRAGON-691
+        // amendment 2, item 3) they are large enough for that to bite, where the old pinched
+        // tips were always at the minimum segment count and hid it.
+        let discs = |v: &Vec<Vec<(f32, f32)>>| -> usize { v.iter().filter(|p| p.len() != 4).count() };
+        assert_eq!(discs(&src), discs(&scaled), "the same discs, however finely drawn");
+        let seg_count = |v: &Vec<Vec<(f32, f32)>>| -> usize {
+            v.iter().filter(|p| p.len() != 4).map(|p| p.len()).max().unwrap_or(0)
+        };
+        assert!(seg_count(&scaled) >= seg_count(&src), "the finer resolution is not coarser");
+    }
+}
+
+/// DRAGON-691: splitting a finished ribbon into RUNS that can be filled at different
+/// colours, which is what lets the live recording ink dissolve along its own length. The
+/// properties pinned are the two that make the split safe: the pieces are the SAME pieces
+/// the one-colour path produces, and no piece is in two runs.
+#[cfg(test)]
+mod stroke_fill_runs_tests {
+    use super::*;
+
+    fn ident(p: (f32, f32)) -> (f32, f32) {
+        p
+    }
+
+    /// A hand-drawn arc, the same shape the pen tests use.
+    fn stroke() -> (Vec<(f32, f32)>, Vec<f32>) {
+        let raw: Vec<(f32, f32)> = (0..60)
+            .map(|i| {
+                let t = i as f32 * 0.05;
+                (20.0 + t * 40.0, 60.0 + (t * 1.3).sin() * 25.0)
+            })
+            .collect();
+        let pts = smooth_path(&raw, 4.0);
+        let speed = pressure_along(&raw, &pts);
+        (pts, speed)
+    }
+
+    /// The whole reason the split is done on the FINISHED ribbon: every run together is
+    /// exactly the one-colour ribbon, piece for piece. Anything else means the geometry was
+    /// re-fitted per run, which is the bead chain the doc warns about.
+    #[test]
+    fn the_runs_together_are_the_whole_ribbon() {
+        let (pts, speed) = stroke();
+        let whole = stroke_fill_polygons(&pts, 4.0, &speed, ident, 1.0);
+        let runs = stroke_fill_runs(&pts, 4.0, &speed, ident, 1.0, |f| (f * 8.0) as usize);
+        let split: usize = runs.iter().map(|(_, p)| p.len()).sum();
+        assert_eq!(split, whole.len(), "the split lost or invented pieces");
+        // And they are the same polygons, not merely the same count.
+        let mut seen: Vec<&Vec<(f32, f32)>> = runs.iter().flat_map(|(_, p)| p.iter()).collect();
+        for poly in &whole {
+            let at = seen.iter().position(|q| *q == poly).expect("piece missing from the runs");
+            seen.remove(at);
+        }
+        assert!(seen.is_empty());
+    }
+
+    /// Runs come back in ascending order, so a caller drawing them in order paints its
+    /// faintest ink first and its solid ink last.
+    #[test]
+    fn the_runs_are_ordered() {
+        let (pts, speed) = stroke();
+        let runs = stroke_fill_runs(&pts, 4.0, &speed, ident, 1.0, |f| (f * 8.0) as usize);
+        assert!(runs.len() > 1, "an 8-way split of a long stroke should produce runs");
+        assert!(runs.windows(2).all(|w| w[0].0 < w[1].0), "runs out of order: {runs:?}");
+    }
+
+    /// One run per answer, and no piece in two of them. Duplicating a piece across runs is
+    /// how a dissolve grows a darker seam.
+    #[test]
+    fn no_piece_belongs_to_two_runs() {
+        let (pts, speed) = stroke();
+        let runs = stroke_fill_runs(&pts, 4.0, &speed, ident, 1.0, |f| (f * 4.0) as usize);
+        let keys: Vec<usize> = runs.iter().map(|(r, _)| *r).collect();
+        let mut uniq = keys.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(keys.len(), uniq.len(), "the same run was emitted twice");
+    }
+
+    /// A constant answer collapses to ONE run holding the whole ribbon, which is the
+    /// marker's case (no dissolve) and must cost nothing extra.
+    #[test]
+    fn a_constant_answer_is_one_run() {
+        let (pts, speed) = stroke();
+        let whole = stroke_fill_polygons(&pts, 4.0, &speed, ident, 1.0);
+        let runs = stroke_fill_runs(&pts, 4.0, &speed, ident, 1.0, |_| 7);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, 7);
+        assert_eq!(runs[0].1.len(), whole.len());
+    }
+
+    /// The fraction really does sweep the stroke: the pieces at the start answer a lower
+    /// run than the pieces at the end. Without this the tag could be a constant and every
+    /// test above would still pass.
+    #[test]
+    fn the_tag_sweeps_from_one_end_to_the_other() {
+        let pts: Vec<(f32, f32)> = (0..40).map(|i| (i as f32 * 5.0, 10.0)).collect();
+        let runs = stroke_fill_runs(&pts, 4.0, &[], ident, 1.0, |f| if f < 0.5 { 0 } else { 1 });
+        assert_eq!(runs.len(), 2);
+        // Run 0 holds the left half of the line, run 1 the right half.
+        let x_of = |polys: &[Vec<(f32, f32)>]| -> f32 {
+            let n: f32 = polys.iter().flat_map(|p| p.iter()).map(|p| p.0).sum();
+            let c: f32 = polys.iter().map(|p| p.len() as f32).sum();
+            n / c
+        };
+        assert!(x_of(&runs[0].1) < x_of(&runs[1].1), "the runs are not laid out along the stroke");
+    }
+
+    /// A tap and an empty stroke behave: one run and none, with no panic on the degenerate
+    /// arc length a single point has.
+    #[test]
+    fn degenerate_strokes_still_split() {
+        let tap = stroke_fill_runs(&[(5.0, 5.0)], 4.0, &[], ident, 1.0, |f| (f * 8.0) as usize);
+        assert_eq!(tap.len(), 1);
+        assert_eq!(tap[0].0, 0);
+        assert!(stroke_fill_runs(&[], 4.0, &[], ident, 1.0, |_| 0).is_empty());
+        // A stroke whose samples are all in one place has no length to divide by.
+        let still = stroke_fill_runs(&[(3.0, 3.0); 5], 4.0, &[], ident, 1.0, |f| (f * 8.0) as usize);
+        assert_eq!(still.len(), 1);
     }
 }

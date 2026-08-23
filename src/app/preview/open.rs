@@ -23,6 +23,11 @@ use super::*;
 // first-frame GPU work does not build views, so a long gap between #n and #n+1 is the stall,
 // located to the frame.
 
+/// How wide the finalize progress bar is drawn (DRAGON-728), in logical points. Sized to sit
+/// under the 56pt spinner and the status line without stretching the loading column, which on
+/// the overlay surface is only as wide as the controls it hugs.
+const FINALIZE_BAR_W: f32 = 220.0;
+
 /// How many preview view builds carry an indexed mark. Enough to cover the whole open
 /// sequence — the spinner frames, the swap to media, the first painted frames, AND the
 /// [`toast::TOAST_TTL`] window that follows it at one `ToastTick` redraw every 250ms (~16
@@ -161,10 +166,15 @@ impl App {
             );
             return Task::none();
         };
-        // A pre-opened video spinner is a stopped recording; pause other media right now if it
-        // captured audio ("either mic or stereo"). An image grab (window/freeze) has no sound.
-        let with_audio = matches!(kind, PreviewKind::Video(_))
-            && (self.record_mic || self.record_system_audio);
+        // A pre-opened video spinner is a stopped recording, and the file does not exist yet
+        // (that is what the spinner is for), so the toggles are the ONLY thing available:
+        // "either mic or stereo" is a guess, and `settle_preview_duck` corrects it when the
+        // probe and the waveform land. An image grab (window/freeze) has no sound at all.
+        let with_audio = if matches!(kind, PreviewKind::Video(_)) {
+            TrackAudio::Unread { expected: self.record_mic || self.record_system_audio }
+        } else {
+            TrackAudio::Still
+        };
         // Size the window to the capture up front (dims are known at grab time) so the
         // compositor honours the initial size — a post-open resize gets overridden.
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
@@ -213,7 +223,7 @@ impl App {
     /// shrank cross-display captures — a 1× grab shown on a 2× trigger opened half-size.
     /// Every platform resolves the real per-output scale here (COSMIC buffer scale, macOS
     /// backing scale, Windows per-monitor DPI); `1.0` means an UNSCALED output, a capture
-    /// with no known output, or a `--preview` file — and on `1.0` the sizing math is
+    /// with no known output, or an `editor` file — and on `1.0` the sizing math is
     /// byte-identical. `_output` is retained for call-site symmetry.
     pub(super) fn preview_source_scale(&self, _output: Option<&OutputHandle>) -> f32 {
         let s = self.preview_output_scale;
@@ -346,12 +356,12 @@ impl App {
             (id, Task::batch([demote, open]), size, PreviewSurface::Window)
         } else {
             // macOS: a fullscreen always-on-top window covering the capture's display
-            // (the pointer's display for `--preview`, which has no capture anchor) —
+            // (the pointer's display for `editor`, which has no capture anchor) —
             // placed/finished natively after open (see `shell::preview_overlay_window`).
             // The process drops to the ACCESSORY activation policy FIRST, before the
             // open task runs: the DRAGON-154 AeroSpace popup opt-out is decided at the
             // window's first AX exposure and requires accessory (a windowed-preview
-            // finalize or a `--preview` boot may have promoted us to Regular).
+            // finalize or an `editor` boot may have promoted us to Regular).
             #[cfg(target_os = "macos")]
             {
                 crate::platform::mac::window::ensure_accessory_policy();
@@ -588,7 +598,7 @@ impl App {
         let fallback_monitor = p.monitor;
         let source_scale = p.source_scale;
         let extra_h = transport_h_for(&p.kind, PreviewSurface::Window);
-        // `--preview` files anchor to the active output (None); in-app captures to the
+        // `editor` files anchor to the active output (None); in-app captures to the
         // capture monitor — the same anchoring as `toggle_preview_appearance`'s
         // overlay→window direction.
         let (output, monitor) = if external {
@@ -784,7 +794,7 @@ impl App {
         // surface, so the net state is unchanged for every reachable toggle.
         let close = self.hide_preview_surface(old_id);
 
-        // `--preview` files anchor to the active output (None); in-app captures to the
+        // `editor` files anchor to the active output (None); in-app captures to the
         // capture monitor. Fall back to the preview's last-known monitor size otherwise.
         let (output, monitor) = if external {
             (None, fallback_monitor)
@@ -801,7 +811,7 @@ impl App {
         // only (the OutputHandle is a display-name String there; on Linux the compositor owns
         // the layer-shell/toplevel output and the toggle keeps the capture-time anchor). Only
         // on the windowed->overlay direction (`old_surface` is the window, the flip is heading
-        // to overlay); the reverse (overlay->window) and `--preview` keep their anchors.
+        // to overlay); the reverse (overlay->window) and `editor` keep their anchors.
         #[cfg(not(target_os = "linux"))]
         let (output, monitor) = if !external && old_surface.is_window() && !self.preview_windowed {
             match crate::platform::window_current_display(super::shell::PREVIEW_WINDOW_TITLE) {
@@ -847,10 +857,10 @@ impl App {
     /// Only one settings pane may exist across all instances, so the decision is
     /// [`settings_activation`]'s three cases: focus the pane THIS process owns, spawn
     /// `--focus-settings` for one owned ELSEWHERE ([`crate::instance::settings_pane_is_open`],
-    /// a probe that does not retain the lock), or spawn a `--settings` child.
+    /// a probe that does not retain the lock), or spawn a `settings` child.
     ///
     /// The probe is TOCTOU-racy by nature and deliberately tolerated: if a pane appears in
-    /// the gap, our `--settings` child finds the lock taken and (macOS/Windows) pokes the
+    /// the gap, our `settings` child finds the lock taken and (macOS/Windows) pokes the
     /// holder or (Linux) returns quietly — the same outcome the other branch aimed for.
     ///
     /// # The fullscreen overlay comes down first, on EVERY branch
@@ -867,7 +877,7 @@ impl App {
     /// DRAGON-488 made that unconditional. The `FocusOwn` branch used to return early with
     /// just a `gain_focus`, which focuses a window UNDER a fullscreen overlay that holds the
     /// keyboard: the pane would be raised into a place the user cannot see or type into.
-    /// Rare (a `--settings` launch never opens a preview), but it was the one branch where
+    /// Rare (a `settings` launch never opens a preview), but it was the one branch where
     /// the promise "the gear always gets you to settings" was false — and that promise is
     /// what earns the right to allow the promotion in [`Self::toggle_preview_appearance`].
     /// The demotion is issued ONCE, before the pane decision is even read, so a future fourth
@@ -904,7 +914,7 @@ impl App {
                 Task::none()
             }
             SettingsActivation::Spawn => {
-                crate::recording_ui::spawn_capture_child("--settings");
+                crate::recording_ui::spawn_capture_child("settings");
                 Task::none()
             }
         };
@@ -920,15 +930,58 @@ impl App {
     /// holder and the guard is engaged only for the FIRST one, so several video previews
     /// share one process-wide duck and the desktop stays muted until the LAST of them
     /// releases (see [`Self::release_preview_duck`]).
-    pub(super) fn engage_preview_duck(&mut self, id: window::Id, with_audio: bool) {
-        if !(self.mute_others_during_preview && with_audio) {
+    ///
+    /// `audio` is what this call site is ABLE to know (DRAGON-733): the four openers each
+    /// build a [`TrackAudio`] rather than a bare bool, and the real reading arrives later
+    /// through [`Self::settle_preview_duck`].
+    pub(super) fn engage_preview_duck(&mut self, id: window::Id, audio: TrackAudio) {
+        let wanted = opens_ducked(audio);
+        if !(self.mute_others_during_preview && wanted) {
+            // DRAGON-733: say which half refused. "The setting is on and the child spawned"
+            // and "the setting is on and nothing happened" were indistinguishable in the log,
+            // and the second one is the whole bug report.
+            //
+            // A still image is the one refusal not worth a line: it is every screenshot this
+            // app takes, the answer can never be anything else, and a line per capture would
+            // bury the ones a reader is actually looking for.
+            if !matches!(audio, TrackAudio::Still) {
+                log::debug!(
+                    "preview duck: not engaging (setting={} track={audio:?})",
+                    self.mute_others_during_preview
+                );
+            }
             return;
         }
         if let Some(p) = self.preview_for_mut(id) {
             p.ducking = true;
         }
         if self.preview_duck_refs.acquire(id) && self.preview_duck.is_none() {
+            log::debug!("preview duck: engaging on the first holder (track={audio:?})");
             self.preview_duck = Some(crate::audio::ducking::OtherAudioDuck::engage());
+        }
+    }
+
+    /// Apply a LATER, better reading of `id`'s soundtrack (DRAGON-733): the `ffprobe` result
+    /// when the poster lands, then the extracted peaks when the waveform lands. Engages a
+    /// document the open-time guess wrote off, and releases one it guessed wrong about.
+    ///
+    /// The decision is pure ([`duck_settlement`]) so both readings share one rule, and it is
+    /// a no-op for a reading that carries nothing new.
+    pub(super) fn settle_preview_duck(&mut self, id: window::Id, audio: TrackAudio) {
+        if !self.mute_others_during_preview {
+            return;
+        }
+        let holding = self.preview_for(id).is_some_and(|p| p.ducking);
+        match duck_settlement(holding, audio) {
+            Some(true) => {
+                log::debug!("preview duck: the track really has sound, engaging late");
+                self.engage_preview_duck(id, audio);
+            }
+            Some(false) => {
+                log::debug!("preview duck: the track makes no sound, releasing");
+                self.release_preview_duck(id);
+            }
+            None => {}
         }
     }
 
@@ -946,7 +999,7 @@ impl App {
     }
 
     /// Open the preview overlay for `path` now (surface + content prep), on
-    /// `preview_output`. `external` marks a pre-existing file (`--preview`). Returns the
+    /// `preview_output`. `external` marks a pre-existing file (`editor`). Returns the
     /// surface+content batch, or none if the output is unknown.
     pub(super) fn open_preview(
         &mut self,
@@ -1016,8 +1069,15 @@ impl App {
         // This is the in-flight capture's document; the capture flow addresses it by id.
         self.capture_preview = Some(id);
         self.focused_preview = Some(id);
-        // Post-capture overlay just opened — pause other media now if this recording has audio.
-        self.engage_preview_duck(id, is_video && (self.record_mic || self.record_system_audio));
+        // Post-capture overlay just opened. The file IS on disk here, but reading it costs the
+        // very delay the instant pause exists to avoid, so this is still the toggles' guess;
+        // `settle_preview_duck` reads the file a moment later, off the poster task.
+        let audio = if is_video {
+            TrackAudio::Unread { expected: self.record_mic || self.record_system_audio }
+        } else {
+            TrackAudio::Still
+        };
+        self.engage_preview_duck(id, audio);
         // DRAGON-353: the editor copies the capture to the clipboard as it opens (the old
         // "Automatically copy to clipboard" setting, now unconditional). The path is
         // already known on this path, so it starts right here — on a worker thread since
@@ -1026,7 +1086,7 @@ impl App {
         Task::batch([open_task, task, copy])
     }
 
-    /// Open a preview for a pre-existing file (`--preview <file>`) on the *active* output
+    /// Open a preview for a pre-existing file (`editor <file>`) on the *active* output
     /// (the monitor the user is on) — read-only toward the file: Save hidden, Cancel just
     /// exits, Save As copies. The monitor size starts as a placeholder and is corrected by
     /// the surface's resize event.
@@ -1070,7 +1130,7 @@ impl App {
             size: Some(size),
             external: true,
             monitor,
-            // A `--preview` file is a plain viewer: its pixels ARE its own resolution,
+            // An `editor` file is a plain viewer: its pixels ARE its own resolution,
             // with no capture backing-scale to undo, so present it 1:1 in logical points.
             source_scale: 1.0,
             loading_msg: random_loading_msg(),
@@ -1086,13 +1146,17 @@ impl App {
             bake_src: None,
             saved_path: None,
         });
-        // A `--preview` launch has exactly this one document; the capture flow's
+        // An `editor` launch has exactly this one document; the capture flow's
         // deferred-open paths address it the same way a captured preview is addressed.
         self.capture_preview = Some(id);
         self.focused_preview = Some(id);
-        // `--preview` is a viewer for an arbitrary file; we can't know if it has sound without
-        // probing (the delay we're avoiding), so pause other media for any video as it opens.
-        self.engage_preview_duck(id, is_video);
+        // `editor` is a viewer for an arbitrary file, and its audio toggles say nothing about
+        // it, so the open-time guess is simply "a video usually has sound". Unlike the capture
+        // paths this one has no better guess to make, and unlike before DRAGON-733 it is no
+        // longer the LAST word: the probe and the waveform settle it either way.
+        let audio =
+            if is_video { TrackAudio::Unread { expected: true } } else { TrackAudio::Still };
+        self.engage_preview_duck(id, audio);
         Task::batch([open_task, task])
     }
 
@@ -1329,10 +1393,22 @@ impl App {
         // takes the keyboard-routing focus.
         self.focused_preview = Some(id);
         // Same rule as a locally-opened preview: pause other players for a recording with
-        // sound (the audio toggles are persisted, so they read the same in both processes).
-        // The child's own duck died with it; re-engaging here is refcounted, so a second
-        // video document can't double-engage or un-mute the first.
-        self.engage_preview_duck(id, req.video && (self.record_mic || self.record_system_audio));
+        // sound. The child's own duck died with it; re-engaging here is refcounted, so a
+        // second video document can't double-engage or un-mute the first.
+        //
+        // This site's guess is the WEAKEST of the four, and DRAGON-733 is why it is worth
+        // saying so. The toggles ARE persisted, including a mid-recording flip, but this
+        // process read them into memory when IT launched: a flip the capturing child made
+        // afterwards reached the file on disk and never reached this copy. The handoff wire
+        // format carries no audio field to close that. It does not matter any more, because
+        // the probe and the waveform below read the delivered file itself.
+        let audio =
+            if req.video {
+                TrackAudio::Unread { expected: self.record_mic || self.record_system_audio }
+            } else {
+                TrackAudio::Still
+            };
+        self.engage_preview_duck(id, audio);
         // A handed-over capture is still a capture the user just took: copy it on open,
         // exactly as a locally-opened one is (DRAGON-353).
         let copy = self.auto_copy_preview_on_open(id);
@@ -1458,7 +1534,7 @@ impl App {
             display_dims: dims,
             source_scale: self.preview_source_scale(None),
             // The capture is OURS — a file we wrote, which the editor may manage, save in
-            // place and discard. `--preview`'s viewer semantics (`external = true`) would
+            // place and discard. `editor`'s viewer semantics (`external = true`) would
             // quietly refuse all of that.
             external: false,
             size: Some(size),
@@ -1501,7 +1577,7 @@ impl App {
     }
 
     /// Update the open preview's monitor size when its surface is (re)sized — needed for
-    /// `--preview`, which opens on the active output before its size is known. Also the
+    /// `editor`, which opens on the active output before its size is known. Also the
     /// windowed preview's post-map hook: the first configure means the surface is mapped,
     /// so the transient `max_size` hint (only there to disarm cosmic-comp's initial-map
     /// 2/3 reshape — see [`super::shell::preview_window`]) is cleared and the user
@@ -1583,7 +1659,7 @@ impl App {
         // `pointer_output()` probe. So for immediate captures the move now FIRES, targeting the
         // cursor's monitor — a no-op via the helper's own "already on target output" skip
         // whenever cosmic-comp already mapped the fresh window on the pointer's output (the
-        // common case). It stays None only for `--preview` (no capture) or a probe/overlay miss,
+        // common case). It stays None only for `editor` (no capture) or a probe/overlay miss,
         // where we SUPPRESS the move and leave cosmic-comp's native pointer-output placement
         // untouched. The DRAGON-317 regression was setting this target from the launch
         // FOCUSED-TOPLEVEL guess: when the focused window sat on a different, empty-of-the-user
@@ -1606,7 +1682,7 @@ impl App {
                         crate::platform::compositor::move_toplevel_to_output(&title, &name);
                     });
                 }
-                // No reliable origin (`--preview`, or the cursor output never resolved):
+                // No reliable origin (`editor`, or the cursor output never resolved):
                 // SUPPRESS the move and leave cosmic-comp's native pointer-output placement
                 // (already where the user is) untouched. Do NOT fall back to the
                 // focused-toplevel/primary output here — that fallback WAS the DRAGON-317
@@ -1683,7 +1759,7 @@ impl App {
         // route is about to be chosen. Everything after this mark is the stretch the user
         // experiences as "the editor opening".
         crate::util::timing_mark("preview: present_capture (capture written; choosing a route)");
-        // DRAGON-428: this launch asked for no editor (`--no-editor`, or a daemon
+        // DRAGON-428: this launch asked for no editor (`--skip-editor`, or a daemon
         // "(no editor)" capture hotkey). Deliver through `finish_share` — the SAME
         // editor-less path a capture takes when no editor can be opened at all — so there
         // is exactly one no-editor delivery in the app rather than a second one that could
@@ -2206,14 +2282,45 @@ impl App {
             PreviewKind::Image(_) => &PREVIEW_LOADING_MESSAGES,
             PreviewKind::Video(_) => &video::PREVIEW_VIDEO_LOADING_MESSAGES,
         };
-        let status = widget::column(vec![
-            widget::indeterminate_circular().size(56.0).into(),
-            widget::text(msgs[preview.loading_msg % msgs.len()])
-                .size(16)
-                .into(),
-        ])
-        .spacing(20.0)
-        .align_x(Alignment::Center);
+        // DRAGON-728: a recording being finalized says what it is doing, and says how far
+        // along it is wherever that is honestly knowable. Everything else falls to
+        // `Spinner`, which is byte-for-byte the two-element column this view always built.
+        // The whole decision is `video::finalize_readout`, pure and unit-tested, so this
+        // stays a rendering of it.
+        let readout = video::finalize_readout(
+            matches!(preview.kind, PreviewKind::Video(_)),
+            self.recording_finalize,
+        );
+        let mut rows: Vec<Element<'_, Msg>> =
+            vec![widget::indeterminate_circular().size(56.0).into()];
+        match readout {
+            video::FinalizeReadout::Spinner => rows.push(
+                widget::text(msgs[preview.loading_msg % msgs.len()])
+                    .size(16)
+                    .into(),
+            ),
+            video::FinalizeReadout::Working(label) => {
+                rows.push(widget::text(label).size(16).into())
+            }
+            video::FinalizeReadout::Measured(label, frac) => {
+                rows.push(widget::text(label).size(16).into());
+                // The determinate vocabulary already in the tree (the encoder bench's own
+                // progress row uses the same widget), inside its own tighter column so the
+                // number sits with its bar rather than a spinner's spacing away from it.
+                rows.push(
+                    widget::column(vec![
+                        widget::container(cosmic::iced::widget::progress_bar(0.0..=1.0, frac))
+                            .width(Length::Fixed(FINALIZE_BAR_W))
+                            .into(),
+                        widget::text(video::percent_text(frac)).size(14).into(),
+                    ])
+                    .spacing(8.0)
+                    .align_x(Alignment::Center)
+                    .into(),
+                );
+            }
+        }
+        let status = widget::column(rows).spacing(20.0).align_x(Alignment::Center);
         let content = widget::column(vec![status.into(), tb.cancel_group()])
             .spacing(20.0)
             .align_x(Alignment::Center);

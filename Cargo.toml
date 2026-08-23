@@ -1,8 +1,8 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2024"
-description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations."
+description = "Screen capture/recording with live annotations, OCR/QR/barcode scanning, color picker with saved palettes, and cloud uploads for every platform."
 license = "GPL-3.0-only"
 repository = "https://github.com/Frosthaven/cosmic-capture-kit"
 

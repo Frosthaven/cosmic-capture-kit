@@ -596,6 +596,298 @@ pub fn win_build_has_overlay_preview(build: u32, dcomp: bool) -> bool {
     !win_build_software_overlays(build, dcomp)
 }
 
+// ── DRAGON-690: keeping our own recording controls out of the recording ───────
+//
+// The in-frame recording toolbar (the chip the capture overlay draws while a recording
+// runs) is OUR chrome, and until now it was in every display / region recording we made.
+// Both paid platforms can take it out, and they do it in different places:
+//
+// * macOS scopes the exclusion to the STREAM we own: the recording target's
+//   `SCContentFilter` is built `initWithDisplay:excludingWindows:` over the ids this
+//   process opted out. Nothing outside our own recording changes.
+// * Windows scopes it to the WINDOW: `SetWindowDisplayAffinity(hwnd,
+//   WDA_EXCLUDEFROMCAPTURE)` is a per-HWND property the Desktop Window Manager honours for
+//   every capture, ours and anyone else's. That is the only mechanism Windows offers, and
+//   it is the same one Electron's `setContentProtection(true)` reaches for.
+//
+// The macOS alternative, `NSWindow.sharingType = .none` (what `setContentProtection` sets
+// on that platform), was RULED OUT rather than overlooked. It stops the legacy CoreGraphics
+// window-capture APIs, and ScreenCaptureKit honoured it through macOS 14 and stopped
+// honouring it on macOS 15; Apple's own answer on the developer forums is that there is no
+// public API for preventing capture, and Electron now carries the same warning in its own
+// documentation. A mechanism that lapses on the newest OS is worse than none, and the
+// filter is under our control on every version we support.
+
+/// The first Windows build with `WDA_EXCLUDEFROMCAPTURE` (Windows 10 version 2004, May
+/// 2020). Below it `SetWindowDisplayAffinity` accepts the value and behaves as if
+/// `WDA_MONITOR` had been passed, which paints the window as a BLACK RECTANGLE in the
+/// capture: strictly worse than leaving the toolbar visible, so we never ask.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WIN_EXCLUDE_FROM_CAPTURE_MIN_BUILD: u32 = 19041;
+
+/// Pure: may this OS `build` take a window OUT of screen captures entirely (DRAGON-690)?
+///
+/// Open at the top (every later Windows keeps the value) and closed at
+/// [`WIN_EXCLUDE_FROM_CAPTURE_MIN_BUILD`] at the bottom. In practice every surviving
+/// Windows 10 install answers `true` (22H2 is build 19045, and 2004 is the oldest build
+/// still serviced), so the `false` band covers 1909 and older only.
+///
+/// An UNREADABLE build number must answer `false` at the call site: the fallback is the
+/// toolbar being recorded, which is today's behaviour, where the wrong guess in the other
+/// direction is a black rectangle sitting in the user's video.
+///
+/// Pure, and unit-tested below. Kept here rather than in `platform/windows/` on purpose:
+/// nobody on the project runs Windows 10, so the band edge has to be provable on Linux and
+/// macOS, exactly like the other `win_build_*` gates above it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_can_exclude_from_capture(build: u32) -> bool {
+    build >= WIN_EXCLUDE_FROM_CAPTURE_MIN_BUILD
+}
+
+/// Keep OUR OWN window titled `title` out of the screen recordings this app makes
+/// (DRAGON-690). The single portable entry point for a PER-WINDOW capture opt-out.
+///
+/// Per-window is the whole contract, not an implementation detail: DRAGON-691 wants to draw
+/// ON the screen during a recording, and that ink must stay IN the video while the controls
+/// stay OUT of it. So a window asks for itself here, and no arm may ever widen that to "our
+/// process's windows". Today the capture overlays are the only caller, because they carry
+/// the recording chip; a future toolbar that moves to its own surface calls this and the
+/// drawing surface simply does not.
+///
+/// Scoped to our own windows by construction: each arm matches this process's window list by
+/// the exact title, so it cannot reach another application's window.
+///
+/// * **macOS** records the window's `CGWindowID` and the recording target's content filter
+///   is built excluding it. The effect is confined to streams WE open, so stills, other
+///   apps' recorders and the DRAGON-292 backdrop grab are untouched.
+/// * **Windows** sets `WDA_EXCLUDEFROMCAPTURE` on the HWND, which is OS-wide for that
+///   window and lasts as long as the window does (the capture session is one-shot, so that
+///   is the overlay's lifetime). Below
+///   [`WIN_EXCLUDE_FROM_CAPTURE_MIN_BUILD`] the arm does NOTHING rather than fall back to
+///   `WDA_MONITOR`, whose black rectangle would be worse than the toolbar it replaced.
+/// * **Linux** has no arm, and this is a protocol fact rather than an omission: neither
+///   `ext-image-copy-capture` nor the xdg-desktop-portal ScreenCast interface has any notion
+///   of excluding a window from a display capture, so there is nothing to call. Window-mode
+///   recording is clean everywhere anyway, since it captures one chosen toplevel.
+///
+/// Idempotent, and best-effort: a window whose title has not landed yet is a silent no-op,
+/// the same convention `opt_out_of_tiling` uses next door.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn exclude_window_from_capture(title: &str) {
+    #[cfg(target_os = "macos")]
+    crate::platform::mac::window::exclude_from_capture(title);
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::window::exclude_from_capture(title);
+}
+
+// ── DRAGON-691: what a WINDOW recording sees, and where the window is ─────────────────────
+//
+// Live annotation draws on a floating surface over the desktop. Whether that surface reaches
+// the FILE depends on what "record this window" means, and there are exactly two shapes:
+//
+// * **the window's OWN buffer** (`SCContentFilter`'s desktop-independent window on macOS,
+//   `GraphicsCaptureItem::CreateForWindow` on Windows, an xdg ScreenCast WINDOW stream on
+//   Linux). That is why window recording never had our toolbar in it, and it is equally why
+//   it never has our ink: no floating surface is part of another window's buffer. The ink has
+//   to be composited in by us, live onto each captured frame (`record::ink_live`) or over the
+//   finished video (`record::ink_bake`).
+// * **a rectangle of the SCREEN** (the Linux NATIVE screencopy path, where every mode funnels
+//   through `spawn_screencopy_worker`'s region crop). The compositor has already put our ink
+//   surface in the frame, exactly as it does for a region or a monitor. Nothing to composite,
+//   and nothing to exclude either.
+//
+// DRAGON-736: which shape a session gets is NOT a property of the operating system, and
+// asking `cfg!` for it was the bug. macOS and Windows have one window-capture implementation
+// each, so there the platform really does answer alone. Linux has TWO, they are both reachable
+// in the same build on the same desktop, and they answer OPPOSITE ways. So the question moved
+// from "which OS am I" to "what did THIS session's capture actually see", the platform half
+// stays a `cfg!` below, and the session half is read where the backend is known
+// (`App::portal_window_cast`).
+
+/// **Pure**, unit-tested: does a WINDOW recording leave every floating surface of ours (the
+/// live annotation ink above all) OUT of the recorded file?
+///
+/// Two independent facts, ORed because either one alone settles it:
+///
+/// * `window_buffer_platform`: this platform captures a window's own buffer for EVERY window
+///   recording, whatever the session. Constant per platform, and true only on macOS and
+///   Windows.
+/// * `portal_window_cast`: THIS session's frames come from an xdg ScreenCast WINDOW stream.
+///   Per session, and only ever true on Linux, because that is the only platform with two
+///   window-recording backends to choose between.
+///
+/// The two are never both true in a shipping build, which is why the OR reads as "either
+/// route to the same physics" rather than as a precedence rule.
+///
+/// Kept pure and free of `cfg` so the truth table is proven on every host, in the tests at the
+/// bottom of this file: the Linux rows are the ones that changed in DRAGON-736 and the macOS
+/// and Windows rows are the ones that must not.
+pub fn window_capture_excludes_overlays_with(
+    window_buffer_platform: bool,
+    portal_window_cast: bool,
+) -> bool {
+    window_buffer_platform || portal_window_cast
+}
+
+/// Does a WINDOW recording leave our floating surfaces out of the file, for the session whose
+/// capture is described by `portal_window_cast`?
+///
+/// The effectful half: it supplies the platform fact and delegates the decision to
+/// [`window_capture_excludes_overlays_with`]. The caller passes the session fact because only
+/// the app knows which backend a recording ended up on; see `App::portal_window_cast`.
+///
+/// This is the one place the platform difference is stated, so the app decides "does this
+/// session's ink have to be composited in" without a `cfg` of its own, and so the answer is
+/// greppable when the Linux X11 backend arrives and has to pick a side.
+pub fn window_capture_excludes_overlays(portal_window_cast: bool) -> bool {
+    window_capture_excludes_overlays_with(
+        cfg!(any(target_os = "macos", target_os = "windows")),
+        portal_window_cast,
+    )
+}
+
+/// What decides whether a WINDOW recording's frames carry the POINTER (DRAGON-739).
+///
+/// The second half of "what does a window recording see". [`window_capture_excludes_overlays`]
+/// answers it for OUR surfaces; this answers it for the cursor, and the two answers are
+/// independent, because the cursor is drawn by the capture stack rather than by any client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowCursorSource {
+    /// The pointer is composited only while POINTER FOCUS is on the recorded toplevel.
+    ///
+    /// Wayland, and traced to primary source: cosmic-comp gates the embedded cursor on
+    /// `pointer.current_focus() ... == Some(toplevel)` in its image-copy-capture render path.
+    /// niri has the identical rule and reports the identical symptom (only when capturing
+    /// individual windows), and KDE has been focus-based deliberately since 2024, so this is
+    /// the platform's settled behaviour rather than one compositor's bug. The consequence for
+    /// us is direct: any surface of ours that takes the pointer takes the cursor out of the
+    /// file with it, which is exactly what an armed annotation tool does.
+    PointerFocus,
+    /// The pointer is composited whenever it is over the recorded window's GEOMETRY, focus or
+    /// no focus.
+    ///
+    /// Windows Graphics Capture errs this way, and errs generously: it over-includes to the
+    /// point that other capture tools have had to add a foreground-process gate to suppress a
+    /// cursor WGC draws anyway. Our `SetIsCursorCaptureEnabled` call has no such gate, so a
+    /// Windows window recording keeps its cursor while our ink surface is armed, and drawing a
+    /// second one would DOUBLE it.
+    ///
+    /// **macOS is here on an ASSUMPTION, not on a measurement** (DRAGON-739). Apple documents
+    /// `SCStreamConfiguration.showsCursor` in two sentences and says nothing about focus or
+    /// occlusion, and no mac was reachable from the box this shipped from. `Geometry` is the
+    /// arm that changes NOTHING there, so the assumption is the safe one: if it turns out to
+    /// be wrong, the mac keeps today's behaviour (no cursor while a tool is armed) rather than
+    /// gaining a doubled one. The check that settles it is one recording long and is written
+    /// out in the ticket.
+    Geometry,
+}
+
+/// **Pure**, unit-tested: what decides whether a window recording's frames carry the pointer,
+/// given whether this platform composites it by pointer FOCUS.
+///
+/// The decision half of [`window_cursor_source`], kept out of every plugin so its whole truth
+/// table is provable on the Linux gate, exactly like the build-number gates above it.
+pub fn window_cursor_source_with(focus_gated: bool) -> WindowCursorSource {
+    if focus_gated {
+        WindowCursorSource::PointerFocus
+    } else {
+        WindowCursorSource::Geometry
+    }
+}
+
+/// What decides whether THIS platform's window recording carries the pointer.
+///
+/// The effectful half: it supplies the platform fact and delegates. One `cfg!`, in the one
+/// place platform differences about "what a window recording sees" are stated, so the answer
+/// is greppable when the Linux X11 backend arrives and has to pick a side.
+pub fn window_cursor_source() -> WindowCursorSource {
+    window_cursor_source_with(cfg!(target_os = "linux"))
+}
+
+/// Where the window with this platform id is on screen RIGHT NOW, or `None` when it cannot be
+/// found (it closed, or the platform has no answer).
+///
+/// The units are each platform's own capture space, the same one `OutputDesc` uses and the
+/// same one a `Selection` carries: PHYSICAL virtual-screen pixels on Windows, global top-left
+/// POINTS on macOS. The bake's mapping is a ratio of two rects in that one space, so it never
+/// has to know which.
+///
+/// Sampled over a recording to build a window-position TIMELINE, because a window can be
+/// moved and resized while it is being recorded while the video stays a fixed size: without
+/// the timeline, ink drawn at a screen position would land in the wrong part of the frame the
+/// moment the user nudged the window.
+///
+/// **Linux answers `None`, and that is a property of the KEY rather than of the platform**
+/// (amended by DRAGON-736). A Linux window recording has two shapes. On the NATIVE screencopy
+/// path it is a fixed screen rectangle, so the ink is captured live and no mapping is ever
+/// needed. On the PORTAL path it is the toplevel's own buffer and a mapping IS needed, but the
+/// portal names a PipeWire node and never a window, so there is no id to ask this with: that
+/// rect is resolved once at grant time by matching the granted stream's SIZE against the
+/// toplevel list (`app::portal::toplevel_for_grant_size`, DRAGON-735), settling a tie between
+/// same-size windows by comparing pictures (`app::portal::resolve_grant_by_pixels`,
+/// DRAGON-737), and read back through `App::recorded_window_rect`. Answering here with a rect nobody could key would only invite
+/// somebody to use it.
+///
+/// **An arm that always answers `None` is INVISIBLE from here**, and that is how DRAGON-691
+/// shipped broken: the macOS arm asked the window server the wrong question, every sample was
+/// dropped, the rect timeline stayed empty, and the only symptom was ink missing from the
+/// finished file. A new arm owes a live test that a real window reports a real rect (see
+/// `platform::mac::focus::window_rect_now_tests`); the bake's own tests cannot see this,
+/// because they start from a rect timeline that is already filled in.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub fn window_rect(id: &str) -> Option<crate::platform::compositor::WinRect> {
+    #[cfg(target_os = "macos")]
+    {
+        // The id a `Selection` carries is the `CGWindowID` as decimal text.
+        crate::platform::mac::focus::window_rect_now(id.parse().ok()?)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::window_rect_now(id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// Runtime seam: was this process launched from a TERMINAL (DRAGON-695)?
+///
+/// The one question a BARE launch turns on, and the reason it has to be asked at all: with no
+/// arguments, `cosmic-capture-kit` at a shell means "tell me what you can do" and
+/// `cosmic-capture-kit` from a login item, Finder or the Start Menu means "come up". Printing
+/// help into a void would leave a GUI user with nothing on screen; raising the tray from a
+/// terminal would leave a reader with no help and a surprise process.
+///
+/// The two platforms answer it differently because they can:
+///
+/// * unix asks the std streams. ANY of the three being a tty counts, deliberately: a user
+///   piping our output (`cosmic-capture-kit | less`) is still at a terminal, and answering
+///   "GUI" there would raise a tray instead of feeding the pipe.
+/// * Windows cannot ask them. Our binary is linked as a GUI-subsystem app, so it starts with
+///   NO console of its own and only borrows the parent's; by the time the streams exist they
+///   describe the attach, not the launch. The honest signal is whether that attach found a
+///   console at all, which `console::attach_parent_console` reports and `main` passes in here.
+///
+/// `console_attached` is therefore consulted on Windows and ignored elsewhere, which is why it
+/// is a parameter rather than a second call: the decision stays one function, and `main` has
+/// no `cfg` at the call site.
+pub fn launched_from_terminal(console_attached: bool) -> bool {
+    #[cfg(windows)]
+    {
+        console_attached
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::IsTerminal as _;
+        let _ = console_attached;
+        std::io::stdin().is_terminal()
+            || std::io::stdout().is_terminal()
+            || std::io::stderr().is_terminal()
+    }
+}
+
 /// Runtime seam: must THIS machine software-render its overlays? Windows 10 only; `false`
 /// everywhere else, so Linux and macOS keep their exact behaviour with no `cfg` at the
 /// call site. The build number itself comes from the Windows-native reader.
@@ -805,8 +1097,8 @@ pub fn overlay_pointer_hideable() -> bool {
 /// Where this answers `false`, the three Recording rows in Settings → Keyboard Shortcuts
 /// are DEAD controls, and the settled rule for a control that cannot apply is to hide it
 /// and say what does work instead (the DRAGON-551 / 569 / 577 hide-where-dead line). What
-/// works there is the CLI: `--toggle-mic`, `--toggle-system-audio`, `--pause-recording`,
-/// `--finish-recording` and `--cancel-recording` each reach the live recording through the
+/// works there is the CLI: `record --sound mic`, `record --sound system`, `record --action pause`,
+/// `record --action save` and `record --action cancel` each reach the live recording through the
 /// resident relay's own command words (`crate::daemon_ipc`), so a desktop-level global
 /// hotkey can drive a recording exactly the way one already launches a capture.
 pub fn in_app_recording_shortcut_reachable(
@@ -897,6 +1189,178 @@ pub fn overlay_fallback_seeding(layer_overlay: bool, uses_portal: bool) -> bool 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn capture_choice_uses_portal(saved_backend_id: &str, native_capture: bool) -> bool {
     saved_backend_id == backend::PORTAL_ID || !native_capture
+}
+
+// ── DRAGON-714: the portal stream that never starts ──────────────────────────
+//
+// A failed PipeWire format negotiation may reach us as an error, or as NOTHING AT ALL, and
+// the watch below is built to survive either. Both halves of that sentence are measured.
+//
+// The reading that motivated this said the error could never arrive: an empty intersection
+// makes `spa_pod_filter_prop` return -EINVAL and the LINK goes to `PW_LINK_STATE_ERROR`,
+// but `link_update_state` pushes that error only to resources bound to the LINK's global,
+// and a `pw_stream` client never binds the link. The conclusion drawn from that, that no
+// error event can ever be delivered, is WRONG, and the live QA of this very ticket is what
+// disproved it.
+//
+// MEASURED on cosmic-comp with PipeWire 1.6.8 (2026-08-19): an impossible size request
+// walks `Unconnected -> Connecting -> Paused -> Error("no more output formats")`, and the
+// Error lands 4ms after the connect. So the stream itself does report it here, whatever the
+// link-global reasoning says. Do not "simplify" this back to a pure timeout.
+//
+// What holds on every compositor is the POSITIVE condition: did the stream ever reach
+// Streaming. That is what the rules below judge, with an explicit early exit for the error
+// case so a stream that says it failed is not made to sit out the budget. Both are kept out
+// here so they are unit-tested on every host; the syscall side (the `state_changed`
+// listener and the loop timer that asks) is
+// `platform::linux::portal::pipewire::consume_frames`.
+//
+// Before this, the whole class of negotiation failures cost a recording and produced no
+// diagnosis: the worker's generic 10s "no frames from the PipeWire stream" was the only
+// thing that ever spoke, and it names a symptom, not a cause.
+
+/// How long a portal ScreenCast stream may take to reach Streaming before we call the
+/// negotiation failed (DRAGON-714).
+///
+/// A healthy negotiation completes in well under a second: the portal has already granted
+/// the session and the node already exists, so this is the format handshake alone. Five
+/// seconds is roughly ten times the observed cost, which leaves room for a loaded machine
+/// without leaving a lost recording undiagnosed for long.
+///
+/// It is deliberately INSIDE the PipeWire worker's own first-frame budget (10s,
+/// `record::pipewire`, which pins the relation with a compile-time assert): the outer wait
+/// can only ever report "no frames", so this one has to expire first for the named
+/// diagnosis to be the one the user sees.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const PW_STREAMING_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a PipeWire capture stream has been seen to be in: our own portable mirror of
+/// `pw_stream_state`, so the decisions below carry no PipeWire types and compile, and are
+/// tested, on every host.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PwStreamPhase {
+    /// Not connected yet (the state a fresh stream starts in).
+    Unconnected,
+    /// Connecting: the node exists and the link is being made.
+    Connecting,
+    /// Linked but not running. This is ALSO where a stream whose negotiation failed sits
+    /// forever, which is the entire reason this watch exists.
+    Paused,
+    /// Running and delivering buffers.
+    Streaming,
+    /// The stream itself errored (a node that went away, a refused connect). Distinct from
+    /// the silent negotiation failure above, and rarer.
+    Error,
+}
+
+/// What the negotiation watch should do on this tick.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PwStreamWatch {
+    /// Streaming was reached: the watch is disarmed for the rest of the session.
+    Settled,
+    /// Not streaming yet, still inside the budget: keep waiting.
+    Waiting,
+    /// Give up and fail the session with a named reason.
+    GiveUp,
+}
+
+/// **Pure**, unit-tested: has a portal ScreenCast stream failed to start?
+///
+/// Four rules, in order:
+///
+/// 1. `reached_streaming` disarms the watch for good, whatever the stream is doing NOW. A
+///    stream that reached Streaming and later goes Paused is an ordinary pause or a
+///    renegotiation, not a failed negotiation, and the frame-level guards own that case.
+/// 2. `Error` before ever streaming gives up IMMEDIATELY. The stream said outright that it
+///    failed, so waiting out the rest of the budget buys nothing.
+/// 3. Inside the budget, keep waiting.
+/// 4. Budget spent without ever reaching Streaming: give up.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pipewire_stream_watch(
+    waited: std::time::Duration,
+    budget: std::time::Duration,
+    reached_streaming: bool,
+    phase: PwStreamPhase,
+) -> PwStreamWatch {
+    if reached_streaming {
+        return PwStreamWatch::Settled;
+    }
+    if phase == PwStreamPhase::Error {
+        return PwStreamWatch::GiveUp;
+    }
+    if waited < budget {
+        return PwStreamWatch::Waiting;
+    }
+    PwStreamWatch::GiveUp
+}
+
+/// **Pure**, unit-tested: the user-facing reason a recording failed because its capture
+/// stream never started.
+///
+/// This string reaches a DIALOG verbatim (`diag::Failure::RecordingFailed` is the one
+/// failure whose detail is shown as user copy), so it says what did not happen and what
+/// the likely cause is, in plain words, with no PipeWire vocabulary the user cannot act
+/// on. `error` is the stream's own message when it had one; it is truncated, because a
+/// driver string is not a paragraph the dialog can hold.
+///
+/// TWO shapes, because there are two failures and saying the wrong one is a lie the user
+/// cannot check (DRAGON-714 live QA):
+///
+/// * **The stream reported an error.** Say so and quote it. It arrives in milliseconds, so
+///   this text must NOT mention the budget: the first cut claimed "did not begin streaming
+///   within 5s" over a stream that had errored at 4ms and been given up on at 101ms, which
+///   invited everyone reading the log to hunt for a five second stall that never happened.
+/// * **The stream simply never left its quiet phase.** That IS the timeout, so the budget
+///   is exactly what wants saying, along with the phase it sat in.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pipewire_stall_reason(
+    budget: std::time::Duration,
+    phase: PwStreamPhase,
+    error: Option<&str>,
+) -> String {
+    /// Longest stream error we repeat into the reason.
+    const MAX_ERR: usize = 120;
+    let reported = error.map(str::trim).filter(|e| !e.is_empty()).map(|e| {
+        if e.chars().count() > MAX_ERR {
+            let short: String = e.chars().take(MAX_ERR).collect();
+            format!("{short}…")
+        } else {
+            e.to_string()
+        }
+    });
+    if phase == PwStreamPhase::Error {
+        return match reported {
+            Some(e) => format!("the desktop refused the screen-cast stream: {e}"),
+            // An error with no text at all. Rare, and still not a timeout.
+            None => "the desktop refused the screen-cast stream and gave no reason".to_string(),
+        };
+    }
+    let stayed = match phase {
+        PwStreamPhase::Unconnected => "unconnected",
+        PwStreamPhase::Connecting => "connecting",
+        PwStreamPhase::Paused => "linked but idle",
+        // Unreachable through the watch (Streaming settles it, Error returned above), kept
+        // total on purpose.
+        PwStreamPhase::Streaming | PwStreamPhase::Error => "not streaming",
+    };
+    let mut msg = format!(
+        "the desktop never started the screen-cast stream: it did not begin streaming \
+         within {}s (the stream stayed {stayed})",
+        budget.as_secs(),
+    );
+    match reported {
+        Some(e) => msg.push_str(&format!(". The stream reported: {e}")),
+        None => msg
+            .push_str(". The compositor may have refused the capture format that was asked for"),
+    }
+    msg
 }
 
 /// Runtime seam: is THIS session's interactive capture overlay the PORTAL-FROZEN fallback
@@ -1344,6 +1808,35 @@ pub fn mac_window_is_stray_chrome(
     !owner_is_color_picker && mac_same_app(owner, me)
 }
 
+/// **Pure**, unit-tested: must this ScreenCaptureKit window be left out of a recording WE
+/// are making, because it is one of OUR OWN windows that opted out (DRAGON-690)?
+///
+/// `owner_pid` is the window's owning process (`0` is SCK's "no owning application"),
+/// `me` this process, `window_id` the window's `CGWindowID`, and `opted_out` the ids
+/// `exclude_window_from_capture` has collected so far (that seam is not built on Linux, so
+/// this names it in plain text: the rule still has to compile and be tested there).
+///
+/// Two rules, and both matter:
+///
+/// * ONLY our own process's windows. Window ids are unique per session, so a foreign match
+///   should be impossible, but "should be impossible" is not a reason to hand another app's
+///   window to an exclusion list the user never asked for.
+/// * ONLY the windows that opted out, one at a time. This is the DRAGON-691 contract in
+///   code: a window we own that did not ask stays IN the recording, so the future
+///   draw-on-screen surface keeps its ink in the video while the controls beside it do not.
+///   Never widen this to "our pid's windows"; that is a different function
+///   ([`mac_window_is_stray_chrome`]) for a different job.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_window_is_capture_excluded(
+    owner_pid: i32,
+    me: i32,
+    window_id: u32,
+    opted_out: &[u32],
+) -> bool {
+    owner_pid != 0 && owner_pid == me && opted_out.contains(&window_id)
+}
+
 // ───────────────────────── Launch at login: what the row may claim ─────────────────────────
 //
 // DRAGON-628. The "Automatically start on login" row rendered the PERSISTED PREFERENCE, which
@@ -1752,11 +2245,15 @@ pub fn win_run_value_is_live_with(data: &str, exists: impl Fn(&std::path::Path) 
     {
         return live(exe);
     }
-    // `instance::RESIDENT_ARG`, the token every launcher agrees on, rather than a fourth
-    // private copy of the literal (see its doc). `windows_autostart` keeps its own for the
-    // command it WRITES, pinned to the same string by its own test.
+    // `instance::TRAY_ARG`, the word every launcher agrees on, rather than a fourth private
+    // copy of the literal (see its doc). `windows_autostart` keeps its own for the command it
+    // WRITES, pinned to the same string by its own test.
+    //
+    // DRAGON-695: the LEGACY word too, because this reads a Run value written by whatever
+    // build registered it, and an entry from before the rename still ends in `resident`.
     let whole = data
-        .strip_suffix(crate::instance::RESIDENT_ARG)
+        .strip_suffix(crate::instance::TRAY_ARG)
+        .or_else(|| data.strip_suffix(crate::instance::LEGACY_RESIDENT_ARG))
         .map(str::trim_end)
         .unwrap_or(data);
     let first = data.split_whitespace().next().unwrap_or(data);
@@ -1921,6 +2418,29 @@ mod tests {
         // An unreadable build reads as "not Windows 10" -> diagnostics stay off, which is
         // the safe side: a Win11 user must never be able to tell the feature exists.
         assert!(!win_build_is_windows_10(0));
+    }
+
+    /// DRAGON-690. The band edge is the whole gate: at 19041 and up the toolbar disappears
+    /// from the capture, and one build lower the SAME call would paint a black rectangle in
+    /// the user's video instead, so the edge is pinned rather than trusted.
+    #[test]
+    fn excluding_a_window_from_capture_needs_windows_10_version_2004() {
+        assert_eq!(WIN_EXCLUDE_FROM_CAPTURE_MIN_BUILD, 19041);
+        // The floor itself, then 22H2 (the last Windows 10) and every Windows 11.
+        for build in [19041, 19045, WIN11_MIN_BUILD, 22621, 26100, u32::MAX] {
+            assert!(win_build_can_exclude_from_capture(build), "build {build} can exclude");
+        }
+        // 1909 and older, plus the unreadable-build reading of 0. These get NO exclusion:
+        // the toolbar is recorded, which is exactly today's behaviour, and never
+        // `WDA_MONITOR`.
+        for build in [0, 7600, WIN10_MIN_BUILD, 18363, 19040] {
+            assert!(!win_build_can_exclude_from_capture(build), "build {build} must not");
+        }
+        // The whole excluded band sits INSIDE Windows 10: no Windows 11 build can ever land
+        // in it, so the feature can never be withheld from a Windows 11 machine.
+        for build in [0, 7600, WIN10_MIN_BUILD, 18363, 19040] {
+            assert!(build < WIN11_MIN_BUILD);
+        }
     }
 
     /// DRAGON-427: the software-renderer gate and the overlay-editor gate are BOTH the
@@ -2514,11 +3034,29 @@ mod win_run_value_tests {
     }
 
     /// The Linux and Windows readers must answer the same QUESTION, or one platform's toggle
-    /// tells the truth and the other does not. The token they both strip is the one every
-    /// launcher agrees on.
+    /// tells the truth and the other does not. The words they both strip are the ones every
+    /// launcher agrees on, current and legacy.
     #[test]
-    fn both_platforms_strip_the_same_resident_token() {
-        assert_eq!(crate::instance::RESIDENT_ARG, "resident");
+    fn both_platforms_strip_the_same_tray_words() {
+        assert_eq!(crate::instance::TRAY_ARG, "tray");
+        assert_eq!(crate::instance::LEGACY_RESIDENT_ARG, "resident");
+    }
+
+    /// DRAGON-695: a Run value an OLDER build wrote still ends in `resident`, and this reader
+    /// has to strip it or a quoted-path-free entry reads as a path that does not exist.
+    #[test]
+    fn a_pre_rename_run_value_still_resolves_its_exe() {
+        // Unquoted and with a space in the path, which is the shape that NEEDS the word
+        // stripped: without it the whole line reads as one absolute path that does not exist.
+        let exe_only =
+            |p: &std::path::Path| p.to_string_lossy().ends_with("cosmic-capture-kit.exe");
+        let legacy = r"C:\Program Files\CCK\cosmic-capture-kit.exe resident";
+        assert!(win_run_value_is_live_with(legacy, exe_only));
+        let current = r"C:\Program Files\CCK\cosmic-capture-kit.exe tray";
+        assert!(win_run_value_is_live_with(current, exe_only));
+        // And a value naming an exe that is GONE is still reported dead, both spellings.
+        assert!(!win_run_value_is_live_with(legacy, |_| false));
+        assert!(!win_run_value_is_live_with(current, |_| false));
     }
 }
 
@@ -2639,5 +3177,297 @@ mod mac_stray_chrome_tests {
         };
         assert!(!mac_window_is_stray_chrome(other, me(), SHIELDING, false));
         assert!(!mac_window_is_stray_chrome(other, me(), 25, false));
+    }
+}
+
+/// DRAGON-690: which of OUR OWN windows a macOS recording leaves out. The SCK reads live in
+/// `platform::mac`; the RULE is here so `cargo test` proves it on Linux and Windows too, and
+/// so the per-window contract DRAGON-691 depends on has a test rather than a comment.
+#[cfg(test)]
+mod mac_capture_exclusion_tests {
+    use super::*;
+
+    /// This process.
+    const ME: i32 = 100;
+    /// The two capture overlays of a dual-monitor session, as they registered themselves.
+    const OPTED_OUT: [u32; 2] = [4211, 4212];
+
+    /// The shipped case: the overlay carrying the recording chip asked to be left out, so it
+    /// is, and the recording shows the desktop that was behind it.
+    #[test]
+    fn a_window_that_opted_out_is_excluded() {
+        assert!(mac_window_is_capture_excluded(ME, ME, 4211, &OPTED_OUT));
+        assert!(mac_window_is_capture_excluded(ME, ME, 4212, &OPTED_OUT));
+    }
+
+    /// The DRAGON-691 contract, and the reason this is a per-window list rather than a pid
+    /// test: a window we own that never asked stays IN the video. A future draw-on-screen
+    /// surface is exactly that window, and widening this rule would erase the user's ink.
+    #[test]
+    fn our_other_windows_stay_in_the_recording() {
+        assert!(!mac_window_is_capture_excluded(ME, ME, 4213, &OPTED_OUT));
+        // Nothing registered at all: byte-identical to the behaviour before DRAGON-690.
+        assert!(!mac_window_is_capture_excluded(ME, ME, 4211, &[]));
+    }
+
+    /// Window ids are unique per session, so a foreign match should not be reachable. It is
+    /// still refused: an exclusion list is not the place to be generous about ownership.
+    #[test]
+    fn another_apps_window_is_never_excluded() {
+        assert!(!mac_window_is_capture_excluded(200, ME, 4211, &OPTED_OUT));
+    }
+
+    /// SCK reports "no owning application" as pid 0. Zero must never match zero, or an
+    /// ownerless window would be excluded from every recording on a machine where our own
+    /// pid could not be read either.
+    #[test]
+    fn an_ownerless_window_never_matches() {
+        assert!(!mac_window_is_capture_excluded(0, 0, 4211, &OPTED_OUT));
+        assert!(!mac_window_is_capture_excluded(0, ME, 4211, &OPTED_OUT));
+    }
+}
+
+/// DRAGON-736: the whole truth table of "is our ink in the recorded file", across both facts
+/// and therefore across all three platforms and both Linux backends.
+///
+/// It is pinned here rather than left to inspection because the version this replaced was a
+/// bare `cfg!`, which made the Linux rows UNREACHABLE from any test on any host: the answer
+/// was baked in at compile time, so a Linux gate could only ever see the Linux answer and
+/// could never see that there were two of them.
+#[cfg(test)]
+mod window_capture_exclusion_tests {
+    use super::*;
+
+    /// macOS and Windows: one window-capture implementation each, so the platform settles it
+    /// and the session fact cannot move it. These are the rows that must NOT have changed.
+    #[test]
+    fn a_window_buffer_platform_answers_alone() {
+        assert!(window_capture_excludes_overlays_with(true, false));
+        // A portal window cast is unreachable there; if one ever were, the answer is the same.
+        assert!(window_capture_excludes_overlays_with(true, true));
+    }
+
+    /// Linux, and the whole point of the ticket: the two backends answer OPPOSITE ways in the
+    /// same build on the same desktop.
+    ///
+    /// * NATIVE screencopy crops the SCREEN, so the compositor has already composited our ink
+    ///   surface into the frame and compositing it again would draw every stroke twice.
+    /// * a PORTAL cast delivers the toplevel's OWN buffer, which no floating surface of ours
+    ///   is part of, so the strokes are on screen and structurally absent from the file.
+    #[test]
+    fn linux_answers_per_backend_and_not_per_platform() {
+        assert!(!window_capture_excludes_overlays_with(false, false), "native screencopy");
+        assert!(window_capture_excludes_overlays_with(false, true), "a portal window cast");
+    }
+
+    /// The effectful wrapper carries this build's platform fact through to the decision, and
+    /// the session fact reaches it. This is what would catch the two halves drifting apart.
+    #[test]
+    fn the_wrapper_carries_the_platform_fact_through() {
+        let native = cfg!(any(target_os = "macos", target_os = "windows"));
+        assert_eq!(window_capture_excludes_overlays(false), native);
+        assert!(window_capture_excludes_overlays(true));
+    }
+}
+
+/// DRAGON-739: WHO draws the pointer into a window recording. The sibling question to the
+/// module above, and the one that decides whether we may draw a cursor ourselves without
+/// ending up with two.
+#[cfg(test)]
+mod window_cursor_source_tests {
+    use super::*;
+
+    /// The two arms say what they say, which is the whole of the decision half.
+    #[test]
+    fn focus_gating_is_the_only_input() {
+        assert_eq!(window_cursor_source_with(true), WindowCursorSource::PointerFocus);
+        assert_eq!(window_cursor_source_with(false), WindowCursorSource::Geometry);
+    }
+
+    /// **The rows that must not change.** macOS and Windows answer `Geometry`, which is the
+    /// arm under which nothing new is ever drawn, so this build's behaviour there is exactly
+    /// what it was before DRAGON-739. Windows is that arm on evidence (WGC over-includes);
+    /// macOS is that arm on the safe assumption, which is a separate statement and is why the
+    /// two are asserted on the same line rather than folded into one.
+    #[test]
+    fn mac_and_windows_stay_geometric() {
+        let here = window_cursor_source();
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert_eq!(here, WindowCursorSource::Geometry);
+        }
+        // And the platform fact really is the only thing the wrapper contributes.
+        assert_eq!(here, window_cursor_source_with(cfg!(target_os = "linux")));
+    }
+
+    /// Linux is focus-gated, which is the defect this ticket exists for: an armed annotation
+    /// surface takes the pointer, so cosmic-comp stops compositing the cursor into the
+    /// recorded toplevel's capture.
+    #[test]
+    fn linux_is_focus_gated() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(window_cursor_source(), WindowCursorSource::PointerFocus);
+        }
+    }
+}
+
+/// DRAGON-714: the rules of the never-reached-Streaming watch. A negotiation failure is
+/// silent by construction (see the section comment above the functions), so these rules are
+/// the whole detector: get them wrong and either a lost recording stays undiagnosed or a
+/// healthy one is killed at five seconds.
+#[cfg(test)]
+mod pipewire_negotiation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Rule 1, and the one that must never regress: reaching Streaming disarms the watch
+    /// FOR GOOD. A live recording that pauses, or renegotiates its format, drops back to
+    /// Paused with hours on the clock, and killing it there would be a data-loss bug far
+    /// worse than the one this detector exists to fix.
+    #[test]
+    fn reaching_streaming_disarms_the_watch_permanently() {
+        for phase in [
+            PwStreamPhase::Paused,
+            PwStreamPhase::Streaming,
+            PwStreamPhase::Connecting,
+            PwStreamPhase::Error,
+        ] {
+            assert_eq!(
+                pipewire_stream_watch(Duration::from_secs(3600), PW_STREAMING_BUDGET, true, phase),
+                PwStreamWatch::Settled,
+                "a stream that reached Streaming must stay settled in {phase:?}"
+            );
+        }
+    }
+
+    /// Rule 2: an explicit error before the first frame is a decision, not a wait. Nothing
+    /// is gained by sitting out the remaining budget once the stream has said it failed.
+    #[test]
+    fn an_error_before_streaming_gives_up_at_once() {
+        assert_eq!(
+            pipewire_stream_watch(Duration::ZERO, PW_STREAMING_BUDGET, false, PwStreamPhase::Error),
+            PwStreamWatch::GiveUp
+        );
+    }
+
+    /// Rule 3: inside the budget, every non-streaming phase waits. `Paused` is the one that
+    /// matters: it is BOTH the healthy pre-roll state and the state a failed negotiation
+    /// sits in forever, so only the clock can tell them apart.
+    #[test]
+    fn inside_the_budget_every_quiet_phase_waits() {
+        for phase in [PwStreamPhase::Unconnected, PwStreamPhase::Connecting, PwStreamPhase::Paused]
+        {
+            assert_eq!(
+                pipewire_stream_watch(Duration::from_millis(900), PW_STREAMING_BUDGET, false, phase),
+                PwStreamWatch::Waiting,
+                "{phase:?} inside the budget must keep waiting"
+            );
+        }
+    }
+
+    /// Rule 4, the detector's whole point: the budget expires and the stream never started.
+    /// The boundary is pinned in both directions so a `<=`/`<` slip cannot pass.
+    #[test]
+    fn the_budget_expiring_without_streaming_gives_up() {
+        let budget = Duration::from_secs(5);
+        assert_eq!(
+            pipewire_stream_watch(Duration::from_millis(4_999), budget, false, PwStreamPhase::Paused),
+            PwStreamWatch::Waiting
+        );
+        assert_eq!(
+            pipewire_stream_watch(budget, budget, false, PwStreamPhase::Paused),
+            PwStreamWatch::GiveUp
+        );
+        assert_eq!(
+            pipewire_stream_watch(Duration::from_secs(6), budget, false, PwStreamPhase::Paused),
+            PwStreamWatch::GiveUp
+        );
+    }
+
+    /// The budget has to expire INSIDE the PipeWire worker's own first-frame wait (10s), or
+    /// the generic "no frames" message wins the race and the named diagnosis never reaches
+    /// anybody. `record::pipewire` pins the same relation with a compile-time assert; this
+    /// says it again where the constant is defined.
+    #[test]
+    fn the_budget_is_inside_the_workers_first_frame_wait() {
+        assert!(
+            PW_STREAMING_BUDGET < Duration::from_secs(10),
+            "the negotiation watch must expire before the worker's first-frame budget"
+        );
+    }
+
+    /// The reason string is USER COPY (it reaches the dialog verbatim through
+    /// `Failure::RecordingFailed`), so it must name what did not happen, carry the budget,
+    /// and offer a cause when the stream gave none.
+    #[test]
+    fn the_reason_names_the_failure_and_the_budget() {
+        let msg = pipewire_stall_reason(Duration::from_secs(5), PwStreamPhase::Paused, None);
+        assert!(msg.contains("never started"), "{msg}");
+        assert!(msg.contains("5s"), "{msg}");
+        assert!(msg.contains("linked but idle"), "{msg}");
+        assert!(msg.contains("refused the capture format"), "{msg}");
+    }
+
+    /// A stream that DID report an error says so, and quotes it, instead of guessing.
+    #[test]
+    fn a_reported_error_replaces_the_guess() {
+        let msg = pipewire_stall_reason(
+            PW_STREAMING_BUDGET,
+            PwStreamPhase::Error,
+            Some("no more output formats"),
+        );
+        assert!(msg.contains("no more output formats"), "{msg}");
+        assert!(!msg.contains("may have refused"), "{msg}");
+    }
+
+    /// The DRAGON-714 live-QA regression, and the reason the reason has two shapes.
+    ///
+    /// MEASURED on cosmic-comp with PipeWire 1.6.8: a broken negotiation errors 4ms after
+    /// the connect and the watch gives up at 101ms. The first cut of this copy said "it did
+    /// not begin streaming within 5s" over exactly that, which is not a small wording
+    /// problem: it sends whoever reads the log hunting for a five second stall that never
+    /// happened, and it is unfalsifiable from the outside.
+    #[test]
+    fn the_error_wording_never_claims_a_budget_that_did_not_elapse() {
+        let msg = pipewire_stall_reason(
+            PW_STREAMING_BUDGET,
+            PwStreamPhase::Error,
+            Some("no more output formats"),
+        );
+        assert!(!msg.contains("5s"), "the error branch must not mention the budget: {msg}");
+        assert!(!msg.contains("within"), "{msg}");
+        assert!(!msg.contains("never started"), "{msg}");
+        assert!(msg.contains("refused"), "{msg}");
+    }
+
+    /// The genuine timeout keeps the budget wording, because there the budget IS what
+    /// happened. Both shapes are needed; neither may swallow the other.
+    #[test]
+    fn the_timeout_wording_survives_for_a_stream_that_just_sat_there() {
+        let msg = pipewire_stall_reason(PW_STREAMING_BUDGET, PwStreamPhase::Paused, None);
+        assert!(msg.contains("never started"), "{msg}");
+        assert!(msg.contains("5s"), "{msg}");
+        assert!(msg.contains("linked but idle"), "{msg}");
+    }
+
+    /// A long driver string is truncated rather than pasted into a dialog whole. Counted in
+    /// CHARS, not bytes, so a multi-byte message cannot be cut mid-character.
+    #[test]
+    fn a_long_stream_error_is_truncated() {
+        let long = "é".repeat(400);
+        let msg = pipewire_stall_reason(PW_STREAMING_BUDGET, PwStreamPhase::Error, Some(&long));
+        assert!(msg.contains('…'), "{msg}");
+        assert!(msg.chars().count() < 300, "reason was {} chars", msg.chars().count());
+    }
+
+    /// An error with no text is still an error, not a timeout: it must not borrow the
+    /// budget wording just because it has nothing to quote.
+    #[test]
+    fn a_blank_error_is_still_reported_as_a_refusal() {
+        for blank in [Some("   "), Some(""), None] {
+            let msg = pipewire_stall_reason(PW_STREAMING_BUDGET, PwStreamPhase::Error, blank);
+            assert!(msg.contains("refused"), "{msg}");
+            assert!(msg.contains("gave no reason"), "{msg}");
+            assert!(!msg.contains("5s"), "{msg}");
+        }
     }
 }

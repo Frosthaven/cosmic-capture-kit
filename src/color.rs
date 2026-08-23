@@ -452,6 +452,19 @@ pub fn hsv_tracking(prev: [f64; 3], color: Srgb) -> [f64; 3] {
 ///
 /// Saturation and hue are the base's throughout: this is a ramp of shades and tints, and
 /// desaturating the light end would make it a different harmony.
+///
+/// # Why the COUNT is free to move
+///
+/// Both halves of the rule are functions of `n`, which is why DRAGON-705 could take the ramp
+/// from five segments to nine without touching a line of this. The slot scales
+/// (`round(v * (n - 1))`), the step is still whatever fits beside it, and the step shrinks
+/// with `n` but reaches zero only for a one-segment ramp, so a larger count can never repeat
+/// a segment where a smaller one did not. What DOES move is where an off-centre base's ramp
+/// ENDS: more slots means the base's own position is measured more finely, so a dark base
+/// that rounded to slot 0 at five (and therefore ran all the way to white) can round to slot
+/// 1 at nine, reach true black one segment below itself, and stop short of white instead.
+/// That is the same "the step is whatever fits on both sides" answer at a finer resolution,
+/// not a new behaviour: the ramp still reaches AWAY from the base's own end.
 fn monochrome_ramp(hsv: [f64; 3]) -> Vec<Srgb> {
     let n = MONOCHROME_STEPS;
     let last = (n - 1) as f64;
@@ -508,9 +521,22 @@ pub enum Harmony {
 
 /// How many segments [`Harmony::Monochromatic`]'s ramp holds, the base's own among them.
 ///
-/// Five, which is the widest any other card is (tetradic's four rotations plus its base),
-/// so the panel's bars stay a family rather than one long card among short ones.
-const MONOCHROME_STEPS: usize = 5;
+/// NINE, the owner's call (DRAGON-705, 2026-08-17). This is the one card in the panel that
+/// is read as a GRADIENT rather than as a set of related colours, so what it is good for is
+/// how finely it divides the lightness it spans, and five steps is a coarse ladder to pick a
+/// shade off. A finer ramp is worth the card being deliberately WIDER than its siblings: a
+/// bar is full width whatever subdivides it (`geom::segment_widths`), so nine segments cost
+/// the panel nothing but their own narrowness.
+///
+/// It was FIVE, chosen as the widest any other card is (tetradic's four rotations plus its
+/// base), so the panel's bars would stay a family rather than one long card among short
+/// ones. That rationale is SUPERSEDED, not disproven: the cards still read as a family
+/// because every one of them is one full-width bar with the same swatch height, which is
+/// what the eye matches them on, and the count inside a bar never was.
+///
+/// The panel's clamp derives from this constant (`app::color_picker::geom::MAX_SEGMENTS`),
+/// so the number lives here once.
+pub const MONOCHROME_STEPS: usize = 9;
 
 impl Harmony {
     /// Every harmony the compare panel shows, in panel order.
@@ -2163,6 +2189,54 @@ mod harmony_tests {
             .expect("the base is in the ramp");
         let want = (base_hsv[2] * (MONOCHROME_STEPS - 1) as f64).round() as usize;
         assert_eq!(at, want, "the base sits at slot {at}, not the {want} its value earns");
+    }
+
+    /// NINE shades since DRAGON-705, and the count is the only thing that moved. Computed
+    /// for a MID-TONE base rather than assumed from the rule: nine distinct colours, evenly
+    /// spaced, the base itself among them at the slot its own value earns, and the ends
+    /// exactly where the five-segment ramp put them for this same base.
+    #[test]
+    fn the_ramp_holds_nine_distinct_shades_of_its_base() {
+        assert_eq!(MONOCHROME_STEPS, 9, "the owner's count (DRAGON-705)");
+        // Mid-tone, saturated, and not a round number of anything: its value sits just above
+        // the middle, so the light side is the tighter one and sets the step.
+        let base = Srgb::new(128, 64, 32);
+        let swatches = Harmony::Monochromatic.swatches(base);
+        assert_eq!(swatches.len(), 9, "{swatches:?}");
+        let mut seen: Vec<(u8, u8, u8)> = swatches.iter().map(|c| (c.r, c.g, c.b)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 9, "two segments are the same colour: {swatches:?}");
+        // The BASE is one of the nine, not a neighbour of one.
+        assert!(
+            swatches
+                .iter()
+                .any(|c| c.r.abs_diff(base.r) <= 1
+                    && c.g.abs_diff(base.g) <= 1
+                    && c.b.abs_diff(base.b) <= 1),
+            "{swatches:?} does not hold {base:?} itself"
+        );
+        let values = ramp(base);
+        let v = unit_to_hsv(base.to_unit())[2];
+        let at = values
+            .iter()
+            .position(|got| (got - v).abs() < 0.005)
+            .expect("the base is in the ramp");
+        assert_eq!(at, 4, "the base sits at slot {at}, not the 4 its value earns: {values:?}");
+        // The ENDS: the light side has the least room, so the step is `(1 - v) / 4` and the
+        // dark end lands at `2v - 1`, which is exactly where the FIVE-segment ramp ended for
+        // this base too (`(1 - v) / 2` a side, half as many slots). Widening the ramp
+        // divides the same span more finely; it does not reach further, and the dark end is
+        // not pure black here any more than it was at five.
+        assert!((values[0] - (2.0 * v - 1.0)).abs() < 0.005, "{values:?}");
+        assert!((values[8] - 1.0).abs() < 0.005, "{values:?}");
+        assert!(swatches[0] != Srgb::new(0, 0, 0), "the dark end collapsed to black");
+        // Evenly spaced, with a step nowhere near the 1/255 that would repeat a segment.
+        let step = values[1] - values[0];
+        assert!(step > 0.01, "the step collapsed to {step}");
+        for w in values.windows(2) {
+            assert!((w[1] - w[0] - step).abs() < 0.005, "{values:?} is not an even ramp");
+        }
     }
 
     /// The EDGES, which is where the two rules this replaced fell over: a base at black,

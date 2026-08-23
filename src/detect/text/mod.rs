@@ -9,6 +9,8 @@
 //! Split into [`preprocess`] (image prep + deskew + the tesseract call), [`parse`]
 //! (TSV → word boxes + token heuristics), and [`layout`] (word boxes → spaced text).
 
+use crate::errln;
+
 mod layout;
 mod parse;
 mod preprocess;
@@ -183,7 +185,7 @@ pub fn scan_text(
     // split them.
     let lang = crate::state::load().ocr_language.clone();
     if std::env::var_os("CCK_SKEW").is_some() {
-        eprintln!("SKEW {:.2} deg", skew * 180.0 / std::f32::consts::PI);
+        errln!("SKEW {:.2} deg", skew * 180.0 / std::f32::consts::PI);
     }
 
     // Mixed contrast — a bright horizontal band AND a dark band in the same selection

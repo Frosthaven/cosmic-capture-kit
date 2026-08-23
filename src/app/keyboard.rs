@@ -719,15 +719,21 @@ impl App {
         // works when you have already drawn the region — and DRAGON-479 restores the BEHAVIOUR
         // without the configurability that made the two meanings of Ctrl+C collide. See
         // `shortcuts::is_region_copy_chord` for why it is fixed rather than bindable.
+        //
+        // DRAGON-756 added the last two terms. Named at the call site, the way
+        // `accept_verdict` names its six, because seven positional arguments in a row is
+        // exactly the shape a later edit transposes two of.
         if crate::shortcuts::is_region_copy_chord(modifiers, &key)
             && region_copy_fires(
-                self.mode,
-                self.kind,
-                self.normalized_region().is_some(),
-                self.countdown.is_some() || self.recording.is_some(),
+                /* mode */ self.mode,
+                /* kind */ self.kind,
+                /* region_drawn */ self.normalized_region().is_some(),
+                /* busy */ self.countdown.is_some() || self.recording.is_some(),
                 // DRAGON-577: dead on the portal fallback (the copy cannot deliver
                 // there); the Region tooltip hides the chord on the same predicate.
-                self.overlay_fallback_active(),
+                /* fallback */ self.overlay_fallback_active(),
+                /* on_overlay */ self.press_landed_on_overlay(window),
+                /* color_picking */ self.color_picking(),
             )
         {
             return self.update(Msg::Capture(CaptureMsg::CopySelection));
@@ -748,6 +754,36 @@ impl App {
         // overlay's own context menu sends.
         if let Some(action) = crate::shortcuts::fixed_scanner_action(modifiers, &key) {
             return self.update(Self::fixed_scanner_msg(action));
+        }
+        // **The live-annotation DISARM key** (DRAGON-742): bare `V`, the third route to the one
+        // disarm Escape has taken since DRAGON-691. The owner asked for it as "i would also
+        // like right click, or v, to disarm markers the same way escape does", and this is the
+        // key half; the right click is `WindowChromeMsg::RightPressed`. Both end in
+        // `App::disarm_ink_tool`, which is what makes "the same way" true rather than nearly
+        // true, and which is what keeps DRAGON-739's painted cursor from being left switched on
+        // by a route that only moved the selector.
+        //
+        // In the FALL-THROUGH, and after the `Context::Recording` keymap lane above, for the
+        // reason the two bare-key lanes below give: this is a BARE letter and every Recording
+        // default is a `Shift+Alt` chord, so on a default install there is nothing to
+        // arbitrate, and with nothing to arbitrate the safe order is the one where a binding
+        // the user configured always wins.
+        //
+        // **The delivered-surface test is `ink_disarm_fires`' first term**, and this lane needs
+        // one just as badly as the accept and directional lanes do: `v` is ordinary typing, and
+        // the settings window and the colour picker's result window both carry text inputs.
+        // Rather than a second delivery predicate it reuses DRAGON-599's `click_surface`, so
+        // the keyboard and the mouse cannot come to disagree about which surfaces the disarm
+        // may be pressed on. The second term, a drawing tool actually being armed, is what
+        // keeps a `v` typed anywhere else in a recording session a no-op.
+        if crate::shortcuts::is_ink_disarm_key(modifiers, &key)
+            && crate::app::update::window_chrome::ink_disarm_fires(
+                self.click_surface(window),
+                self.ink_drawing_armed(),
+            )
+        {
+            log::debug!("the disarm key while a live annotation tool is armed: disarming");
+            return self.disarm_ink_tool();
         }
         // **The directional keys** (DRAGON-599): the four arrows and the vim letters `h` `j`
         // `k` `l`. ONE key family, two consumers, chosen here by which one is on screen:
@@ -878,19 +914,25 @@ impl App {
 
     /// Whether this press was delivered to one of our capture OVERLAYS.
     ///
-    /// **The delivery test the two BARE-key lanes share**, the accept keys (DRAGON-612) and
-    /// the directional keys. Both answer keys that are ordinary typing on any surface with a
-    /// text input, so both have to know that the press really landed on an overlay rather
-    /// than being typed into something that already handled it. `sub_global_events` forwards
-    /// every press with no `Status` filter, so the delivering surface is the only signal
-    /// available, and it is a good one.
+    /// **The delivery test every lane that can be TYPED shares**: the accept keys
+    /// (DRAGON-612), the directional keys, and the region-copy chord (DRAGON-756). All of
+    /// them answer keys that are ordinary typing on any surface with a text input, so all of
+    /// them have to know that the press really landed on an overlay rather than being typed
+    /// into something that already handled it. `sub_global_events` forwards every press with
+    /// no `Status` filter, so the delivering surface is the only signal available, and it is
+    /// a good one.
     ///
-    /// One method rather than the predicate written out at both lanes: the two were allowed
+    /// One method rather than the predicate written out at each lane: the lanes were allowed
     /// to disagree once already, and the nudge lane was the one that lost.
     ///
-    /// Only the BARE-key lanes need it. A modifier chord is not typing, which is why the
-    /// region-copy chord, the five baked editor chords and the three baked scanner chords
-    /// (DRAGON-627) do not consult this.
+    /// **This used to say "only the BARE-key lanes need it. A modifier chord is not typing",
+    /// and that sentence was wrong.** A bare primary+C IS typing: it is the copy binding of
+    /// every text input in the process, which is exactly why the colour picker's own copy
+    /// chord is primary+SHIFT+C (`shortcuts::is_copy_value_chord`). So the region-copy chord
+    /// consults this too, through `region_copy_fires`'s `on_overlay` term. The five baked
+    /// editor chords and the three baked scanner chords (DRAGON-627) still do not, and the
+    /// honest reason is narrower than the old one: none of them is a chord a text input
+    /// claims.
     fn press_landed_on_overlay(&self, window: window::Id) -> bool {
         press_on_overlay(self.outputs.iter().map(|o| o.id), window)
     }
@@ -1172,7 +1214,7 @@ fn key_target(
 /// this is the whole of "does it mean anything here", split out so the four-way precedence is
 /// testable without a compositor, an overlay or a keypress.
 ///
-/// All five terms, and why each is a term rather than an assumption:
+/// All seven terms, and why each is a term rather than an assumption:
 ///
 /// * `mode == Region` — the action copies THE DRAWN REGION. In window or monitor mode there is
 ///   no rectangle for it to mean.
@@ -1192,17 +1234,49 @@ fn key_target(
 ///   window's focus, which the skip-editor path never creates. Firing would silently lose the
 ///   user's capture, so the chord is honestly dead there, and the Region tooltip
 ///   (`toolbar::region_capture_tip`) stops advertising it on the same predicate.
+/// * `on_overlay` (DRAGON-756): the press was DELIVERED to one of our capture overlays
+///   ([`App::press_landed_on_overlay`]). The five terms above are all APP STATE, and none of
+///   them can tell a press on the overlay from one typed into another window of ours, so the
+///   chord fired from the SETTINGS window and from the colour picker's result window / palette
+///   viewer. It is worse than it sounds, because `self.region` is not "the drag that just
+///   happened": `App::init` restores it from the config on EVERY launch and `mode` defaults to
+///   `Region`, so a `settings` or `color --viewer` launch that draws nothing at all still
+///   satisfied all five, and a bare Ctrl+C in the settings search field committed a region
+///   capture. A bare primary+C is ordinary text-input copy, which is exactly why the picker
+///   window's own copy chord is primary+SHIFT+C (`shortcuts::is_copy_value_chord`).
+/// * `!color_picking` (DRAGON-756): a colour pick mints the SAME per-output overlays a capture
+///   does (`App::live_picker_windows`), so `on_overlay` is TRUE during a pick and cannot cover
+///   this. The picker also carries the remembered region it never shows, the same trap
+///   [`region_nudge_fires`] documents, so Ctrl+C mid-pick committed a region capture underneath
+///   the pick. Neither term subsumes the other: a settings-window press has no pick active, and
+///   a press on a picker overlay is on an overlay.
+///
+/// The delivery term is asked INSIDE the gate here, while the accept keys ask it at their lane
+/// (see [`App::press_landed_on_overlay`]). The difference is that lane logs a REFUSAL for a
+/// press it declines, so a press that was never ours must not reach it; this lane logs nothing
+/// and only returns early on `true`, so a term is the simpler place.
 ///
 /// Every `false` here is a FALL-THROUGH, never a swallow: the caller only returns early when
-/// this is true, so a chord that does not fire behaves exactly as it did before DRAGON-479.
+/// this is true, so a chord that does not fire behaves exactly as it did before DRAGON-479. A
+/// press from the settings window, the picker result window / palette viewer, or any other
+/// non-overlay window of ours therefore falls through exactly as it did before it reached this
+/// lane at all, which on those surfaces is the text input's own copy.
 fn region_copy_fires(
     mode: Mode,
     kind: Kind,
     region_drawn: bool,
     busy: bool,
     fallback: bool,
+    on_overlay: bool,
+    color_picking: bool,
 ) -> bool {
-    mode == Mode::Region && kind != Kind::Scanner && region_drawn && !busy && !fallback
+    mode == Mode::Region
+        && kind != Kind::Scanner
+        && region_drawn
+        && !busy
+        && !fallback
+        && on_overlay
+        && !color_picking
 }
 
 /// **Pure**, unit-tested: whether a directional key ([`crate::shortcuts::nudge_direction`])
@@ -1550,15 +1624,78 @@ mod region_copy_tests {
     use super::*;
 
     /// The happy path, and the one shape that produces it: a drawn region, in region mode, in a
-    /// non-scanner kind, with nothing else running, on a native (non-fallback) session.
+    /// non-scanner kind, with nothing else running, on a native (non-fallback) session, from a
+    /// press delivered to a capture overlay, with no colour pick up.
     #[test]
     fn it_fires_only_with_a_drawn_region_in_an_idle_region_capture() {
-        assert!(region_copy_fires(Mode::Region, Kind::Image, true, false, false));
-        assert!(region_copy_fires(Mode::Region, Kind::Video, true, false, false));
+        assert!(region_copy_fires(Mode::Region, Kind::Image, true, false, false, true, false));
+        assert!(region_copy_fires(Mode::Region, Kind::Video, true, false, false, true, false));
         // Nothing drawn yet.
-        assert!(!region_copy_fires(Mode::Region, Kind::Image, false, false, false));
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, false, false, false, true, false));
         // Busy: a countdown or a recording owns the session.
-        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, true, false));
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, true, false, true, false));
+    }
+
+    /// DRAGON-756: a press delivered somewhere OTHER than a capture overlay never fires the
+    /// chord, whatever the rest of the session looks like. That is the whole of the owner's
+    /// report for the settings window and the palette viewer: `self.region` is restored from
+    /// the config at every launch and `mode` defaults to `Region`, so those five state terms
+    /// were satisfied by a launch that had drawn nothing, and a bare Ctrl+C in a text field
+    /// committed a capture.
+    #[test]
+    fn a_press_outside_the_capture_overlays_never_fires() {
+        for mode in [Mode::Region, Mode::Window, Mode::Monitor] {
+            for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
+                for drawn in [true, false] {
+                    for busy in [true, false] {
+                        for picking in [true, false] {
+                            assert!(
+                                !region_copy_fires(
+                                    mode, kind, drawn, busy, false, false, picking,
+                                ),
+                                "{mode:?} / {kind:?} / drawn={drawn} / busy={busy} / \
+                                 picking={picking}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// DRAGON-756: a colour pick never fires it either, and the delivery term cannot cover
+    /// this one. The picker mints the SAME per-output overlays a capture does, so `on_overlay`
+    /// is TRUE for a press on a picker overlay, and the picker carries the remembered region
+    /// it never draws.
+    #[test]
+    fn a_colour_pick_never_fires_the_chord_even_on_its_own_overlay() {
+        for mode in [Mode::Region, Mode::Window, Mode::Monitor] {
+            for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
+                for drawn in [true, false] {
+                    for busy in [true, false] {
+                        assert!(
+                            !region_copy_fires(mode, kind, drawn, busy, false, true, true),
+                            "{mode:?} / {kind:?} / drawn={drawn} / busy={busy}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two DRAGON-756 terms are INDEPENDENT: neither one alone refuses both shapes, which
+    /// is why both are terms. Pinned so a later "simplification" that drops one has to fail
+    /// here rather than in the field.
+    #[test]
+    fn neither_new_term_subsumes_the_other() {
+        // On an overlay, no pick: the happy path, and the only one of the four that fires.
+        assert!(region_copy_fires(Mode::Region, Kind::Image, true, false, false, true, false));
+        // On an overlay, picking: only the pick term refuses it.
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, false, false, true, true));
+        // Off the overlays, no pick: only the delivery term refuses it.
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, false, false, false, false));
+        // Neither holds.
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, false, false, false, true));
     }
 
     /// The SCANNER keeps primary+C for its own "copy recognized text"
@@ -1570,7 +1707,15 @@ mod region_copy_tests {
         for drawn in [true, false] {
             for busy in [true, false] {
                 assert!(
-                    !region_copy_fires(Mode::Region, Kind::Scanner, drawn, busy, false),
+                    !region_copy_fires(
+                        Mode::Region,
+                        Kind::Scanner,
+                        drawn,
+                        busy,
+                        false,
+                        true,
+                        false,
+                    ),
                     "scanner kind must fall through (drawn={drawn} busy={busy})"
                 );
             }
@@ -1582,7 +1727,10 @@ mod region_copy_tests {
     fn only_region_mode_has_a_region_to_copy() {
         for mode in [Mode::Window, Mode::Monitor] {
             for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
-                assert!(!region_copy_fires(mode, kind, true, false, false), "{mode:?} / {kind:?}");
+                assert!(
+                    !region_copy_fires(mode, kind, true, false, false, true, false),
+                    "{mode:?} / {kind:?}"
+                );
             }
         }
     }
@@ -1598,7 +1746,7 @@ mod region_copy_tests {
                 for drawn in [true, false] {
                     for busy in [true, false] {
                         assert!(
-                            !region_copy_fires(mode, kind, drawn, busy, true),
+                            !region_copy_fires(mode, kind, drawn, busy, true, true, false),
                             "{mode:?} / {kind:?} / drawn={drawn} / busy={busy}"
                         );
                     }
@@ -1607,24 +1755,39 @@ mod region_copy_tests {
         }
     }
 
-    /// EVERY combination that is not the happy shape falls through — stated exhaustively, so a
-    /// term added or dropped later cannot quietly widen what the chord swallows. With
-    /// `fallback` false this is the pre-DRAGON-577 native matrix, byte-identical.
+    /// EVERY combination that is not the happy shape falls through, stated exhaustively, so a
+    /// term added or dropped later cannot quietly widen what the chord swallows. The whole
+    /// seven-term truth table since DRAGON-756; with `fallback` false, `on_overlay` true and
+    /// `picking` false this is still the pre-DRAGON-577 native matrix, byte-identical.
     #[test]
     fn every_other_combination_falls_through() {
         for mode in [Mode::Region, Mode::Window, Mode::Monitor] {
             for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
                 for drawn in [true, false] {
                     for busy in [true, false] {
-                        let want = mode == Mode::Region
-                            && kind != Kind::Scanner
-                            && drawn
-                            && !busy;
-                        assert_eq!(
-                            region_copy_fires(mode, kind, drawn, busy, false),
-                            want,
-                            "{mode:?} / {kind:?} / drawn={drawn} / busy={busy}"
-                        );
+                        for fallback in [true, false] {
+                            for on_overlay in [true, false] {
+                                for picking in [true, false] {
+                                    let want = mode == Mode::Region
+                                        && kind != Kind::Scanner
+                                        && drawn
+                                        && !busy
+                                        && !fallback
+                                        && on_overlay
+                                        && !picking;
+                                    assert_eq!(
+                                        region_copy_fires(
+                                            mode, kind, drawn, busy, fallback, on_overlay,
+                                            picking,
+                                        ),
+                                        want,
+                                        "{mode:?} / {kind:?} / drawn={drawn} / busy={busy} / \
+                                         fallback={fallback} / on_overlay={on_overlay} / \
+                                         picking={picking}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }

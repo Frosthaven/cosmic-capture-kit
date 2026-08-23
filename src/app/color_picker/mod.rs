@@ -3,7 +3,7 @@
 //!
 //! # Shape of the feature
 //!
-//! A colour-picker launch is its OWN process, exactly like a capture (`--color-picker`,
+//! A colour-picker launch is its OWN process, exactly like a capture (`color --picker`,
 //! or the tray / preview-editor / global-shortcut entry points, which all spawn that
 //! flag). It mints the SAME per-output overlays a capture launch does, through the same
 //! `app::shell` seam, and only the view and the click handling differ. Nothing here adds
@@ -78,7 +78,7 @@
 //!
 //! # Opening the window WITHOUT picking: the palette viewer (DRAGON-680)
 //!
-//! `--palette-viewer` is the second launch shape of this feature: the same result window,
+//! `color --viewer` is the second launch shape of this feature: the same result window,
 //! opened directly, with no overlay and no pick, so the saved palette can be read and
 //! reused without sampling a pixel first. It reuses the one-window rule above rather than
 //! sitting beside it, and asks for a RAISE instead of sending a colour, because a colour
@@ -286,7 +286,7 @@ pub(crate) const WINDOW_TITLE: &str = "CCK Palette Viewer";
 /// An environment variable rather than a flag because that is how this app already hands a
 /// child a fact about its launch (`CCK_ACTIVE_WIN_ID`, `CCK_ACTIVE_DISPLAY`,
 /// `CCK_SETTINGS_TAB`), and because it is not a user-facing option: a person running
-/// `--color-picker` from a terminal has no editor to name.
+/// `color --picker` from a terminal has no editor to name.
 pub const COLOR_TO_PID_ENV: &str = "CCK_COLOR_TO_PID";
 
 /// Which SAVED PALETTE this pick is for, as the NONCE the picker window minted for its

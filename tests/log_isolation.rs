@@ -69,7 +69,7 @@ impl FakeHome {
     /// log forced on and this fake home in place.
     fn run(&self, extra: &[(&str, &Path)]) -> Output {
         let mut cmd = Command::new(BIN);
-        cmd.args(["--test", "definitely-not-a-test"])
+        cmd.args(["debug", "test", "definitely-not-a-test"])
             .env("CCK_DEBUG_LOG", "1")
             .env("HOME", &self.root)
             .env("XDG_STATE_HOME", self.root.join("state"))
@@ -165,7 +165,7 @@ fn the_path_override_is_honoured_but_never_into_the_user_s_folder() {
 fn a_child_with_the_log_off_writes_nowhere() {
     let home = FakeHome::new("off");
     let out = Command::new(BIN)
-        .args(["--test", "definitely-not-a-test"])
+        .args(["debug", "test", "definitely-not-a-test"])
         .env("CCK_DEBUG_LOG", "0")
         .env("HOME", &home.root)
         .env("XDG_STATE_HOME", home.root.join("state"))

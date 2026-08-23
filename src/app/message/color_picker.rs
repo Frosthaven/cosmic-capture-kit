@@ -146,7 +146,7 @@ pub enum ColorPickerMsg {
     /// there.
     CopyValue,
     /// DRAGON-587: the pipette on the recents row — start a NEW pick, exactly as launching
-    /// the tool does. Spawns a detached `--color-picker` child, the same route the tray entry
+    /// the tool does. Spawns a detached `color --picker` child, the same route the tray entry
     /// and the preview editor's own pipette take.
     PickAgain,
     /// DRAGON-680 item 24: open or close the colour history's context menu over the swatch
@@ -330,7 +330,7 @@ pub enum ColorPickerMsg {
     /// colour lands DIRECTLY in group `usize`, never on the main tool swatch.
     ///
     /// The pick is its own process, so the handler mints a nonce, snapshots the group's
-    /// identity beside it, and spawns the ordinary `--color-picker` child with
+    /// identity beside it, and spawns the ordinary `color --picker` child with
     /// `COLOR_TO_PALETTE_ENV` set; the child delivers back over the picker IPC's tagged
     /// `color` verb and this window appends through the one shared append. See
     /// `PickDestination::PickerPalette` for what the child deliberately does NOT do

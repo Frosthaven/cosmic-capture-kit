@@ -6649,6 +6649,25 @@ mod tests {
         assert_eq!(stroke_width_nearest_index(100.0), 6); // huge → thickest
     }
 
+    /// DRAGON-703: the LIVE recording ink is this module's Thin line preset, by owner decision.
+    ///
+    /// [`crate::ink::WIDTH_PT`] is the one weight the Marker and Magic Marker draw at while a
+    /// recording runs, and it has no picker of its own, so the number has to come from
+    /// somewhere. The owner's answer is that it comes from here. The two constants sit in
+    /// different trees (`crate::ink` is the pure model, compiled everywhere; this module is
+    /// private to `app`, which is why `WIDTH_PT`'s own doc names it in prose and cannot link
+    /// it), so nothing but this test makes them one number. The test lives on THIS side of the
+    /// pair because the visibility only runs one way.
+    #[test]
+    fn live_recording_ink_is_the_editors_thin_line_preset() {
+        assert_eq!(crate::ink::WIDTH_PT, DEFAULT_ANNOT_STROKE);
+        // "Thin line" is `preview::chrome`'s label for the THIRD rung (its `minus-4` glyph), so
+        // pin the rung as well as the value: a re-ordered ladder would otherwise re-point the
+        // live ink at a differently named preset without changing a number anywhere.
+        assert_eq!(stroke_width_nearest_index(crate::ink::WIDTH_PT), 2);
+        assert_eq!(STROKE_WIDTHS[2], DEFAULT_ANNOT_STROKE);
+    }
+
     /// DRAGON-447: the line-width guarantee, pinned rather than assumed. Every platform
     /// resolves a REAL per-output scale into `PreviewState::source_scale` (COSMIC buffer
     /// scale / macOS backing scale / Windows `GetDpiForMonitor`), so the points↔source-px
@@ -8577,10 +8596,13 @@ mod tests {
         assert!(pen_pressure(&[vec![0.5]], paths, 0).is_empty());
     }
 
+    /// DRAGON-691 amendment 2, item 3: the bake's ribbon ends in a ROUND CAP at the stroke's
+    /// full weight. This replaces the test that pinned the old pinched tip, and it is checked
+    /// in the RASTER because that is where the owner sees it.
     #[test]
-    fn the_bake_tapers_its_tips_and_covers_its_centerline() {
+    fn the_bake_rounds_its_tips_and_covers_its_centerline() {
         // Bake parity sanity: the rasterized ribbon covers the centerline it was traced along,
-        // and the tapered TIP is measurably thinner than the body.
+        // and the END carries the body's weight rather than tapering away.
         let items = vec![pen(1, [255, 0, 0, 255], 8.0, &[&[(10.0, 40.0), (70.0, 40.0)]])];
         let img = rasterize_scene(&items, 80, 80, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("raster");
         for x in [12u32, 25, 40, 55, 68] {
@@ -8591,8 +8613,11 @@ mod tests {
         let mid = thickness(40);
         let tip = thickness(11);
         assert!(mid >= 7, "the body inks at about the 8px preset: {mid}");
-        assert!(tip < mid, "the tip is pinched: {tip} vs {mid}");
-        assert!(tip > 0, "…but never vanishes");
+        assert!(tip >= mid - 1, "the end is as thick as the body: {tip} vs {mid}");
+        // ROUND, not square: the cap reaches past the last point along the stroke, and its
+        // corner is cut away.
+        assert!(img.get_pixel(72, 40).0[3] > 0, "the cap does not stop at the last point");
+        assert!(img.get_pixel(73, 44).0[3] == 0, "the corner is rounded off, not square");
         // Nothing inks outside the ribbon's width ceiling.
         assert_eq!(img.get_pixel(40, 40 - 7).0[3], 0, "no ink past max_width/2");
     }

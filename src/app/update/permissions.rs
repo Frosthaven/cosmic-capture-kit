@@ -22,7 +22,7 @@ impl App {
                     let mut cmd = std::process::Command::new(exe);
                     // Reopen straight back into the permission window so the user sees
                     // the (now-applied) grant land green, and can grant the rest.
-                    cmd.arg("--permissions");
+                    cmd.arg("permissions");
                     match cmd.spawn() {
                         Ok(child) => log::info!("permissions: relaunched (pid {})", child.id()),
                         Err(e) => log::warn!("permissions: relaunch failed: {e}"),
@@ -38,19 +38,28 @@ impl App {
             // daemon would eventually see the grant, but restarting guarantees the running
             // daemon uses it immediately (and clears any stale AX server connection) — the
             // same SIGTERM + detached-respawn the hotkey-change flow uses (the respawn
-            // comes up as a daemon because `resident` is persisted on; the mac lock retry
+            // comes up as a daemon because it is launched with `tray`; the mac lock retry
             // makes it race-safe).
             PermissionsMsg::RestartDaemon => {
                 #[cfg(target_os = "macos")]
                 {
                     // Only respawn if a daemon was actually running (the SIGTERM landed):
-                    // otherwise a bare respawn could bring a daemon up when the user has
-                    // residency off. The respawn re-reads `resident` at startup, so it
-                    // comes up as a daemon only when residency is on.
+                    // otherwise this would bring a daemon up when the user has residency off.
+                    //
+                    // DRAGON-695: the respawn now says `tray` OUT LOUD rather than relying on
+                    // a bare launch re-reading the `resident` setting. Two reasons. It states
+                    // what this button means, which is "restart the daemon" and never anything
+                    // else; and a bare launch is no longer a synonym for it, since with the
+                    // setting off a bare GUI launch opens the settings window. The guard above
+                    // already establishes that a daemon was running, so the explicit word can
+                    // never raise one the user does not want.
                     if crate::instance::signal_daemon_quit() {
                         log::info!("permissions: signalled the daemon to restart for Accessibility");
                         if let Ok(exe) = std::env::current_exe() {
-                            match std::process::Command::new(&exe).spawn() {
+                            match std::process::Command::new(&exe)
+                                .arg(crate::instance::TRAY_ARG)
+                                .spawn()
+                            {
                                 Ok(child) => {
                                     log::info!("permissions: respawned daemon (pid {})", child.id())
                                 }

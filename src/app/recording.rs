@@ -157,23 +157,48 @@ impl App {
     /// The active encoder family's speed/quality preset, for the metadata line:
     /// the NVENC `p1`–`p7` ladder, the x264 named ladder, or VAAPI's compression
     /// level (`cl3`; `cl-default` when left to the driver).
+    ///
+    /// The table itself is `encode::session_preset_label` (DRAGON-754), because the Windows
+    /// worker rewrites this field once it knows which tier won and the two must not be able
+    /// to disagree. The strings are unchanged.
     fn preset_label(&self, encoder: &str) -> String {
-        match encoder {
-            "nvenc" => self.nvenc_preset.clone(),
-            "software" => self.x264_preset.clone(),
-            "vaapi" => match self.vaapi_compression_level {
-                -1 => "cl-default".to_string(),
-                cl => format!("cl{cl}"),
-            },
-            _ => "-".to_string(),
-        }
+        crate::encode::session_preset_label(encoder, &self.presets())
     }
 
     /// One-line, parseable metadata describing how a recording was made — embedded in
-    /// the file (mp4 `comment`) and read back by `--inspect`. Starts with the app name.
+    /// the file (mp4 `comment`) and read back by `debug inspect`. Starts with the app name.
     /// `codec=auto` is annotated with the RESOLVED codec by the finalize pass (the
     /// encode plan picks H.264 vs HEVC only once the first frame fixes the dims).
-    pub(super) fn recording_metadata(&self) -> String {
+    /// `via_portal` is which worker is ACTUALLY about to run, not which one the settings
+    /// asked for (DRAGON-718). Its two callers are the two spawn sites, and each one knows
+    /// the answer for certain because it IS the answer.
+    ///
+    /// It used to re-derive the source from the saved choice through
+    /// `source_label` -> `active_record_backend`, which resolves the portal on
+    /// `recording_uses_portal() && pipewire_available`. Those terms can both be true while
+    /// the recording runs on screencopy, and for a pinned `--monitor` launch they reliably
+    /// were: the file claimed `source=pipewire` for a screencopy recording. A metadata
+    /// field that reports an intention rather than an event is worse than no field, because
+    /// it is the thing a later investigation trusts.
+    ///
+    /// `encoder=` and `preset=` are the two fields WINDOWS does not fill in here
+    /// (DRAGON-754). Naming the resolved tier means asking `effective_encoder`, which walks
+    /// `encode::device::available_encoders`, and on Windows every tier in that walk costs a
+    /// real ffmpeg probe-ENCODE: measured on the owner's box at 1.1 to 1.3s warm and about
+    /// 2.35s cold, paid on the UI thread inside the record control's own click handler, which
+    /// is the 1 to 2 second freeze the user reported. Both callers are the worker spawn, so
+    /// the honest answer is the WORKER's: it resolves the plan on its own thread moments
+    /// later and rewrites both fields through `record::annotate_session_encoder`. What this
+    /// writes on Windows is the REQUEST, so a line that somehow reaches disk un-annotated
+    /// still says something true rather than nothing.
+    ///
+    /// Linux and macOS are untouched and byte-identical. Their encoder resolution is a device
+    /// node check plus the cached `ffmpeg -encoders` read, so there is no freeze to fix and no
+    /// reason to move the answer away from the one place that has always given it.
+    pub(super) fn recording_metadata(&self, via_portal: bool) -> String {
+        #[cfg(windows)]
+        let encoder = self.encoder_requested();
+        #[cfg(not(windows))]
         let encoder = self.effective_encoder();
         let encoder = encoder.as_str();
         let audio = match (self.mic_armed(), self.record_system_audio) {
@@ -186,7 +211,7 @@ impl App {
         format!(
             "Cosmic Capture Kit | type=video | source={} | mode={} | encoder={} | \
              preset={} | codec={} | zero_copy={} | max_res={} | fps={} | bitrate={}k | audio={}",
-            self.source_label(),
+            if via_portal { "pipewire" } else { "cosmic" },
             self.mode_label(),
             encoder,
             self.preset_label(encoder),
@@ -294,7 +319,7 @@ impl App {
     /// nvenc / vaapi / software, so the three added arms are unreachable there.
     pub(super) fn effective_encoder(&self) -> String {
         match self.preferred_encoder().as_str() {
-            id @ ("nvenc" | "vaapi" | "amf" | "qsv" | "videotoolbox" | "software") => {
+            id @ ("nvenc" | "vaapi" | "amf" | "qsv" | "mf" | "videotoolbox" | "software") => {
                 id.to_string()
             }
             _ => self
@@ -459,8 +484,19 @@ impl App {
         if self.overlay_fallback_active() {
             self.snapshot_preview_anchor(&sel);
         }
+        // DRAGON-693: decide this session's annotation TIER and, for the two tiers that mint
+        // their own armed window, snapshot the recorded output's geometry. Here for exactly the
+        // same reason the preview anchor is: `recreate_active_overlays` below takes every
+        // surface AND `self.outputs` with it on the fallback path, and by the time the user
+        // arms a tool there is nothing left to ask.
+        self.begin_ink_session();
         // Keep the ORIGINAL selection for the overlay/border + toolbar anchor.
         self.pending = Some(sel);
+        // DRAGON-745: decide whether the in-frame toolbar is hidden for this take, HERE, one
+        // statement before the file is allowed to begin. Every input it reads was resolved by
+        // the line above; see `resolve_recording_toolbar` for why the answer may not wait for
+        // the settle.
+        self.resolve_recording_toolbar();
         // DRAGON-673: SAY GO. This is the instant the app begins claiming to record, so it is
         // the instant a countdown's prewarmed worker is released to stamp media 0 — the file
         // and the claim then start together by construction, with nothing predicting either.
@@ -470,13 +506,19 @@ impl App {
         self.open_countdown_gate();
         // DRAGON-659: adopt a worker that is ALREADY settled here rather than up to one 100ms
         // poll later, so the tray and the elapsed anchor never lag a recording that is
-        // already live. It also runs `begin_recording_tray` BEFORE the overlay rebuild below,
-        // so `tray_hides_toolbar` is settled when the input regions are cut.
+        // already live.
         //
         // DRAGON-673 made that the RARE case rather than the countdown's normal one: the gate
-        // was opened one statement ago and the worker settles a few milliseconds after it, so
-        // a countdown session usually adopts on the next `RecordingPoll`, which handles the
-        // tray rebuild it owes. Nothing here waits for the worker either way.
+        // was opened one statement ago, so the worker has only just passed media 0 and has a
+        // whole opening phase still to run (DRAGON-725, 30ms to 2.2s measured on Linux). A
+        // countdown session therefore adopts on a later `RecordingPoll`. Nothing here waits
+        // for the worker either way.
+        //
+        // DRAGON-745: it no longer matters to the TOOLBAR which of the two happens. This used
+        // to be the line that ran `begin_recording_tray` before the rebuild below, so that
+        // `tray_hides_toolbar` was settled when the input regions were cut; the visibility
+        // answer is resolved at promotion now, so the rebuild below always reads the final
+        // one whether or not the worker has settled.
         self.adopt_warm_start();
         // Recreate the overlay click-through except the toolbar's region so the
         // recorded apps stay usable. (A no-op rebuild from the countdown, which is
@@ -617,7 +659,7 @@ impl App {
                 // only); manual mode keeps the offset above exactly as set (DRAGON-119).
                 auto_device_compensation: self.audio_sync_auto,
                 max_res: (max_w, max_h),
-                metadata: self.recording_metadata(),
+                metadata: self.recording_metadata(true),
                 out_path: out_path.to_path_buf(),
             },
         })
@@ -677,48 +719,60 @@ impl App {
                 // only); manual mode keeps the offset above exactly as set (DRAGON-119).
                 auto_device_compensation: self.audio_sync_auto,
                 max_res: (max_w, max_h),
-                metadata: self.recording_metadata(),
+                metadata: self.recording_metadata(false),
                 out_path: out_path.to_path_buf(),
             },
         })
     }
 
-    /// DRAGON-659/661: adopt the worker's SETTLED signal, once per recording. Returns whether
-    /// this call is the one that made the recording LIVE.
+    /// DRAGON-659/661: adopt the worker's bring-up signals, once per recording.
     ///
-    /// `settled_at` — the end of the worker's opening phase — answers BOTH questions since
-    /// DRAGON-672/673, because it is MEDIA 0:
+    /// It used to RETURN whether this call is the one that made the recording live, and both
+    /// callers now ignore that: DRAGON-745 deleted the settle-time overlay rebuild that was
+    /// the only reader, because the toolbar's visibility is resolved at promotion and the
+    /// input regions are already correct by the time this runs.
     ///
-    /// * it is the LIVE DECLARATION: the tray's "Recording" state, the same claim the record
-    ///   chip's STOP face makes. DRAGON-661 moved that here from `warm_at`, which fires at the
-    ///   START of a bring-up with the audio pre-flight, the ffmpeg spawn and the opening
-    ///   catch-up still to come, so an icon saying "Recording" through 600ms of setup was
-    ///   telling the user something not yet true.
-    /// * it is also the ELAPSED ANCHOR, where the file begins. That half used to read
-    ///   `warm_at`, on the premise that the confirmed first frame is where the file's content
-    ///   starts. It no longer is: media 0 is the settled pipeline (DRAGON-672), and with the
-    ///   worker spawned at countdown START (DRAGON-673) the first frame precedes the file by
-    ///   the WHOLE countdown. The owner saw it immediately: a 10s countdown's recording armed
-    ///   its readout at about 0:10 and he cancelled the take.
+    /// TWO signals answering two questions (DRAGON-725; see [`warm_adoption`] for why one
+    /// could not serve both):
+    ///
+    /// * `settled_at`, the end of the worker's opening phase, is the LIVE DECLARATION: the
+    ///   tray's "Recording" state, the same claim the record chip's STOP face makes.
+    ///   DRAGON-661 moved that here from `warm_at`, which fires at the START of a bring-up
+    ///   with the audio pre-flight, the ffmpeg spawn and the opening catch-up still to come,
+    ///   so an icon saying "Recording" through 600ms of setup was telling the user something
+    ///   not yet true.
+    /// * `media_zero_at` is the ELAPSED ANCHOR, where the file begins. That half read
+    ///   `warm_at` until DRAGON-673 (the worker spawns at countdown START, so the first
+    ///   frame precedes the file by the WHOLE countdown, and a 10s countdown armed its
+    ///   readout at about 0:10) and `settled_at` until DRAGON-725 (which is 328 to 480ms
+    ///   past media 0, so the readout undercounted the delivered file by that much and every
+    ///   live ink stroke was stamped that far early).
     ///
     /// The anchor is still the WORKER's own timestamp, never a fresh `Instant::now()`, so the
     /// readout cannot drift by a poll's cadence.
     ///
-    /// Each half keeps its own latch and neither waits for the other's. `recording_started`
-    /// latches the anchor. `recording_live_declared` latches the tray, and it has to be its
-    /// own field rather than `self.tray`: a Linux session with no SNI host leaves that
-    /// `None` even though the tray was raised as far as it can be, and keying on it would
-    /// re-run this every 100ms for the whole recording.
-    pub(super) fn adopt_warm_start(&mut self) -> bool {
+    /// Each half keeps its own state and neither waits for the other's.
+    /// `recording_live_declared` latches the tray, and it has to be its own field rather
+    /// than `self.tray`: a Linux session with no SNI host leaves that `None` even though the
+    /// tray was raised as far as it can be, and keying on it would re-run this every 100ms
+    /// for the whole recording. The anchor is not a latch: `recording_started` is passed in
+    /// as a VALUE and re-adopted whenever the worker's media 0 differs from it (DRAGON-730,
+    /// the Linux zero-copy fallback), which is why this is not simply `is_some()`.
+    pub(super) fn adopt_warm_start(&mut self) {
         let (anchor, declare_live) = warm_adoption(
-            self.recording_started.is_some(),
+            self.recording_started,
             self.recording_live_declared,
+            self.media_zero_instant(),
             self.settled_instant(),
         );
         // Both marks land on the SAME timeline as the workers' own (`rec/sck: first frame`,
         // `rec/sck: opening covered ...`), so one debug log shows the whole start: when the
         // file's content begins, and when the UI began claiming to be live. That pair is
         // what DRAGON-661 was diagnosed from, and it is what a re-check needs.
+        // Normally once per recording. TWICE on a Linux zero-copy attempt that declined and
+        // handed the session to the CPU worker (DRAGON-730): the second pair of lines is the
+        // successor's real media 0 replacing the abandoned attempt's, and seeing both is the
+        // point, because a fallback silently re-timing a recording is what went wrong.
         if let Some(at) = anchor {
             self.recording_started = Some(at);
             crate::util::timing_mark("ui: elapsed anchor adopted (media 0)");
@@ -736,13 +790,31 @@ impl App {
                     at.saturating_duration_since(warm).as_secs_f64() * 1000.0,
                 );
             }
+            // DRAGON-745's net, and the reason this ticket needed one: the defect was a pure
+            // ORDERING mistake between two instants nothing compared, so it was invisible for
+            // as long as it existed and was only ever going to be found by a user watching
+            // their own recording back. This is the comparison, made once per recording, the
+            // moment both instants exist. Reading the toolbar's own hidden flag rather than
+            // re-deriving it, so a future change that moves the resolve back onto the settle
+            // path fires this whatever route it takes.
+            if toolbar_reached_the_file(self.tray_hides_toolbar, self.toolbar_resolved_at, at) {
+                let late = self
+                    .toolbar_resolved_at
+                    .map(|r| r.saturating_duration_since(at).as_secs_f64() * 1000.0)
+                    .unwrap_or_default();
+                log::error!(
+                    "recording toolbar: the bar was hidden {late:.0}ms AFTER media 0, so the \
+                     opening of this file carries a toolbar the user asked to have hidden \
+                     (DRAGON-745); the answer belongs at promotion, in \
+                     App::resolve_recording_toolbar",
+                );
+            }
         }
         if declare_live {
             self.recording_live_declared = true;
             crate::util::timing_mark("ui: recording declared live (settled)");
             self.begin_recording_tray();
         }
-        declare_live
     }
 
     /// The live recording worker's confirmed first-frame instant (DRAGON-657's
@@ -753,6 +825,16 @@ impl App {
         self.recording
             .as_ref()
             .and_then(|r| r.warm_at.lock().ok().and_then(|g| *g))
+    }
+
+    /// The live recording worker's MEDIA 0 (DRAGON-725's `RecordHandle::media_zero_at`):
+    /// where the delivered file begins. `None` until the worker has anchored its clock,
+    /// which is after [`Self::warm_instant`] and before [`Self::settled_instant`] on every
+    /// worker and every platform.
+    fn media_zero_instant(&self) -> Option<std::time::Instant> {
+        self.recording
+            .as_ref()
+            .and_then(|r| r.media_zero_at.lock().ok().and_then(|g| *g))
     }
 
     /// The live recording worker's SETTLED instant (DRAGON-661's
@@ -871,8 +953,8 @@ impl App {
     /// raised fresh here and dropped in `end_recording_tray`.
     fn begin_recording_tray(&mut self) {
         // DRAGON-583: open this recording to control commands from other processes, so a
-        // desktop global hotkey bound to `--toggle-mic` / `--pause-recording` /
-        // `--finish-recording` / `--cancel-recording` / `--toggle-system-audio` can reach
+        // desktop global hotkey bound to `record --sound mic` / `record --action pause` /
+        // `record --action save` / `record --action cancel` / `record --sound system` can reach
         // it. Bound BEFORE the tray, and deliberately independent of it: a sandboxed child
         // often fails to register a tray item at all, and that is exactly the session where
         // these commands are the only control the user has left. A bind failure costs only
@@ -905,14 +987,6 @@ impl App {
                 self.delay_idx,
             );
         }
-        // DRAGON-174: the ONLY thing that hides the in-frame toolbar now is the user's
-        // "hide toolbar on full screen captures" setting AND a capture the toolbar can't
-        // fit outside of. Nothing about the tray/icon depends on this (the icon ALWAYS
-        // carries the controls); daemon-attached no longer implies hiding.
-        self.tray_hides_toolbar = toolbar_hidden(
-            self.hide_toolbar_fullscreen,
-            self.recording_toolbar_oversized(),
-        );
         // Push-to-talk: the mic (armed via `mic_armed`) starts muted (an off event at
         // t≈0), so it's only audible while the hotkey is held (which logs on/off around
         // the held span).
@@ -922,6 +996,111 @@ impl App {
         }
     }
 
+    /// DRAGON-745: settle whether this recording shows an in-frame toolbar. Called ONCE, from
+    /// [`App::start_recording`], at PROMOTION, one statement before `open_countdown_gate` lets
+    /// the file begin.
+    ///
+    /// # Why it is here and not in `begin_recording_tray`, where it lived
+    ///
+    /// It used to sit inside [`App::begin_recording_tray`], and that function runs
+    /// on the worker's SETTLE (DRAGON-659/661 moved it there so the tray's "Recording" claim
+    /// would be honest). Nothing moved the VISIBILITY answer with it, and the two instants are
+    /// not the same instant: the file begins at `owned::media_zero()` and the settle is the END
+    /// of the worker's opening phase, DRAGON-725's whole finding. So a session that had already
+    /// decided to hide the bar DREW it for the entire opening phase, into a file that had
+    /// already started, and then deleted it. The owner: "i noticed that during one monitor
+    /// recording it recorded part of the toolbar during its warmup animation before it
+    /// vanished ... if we have toolbar set to hide, how the fuck is it visible during a
+    /// recording?"
+    ///
+    /// Measured on the owner's own box, ten sessions on 2026-08-20, media 0 to this answer:
+    /// 35, 44, 122, 137, 705, 1025, 1395, 2084, 2155 and 2199 ms. Three of them were
+    /// `record --monitor` with the bar hidden, so those three files each open with 137ms to
+    /// 2199ms of visible toolbar. Two cleared [`WARM_SPINNER_REVEAL_DELAY`] and held past
+    /// [`WARM_SPINNER_MIN_HOLD`], which is why the SPINNER is what the owner saw recorded. The
+    /// span is load-driven and has no upper bound.
+    ///
+    /// DRAGON-740 predicted this one in `capture_footprint`'s own rustdoc, from the other side
+    /// of the same seam: "A visibility rule that fires part-way into a session will always read
+    /// as a disappearance rather than as a setting."
+    ///
+    /// # Why promotion is early enough, and why nothing else moved
+    ///
+    /// Every input is a property of the SESSION, and all of them are resolved by the time
+    /// `start_recording` reaches this call: the user's setting, `self.mode`, `self.pending`
+    /// (set one line earlier), `App::portal_window_anchor` (ONE sample, taken at grant time,
+    /// DRAGON-735) and `self.outputs`. None of them can change at the settle, so this is the
+    /// same answer, earlier.
+    ///
+    /// The three things deliberately NOT moved with it, because only this one is about the
+    /// file's contents:
+    ///
+    /// * media 0 stays exactly where it is (DRAGON-725, DRAGON-730). The bug is not that the
+    ///   file starts too early; it is that the screen was still wrong when it did.
+    /// * the TRAY raise, the "Recording" state and the `record --action` control inlet stay on
+    ///   the settle, all of them DRAGON-661's, all of them claims about liveness.
+    /// * nothing is cropped and no frame is trimmed. That would change what the user gets.
+    ///
+    /// # What the user gives up during bring-up, which is nearly nothing
+    ///
+    /// On a session that hides the bar there is now no in-frame surface from promotion to
+    /// settle, where before there was one from promotion to settle and none after. STOP and
+    /// CANCEL are unaffected: the record chip is not pressable while warming
+    /// (`ChipFace::Warming`) and the control inlet is raised in `begin_recording_tray`, so
+    /// neither existed during bring-up before this change either. What is actually lost is the
+    /// mic and system-audio toggles and the ink arm, for that span, on a session where they
+    /// were about to vanish for the whole take. The warming spinner goes with them, which is
+    /// the point: it was the thing being recorded.
+    ///
+    /// # Which platforms this was actually VISIBLE on, and why it is fixed for all of them
+    ///
+    /// The bar can only reach a file whose capture is a crop of the SCREEN and which carries
+    /// our own surfaces. That is Linux, and in the field it is Linux alone: DRAGON-690 already
+    /// keeps our overlays out of the other two, through the SCK filter's
+    /// `initWithDisplay:excludingWindows:` list on macOS and `WDA_EXCLUDEFROMCAPTURE` per
+    /// placed overlay on Windows, and Wayland offers no per-surface equivalent for the
+    /// screencopy path.
+    ///
+    /// It is still fixed HERE, on the shared path, and not behind a platform seam. A seam
+    /// would buy macOS and Windows a few hundred milliseconds more toolbar during bring-up, on
+    /// sessions where the user has asked for no toolbar, at the price of the same setting
+    /// meaning two different things on two platforms and of a new `cfg` in a rule that has
+    /// none. Uniform is the simpler answer and the honest one.
+    ///
+    /// The WINDOW cases, for the same reason, need no arm of their own. A portal window cast,
+    /// a macOS SCK window recording and a Windows WGC window recording all deliver the
+    /// toplevel's OWN buffer, so no surface of ours is in those frames whatever the timing
+    /// (`platform::window_capture_excludes_overlays_with`, DRAGON-736). A NATIVE screencopy
+    /// window recording crops the screen, so it is the one window route that could carry the
+    /// bar, and it only ever hides it when the bar has no room clear of the recorded window,
+    /// which is exactly the case this call now answers in time.
+    fn resolve_recording_toolbar(&mut self) {
+        // DRAGON-174: the ONLY thing that hides the in-frame toolbar now is the user's
+        // "hide toolbar on full screen captures" setting AND a capture the toolbar can't
+        // fit outside of. Nothing about the tray/icon depends on this (the icon ALWAYS
+        // carries the controls); daemon-attached no longer implies hiding.
+        let cant_fit_outside = self.recording_toolbar_oversized();
+        self.tray_hides_toolbar = toolbar_hidden(self.hide_toolbar_fullscreen, cant_fit_outside);
+        // DRAGON-745: when the answer was applied, for the net in `adopt_warm_start`. Our own
+        // clock, not the worker's, and deliberately the same kind of instant media 0 is, so
+        // the two are comparable.
+        self.toolbar_resolved_at = Some(std::time::Instant::now());
+        // DRAGON-740: say what this decided and why. It deletes the in-frame toolbar from a
+        // LIVE recording and used to leave no trace at all, so diagnosing the vanish took a
+        // read of the user's saved settings beside the log. Behaviour only, no geometry:
+        // the two inputs and the answer.
+        log::debug!(
+            "recording toolbar: {}; hide-on-full-screen {}, room outside the capture {}",
+            if self.tray_hides_toolbar {
+                "HIDDEN, the tray carries the controls"
+            } else {
+                "shown in frame"
+            },
+            if self.hide_toolbar_fullscreen { "on" } else { "off" },
+            if cant_fit_outside { "none" } else { "yes" },
+        );
+    }
+
     /// Drop the recording status icon when the recording ends (DRAGON-182): the own
     /// icon exists ONLY while a recording is live, so it comes down with the
     /// recording (a daemon relay drop likewise reverts the resident to its own idle
@@ -929,6 +1108,9 @@ impl App {
     pub(super) fn end_recording_tray(&mut self) {
         self.tray = None;
         self.tray_hides_toolbar = false;
+        // DRAGON-745: and the instant that answer was applied, which only means anything for
+        // as long as the recording it was answered for.
+        self.toolbar_resolved_at = None;
         // DRAGON-583: the control inlet has the same lifetime as the icon it sits beside:
         // there is no recording left to command. Dropping it unlinks the socket, so a
         // command sent a moment later reports "no recording is in progress" instead of
@@ -945,6 +1127,7 @@ impl App {
     pub(super) fn drop_session_icon(&mut self) {
         self.tray = None;
         self.tray_hides_toolbar = false;
+        self.toolbar_resolved_at = None;
         // DRAGON-583: and the control inlet, on the same terms. `finish_session` exits
         // through `iced::exit`, which runs no destructor, so the socket file this misses is
         // the one `instance::sweep_stale_markers` clears on the next launch, exactly like
@@ -1001,11 +1184,15 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Whether the recording toolbar can't fit OUTSIDE the captured area — the case
+    /// Whether the recording toolbar can't fit OUTSIDE the captured area, which is the case
     /// the tray placement is for. Always true for a full-screen monitor capture; for a
-    /// region / window it's true only when the toolbar's own placement overlaps the
-    /// captured rect (i.e. it had to fall back inside — the region is too large to
+    /// region or a window it's true only when the toolbar's own placement overlaps the
+    /// captured rect (i.e. it had to fall back inside, the region being too large to
     /// leave room around it). Runs at recording start (`self.pending` = the capture).
+    ///
+    /// DRAGON-740: WHICH rect it measures is [`capture_footprint`]'s decision now, and that
+    /// function carries the whole argument. The short version is that this predicate and
+    /// [`App::toolbar_layout`] are two halves of one question and they had drifted apart.
     fn recording_toolbar_oversized(&self) -> bool {
         if self.mode == Mode::Monitor {
             return true;
@@ -1014,29 +1201,44 @@ impl App {
         let Some(sel) = self.pending.as_ref() else {
             return false;
         };
-        // A portal-picked window commits a 1×1 placeholder (the portal never
-        // reports the window's geometry — see `portal_for_mode`), so the overlap
-        // check below can't see the real footprint. Treat it as oversized, like
-        // Monitor: the picked window may well be maximized, and the toolbar can't
-        // anchor beside a rect it doesn't know.
-        if self.mode == Mode::Window && sel.width <= 1 && sel.height <= 1 {
+        // DRAGON-740: a PORTAL window pick commits a 1x1 placeholder, so the selection is a
+        // footprint of nothing and the overlap check below cannot use it. The real rect,
+        // when the compositor could name it, comes through the very same
+        // `portal_window_anchor` the toolbar's own placement reads (DRAGON-735). Sharing
+        // that ONE answer is the point of routing it through here.
+        //
+        // `portal_window_cast` and not `selection::target_unlocated` directly, even though
+        // on Linux it is exactly that: its `cfg` arm makes the whole question a compile-time
+        // `false` on macOS and Windows, so those two keep their old answer BY CONSTRUCTION
+        // rather than on the strength of "our own window picker always fills `window_id`".
+        // Which is true, and is not the kind of thing a cross-platform guarantee should rest
+        // on when a free one is available.
+        let Some((fx, fy, fw, fh)) = capture_footprint(
+            self.portal_window_cast(),
+            self.portal_window_anchor(),
+            (sel.x, sel.y, sel.width, sel.height),
+        ) else {
+            // A portal window cast nothing could place: the footprint is genuinely unknown
+            // and the picked window may well be maximized, so treat it as oversized, like
+            // Monitor. This is the ONLY case the old blanket `return true` was ever
+            // entitled to, and it is what survives.
             return true;
-        }
+        };
         // The toolbar overlaps the capture on the output it sits on → no outside room.
         self.outputs.iter().any(|o| {
             let Some((tb, _)) = self.toolbar_layout(o) else {
                 return false;
             };
-            // `toolbar_layout` returns output-local POINTS while the selection is CAPTURE
-            // space, so bring the SELECTION into this output's point space to compare
-            // (DRAGON-448 — the old shift-the-toolbar-to-global direction compared a point
+            // `toolbar_layout` returns output-local POINTS while the footprint is CAPTURE
+            // space, so bring the FOOTPRINT into this output's point space to compare
+            // (DRAGON-448: the old shift-the-toolbar-to-global direction compared a point
             // rect against a physical one on a scaled Windows monitor).
             let units = o.units();
-            let (cx, cy) = units.to_point((sel.x, sel.y));
+            let (cx, cy) = units.to_point((fx, fy));
             // The pair form of `len_to_point`; on the letterbox fallback bridge
             // (`lab/flatpak`) `to_point` above already carried the bar offsets, and the
             // extent scales uniformly. Identical arithmetic everywhere else.
-            let (cw, ch) = units.size_f_to_point((sel.width as f32, sel.height as f32));
+            let (cw, ch) = units.size_f_to_point((fw as f32, fh as f32));
             let overlap_x = tb.x < cx + cw && tb.x + tb.width > cx;
             let overlap_y = tb.y < cy + ch && tb.y + tb.height > cy;
             overlap_x && overlap_y
@@ -1109,8 +1311,10 @@ impl App {
     /// The ONE place that says what "no longer recording" means, shared by the ordinary end
     /// (`RecordingPoll` seeing a result) and by giving up on a wedged one, so the two cannot
     /// drift. `recording_path` is deliberately NOT cleared here: what happens to the temp
-    /// differs between them (deleted after a normal finalize, already salvaged after a
-    /// wedge), and that difference is exactly what must not be laundered.
+    /// differs between them (dropped by the finalize pass itself after a normal delivery,
+    /// DRAGON-748, with the poll's own unlink standing behind it; already salvaged into a
+    /// `-recovered.mkv` after a wedge), and that difference is exactly what must not be
+    /// laundered.
     pub(super) fn clear_recording_state(&mut self) {
         self.recording = None;
         // DRAGON-322: the recording ended (this process lives on into the video preview) —
@@ -1129,10 +1333,18 @@ impl App {
         self.recording_paused_accum = std::time::Duration::ZERO;
         self.recording_stopping = false;
         self.recording_progress = None;
+        // DRAGON-728: the finalize pass clears its own slot when it returns, but the poll that
+        // reads it stops on this very transition, so the app's cached copy has to go here or
+        // the preview would keep showing the last phase for the whole poster extraction.
+        self.recording_finalize = None;
         self.recording_out_path = None;
         self.end_recording_tray();
         self.mic_level = 0.0;
         self.sys_level = 0.0;
+        // DRAGON-694: a take stopped with a drawing tool still armed must not leave the
+        // owner's music paused into the editor. `self.recording` is already `None` above, so
+        // this releases; it is a no-op on every session that never held the guard.
+        self.sync_ink_duck();
     }
 
     /// Feed the session-level bound one observation (DRAGON-423), from the recording poll.
@@ -1237,6 +1449,14 @@ impl App {
         // worker is free to clear that one, and one that did is what left a recording
         // running behind a spinner nobody could dismiss.
         self.recording_stopping = true;
+        // DRAGON-694: nothing is annotated once stop is pressed, so the media guard lets go
+        // here rather than at the end of finalize (seconds later on a long take). Reads the
+        // flag just set, so it must follow it. A no-op unless the guard is actually held.
+        self.sync_ink_duck();
+        // DRAGON-691 amendment 2: hand the worker the ink to composite BEFORE the stop flag,
+        // so it is in the slot by the time the stop tail has run and finalize reads it. After
+        // the flag would be a race with the worker's own finish; this ordering has none.
+        self.publish_ink_bake();
         if let Some(rec) = &self.recording {
             rec.stop
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1348,6 +1568,103 @@ fn toolbar_hidden(hide_setting: bool, cant_fit_outside: bool) -> bool {
     hide_setting && cant_fit_outside
 }
 
+/// **Pure**, unit-tested (DRAGON-745): did this session's in-frame toolbar reach the recorded
+/// FILE, i.e. was it still on screen after the file had already begun?
+///
+/// * `hidden`: the session's resolved answer, [`toolbar_hidden`]. A bar the user is keeping
+///   is in the file because they asked for it there, so only a HIDDEN one can be a defect.
+/// * `resolved_at`: when that answer was applied ([`App::resolve_recording_toolbar`]), or
+///   `None` for a session that has not promoted a recording at all.
+/// * `media_zero_at`: where the file begins (`RecordHandle::media_zero_at`, DRAGON-725).
+///
+/// The rule in one line: a hidden bar whose hiding was applied LATER than media 0 was drawn
+/// into the opening of the file. That is the whole of DRAGON-745, and stating it as a
+/// comparison is the point of writing it down: the defect existed because these two instants
+/// were never compared, only assumed to coincide, which is the same assumption DRAGON-725
+/// found in `settled_at` and DRAGON-730 found in the fallback's second anchor. Three tickets,
+/// one shape.
+///
+/// # Why the boundary is strict
+///
+/// `>` and not `>=`: an answer applied AT media 0 is applied in time by the only measure this
+/// process has. The residue below one video tick is not something a wall-clock comparison in
+/// the app can see anyway, because what reaches the file is decided by when the compositor
+/// next composites, not by when we set a flag. This function measures the ORDER of two
+/// decisions, and deliberately claims nothing about pixels.
+///
+/// # Not a hot path
+///
+/// Read once per recording, from [`App::adopt_warm_start`], the moment both instants exist.
+fn toolbar_reached_the_file(
+    hidden: bool,
+    resolved_at: Option<std::time::Instant>,
+    media_zero_at: std::time::Instant,
+) -> bool {
+    hidden && resolved_at.is_some_and(|r| r > media_zero_at)
+}
+
+/// **Pure**, unit-tested: WHICH rectangle the "can the toolbar fit outside this capture"
+/// test measures against, or `None` when this session cannot say and must assume the worst
+/// (DRAGON-740).
+///
+/// Two facts and one rule. `portal_cast` is [`App::portal_window_cast`], a WINDOW pick made
+/// in the portal's dialog, which leaves a 1x1 placeholder at the origin: a footprint of
+/// nothing. `anchor` is the DRAGON-735 rect, the compositor's own answer for where that
+/// window sits, and `None` whenever it could not name it. Everything else measures its own
+/// selection, which is what it always did, and `portal_cast` is a compile-time `false` off
+/// Linux, so macOS and Windows can only ever take that branch.
+///
+/// # Why this exists, and what it is protecting
+///
+/// It used to be a bare `return true` on the placeholder, and the comment beside it named its
+/// own precondition out loud: "the toolbar can't anchor beside a rect it doesn't know".
+/// DRAGON-735 made that false. `toolbar_layout` learned to read the compositor's rect and
+/// dock the bar clear of the recorded window, and this predicate did not, so the two halves
+/// of ONE decision disagreed: the bar was placed perfectly beside a 1688x1384 window on a
+/// 5120x1440 desktop and then declared unable to fit outside it, which with "Hide toolbar on
+/// full screen captures" ON deleted it from the screen for the whole take. The owner:
+/// "toolbar literally shows up only for the warmup and then vanishes".
+///
+/// The WARMUP is the tell, and it is worth keeping: [`App::begin_recording_tray`] is what
+/// asks this question, and DRAGON-659/661 moved that onto the SETTLE rather than the
+/// promotion, so the bar is drawn for the whole bring-up and only then goes. A visibility
+/// rule that fires part-way into a session will always read as a disappearance rather than
+/// as a setting.
+///
+/// The conservative answer survives, narrowed to the one case that earned it: a portal window
+/// cast nothing could place. There the honest statement is still that we do not know the
+/// footprint, and a recording that may well be of a maximized window must not keep a toolbar
+/// the user asked to have hidden.
+///
+/// Total on purpose, and it never invents a rectangle: a session that cannot say says so, the
+/// same first-class miss `portal::toplevel_for_grant_size` returns.
+///
+/// # Do not re-split this
+///
+/// `App::toolbar_layout` and `App::recording_toolbar_oversized` are two halves of ONE
+/// question, "where is the recorded window, and is there room beside it", and they now share
+/// ONE answer: both reach the rect through `App::portal_window_anchor`, and this function is
+/// the only place that decides what to do when there isn't one. They must, because a
+/// placement the visibility rule disagrees with is not a placement at all: the bar is put in
+/// the right spot and then deleted, which is strictly worse than the wrong spot the owner
+/// originally complained about. A future reader tempted to give either half a private opinion
+/// about the portal placeholder is re-creating this bug.
+///
+/// The mechanism is worth naming because it is not a slip anyone would spot in review. The
+/// old `return true` carried a comment justifying itself, "the toolbar can't anchor beside a
+/// rect it doesn't know", and DRAGON-735 falsified that sentence without touching the line it
+/// sat above. **A comment stating an assumption that has since become untrue is worse than no
+/// comment at all**, because it reads as justification and stops the next person looking. When
+/// a ticket makes something knowable that used to be unknown, grep for the code that assumed
+/// it was unknown, and treat every "we can't know this" comment as a search key.
+fn capture_footprint(
+    portal_cast: bool,
+    anchor: Option<(i32, i32, u32, u32)>,
+    sel: (i32, i32, u32, u32),
+) -> Option<(i32, i32, u32, u32)> {
+    if portal_cast { anchor } else { Some(sel) }
+}
+
 /// Whether the record chip wears its WARMING face at `now` (DRAGON-659). Pure,
 /// unit-tested.
 ///
@@ -1398,34 +1715,82 @@ fn warm_spinner_visible(
     }
 }
 
-/// What one recording poll adopts from the worker's SETTLED signal (DRAGON-661, rewritten
-/// by DRAGON-673). Pure, unit-tested.
+/// What one recording poll adopts from the worker's two bring-up signals (DRAGON-661,
+/// rewritten by DRAGON-673, then DRAGON-725, then DRAGON-730). Pure, unit-tested.
 ///
-/// * `anchor_set` / `live_declared`: the two once-per-recording latches, already taken.
-/// * `settled_at`: the end of the worker's opening phase (`RecordHandle::settled_at`), which
-///   is MEDIA 0 — where the file begins — or `None` while it is still coming up.
+/// * `adopted_anchor`: the elapsed anchor this recording is counting from right now
+///   (`App::recording_started`), or `None` before any poll has taken one.
+/// * `live_declared`: the once-per-recording live latch, already taken.
+/// * `media_zero_at`: where the FILE begins (`RecordHandle::media_zero_at`), or `None`
+///   before the worker has anchored its clock.
+/// * `settled_at`: the end of the worker's OPENING PHASE (`RecordHandle::settled_at`), or
+///   `None` while it is still coming up.
 ///
 /// Returns the elapsed anchor to adopt (`None` = leave it alone) and whether THIS poll is
 /// the one that declares the recording live.
 ///
-/// ONE signal, for both, and that is the fix. It used to take `warm_at` as well and anchor
-/// the elapsed readout there, on the premise that the confirmed first frame is "where the
-/// file's real content begins". DRAGON-672 made that premise false (media 0 became the
-/// settled pipeline, so everything before it is dropped) and DRAGON-673 made it visible: the
-/// worker is spawned at countdown START, so `warm_at` lands a whole countdown early and a 10s
-/// countdown opened its recording at 0:10. The readout must count the file, and the file
-/// begins where the app declares itself live, so the two are the same instant by
-/// construction.
+/// TWO signals, for two questions, and that is the fix. This took ONE signal from
+/// DRAGON-673 until DRAGON-725, using `settled_at` for both halves, on the documented
+/// premise that it lands a few milliseconds after media 0 and so may stand in for it.
+/// Measured, it lands 328 to 480ms after (`record::owned::mark_settled` carries the numbers
+/// and the levers that were tried on the span), because the opening phase between them ends
+/// when ffmpeg's muxer scheduler lets a video write through. Everything the app counted
+/// from it was therefore off by that span: the elapsed readout undercounted the delivered
+/// file, and `App::ink_media_ms` stamped every live stroke early, so a baked mark appeared
+/// 10 to 15 frames before the cursor that drew it.
 ///
-/// The old guard ("never declared live without an anchor to count from") is now structural
-/// rather than tested: both halves read the same `Option`, so live cannot be declared with no
-/// anchor even in principle.
+/// Each half now reads the signal that answers ITS question. The anchor counts the file, so
+/// it takes media 0. The live declaration is DRAGON-661's, and it stays on `settled_at` for
+/// DRAGON-661's unchanged reason: the chip must not offer STOP while the pipeline is still
+/// bring-up.
+///
+/// The old guard ("never declared live without an anchor to count from") survives the split
+/// and is still structural rather than tested, because the worker fills `media_zero_at`
+/// strictly BEFORE `settled_at` on every path: a poll that can see the later one has
+/// already been able to see the earlier one.
+///
+/// # The anchor is COMPARED, not latched (DRAGON-730)
+///
+/// The anchor half took a `bool` latch until DRAGON-730, on the premise that one recording
+/// has one media 0. One Linux arm breaks that premise: the pipewire zero-copy worker fills
+/// `media_zero_at` and can STILL hand the whole session to the CPU pipewire worker
+/// afterwards, which mints its own, later media 0 into the SAME slot (both workers are
+/// handed the same `Arc`; see `record::start_pipewire_recording`). The app polls every
+/// 100ms, so a poll landing anywhere in the abandoned attempt's window latched that
+/// attempt's media 0, and the latch then refused the real one for the rest of the session:
+/// the elapsed readout over-counted by the whole fallback bring-up, and `App::ink_media_ms`
+/// stamped every stroke early by it, which is the exact defect DRAGON-725 exists to remove.
+///
+/// So the question this half asks is now "has the value CHANGED", not "have I taken one".
+/// That is a no-op everywhere else, and provably: `record::owned::media_zero` writes the
+/// slot exactly once per worker invocation, only a fallback ever runs a second worker for
+/// one session, and macOS and Windows have no fallback successor at all. On every path but
+/// the Linux one above the slot's value never changes, so the comparison returns `None` at
+/// exactly the polls the `bool` did. What it can no longer do is REFUSE a later value.
+///
+/// Two things that look like the fix and are not, so nobody re-derives them:
+///
+/// * Having the abandoning worker clear the slot is NOT sufficient on its own. It cannot
+///   un-take an anchor a poll has already taken, and on three of that arm's four
+///   fallback-capable returns the session ran to its stop tail first, so the app has
+///   certainly polled. The worker clears it anyway (`record::owned::retract_bring_up`),
+///   because a filled slot should only ever describe the worker that owns the session.
+/// * Gating re-adoption on `settled_at` still being `None` does NOT work either, and it is
+///   the obvious-looking narrow version of this. Those same three returns come after
+///   `mark_settled` has already run, so `settled_at` is `Some` and the gate would refuse
+///   the real anchor precisely in the cases with the longest over-count.
 fn warm_adoption(
-    anchor_set: bool,
+    adopted_anchor: Option<std::time::Instant>,
     live_declared: bool,
+    media_zero_at: Option<std::time::Instant>,
     settled_at: Option<std::time::Instant>,
 ) -> (Option<std::time::Instant>, bool) {
-    let anchor = if anchor_set { None } else { settled_at };
+    let anchor = match media_zero_at {
+        // A worker that retracted its media 0 leaves `None` here: keep counting from the
+        // anchor already taken rather than dropping to 0:00 for the successor's bring-up.
+        Some(zero) if adopted_anchor != Some(zero) => Some(zero),
+        _ => None,
+    };
     let declare_live = !live_declared && settled_at.is_some();
     (anchor, declare_live)
 }
@@ -1564,6 +1929,65 @@ mod stop_preview_anchor_tests {
     }
 }
 
+/// DRAGON-740: which rectangle the toolbar's fits-outside test measures. Its own module
+/// because it pins ONE function and one bug: the recording toolbar vanishing the moment a
+/// portal window recording went live, on a desktop with thousands of free pixels beside the
+/// window it was recording.
+#[cfg(test)]
+mod capture_footprint_tests {
+    use super::capture_footprint;
+
+    /// The owner's failing take, read out of the session log on 2026-08-20: a 1688x1384
+    /// window at (12, 44) on a 5120x1440 ultrawide, resolved by DRAGON-735 at grant time.
+    const OWNERS_WINDOW: (i32, i32, u32, u32) = (12, 44, 1688, 1384);
+    /// What a PORTAL window pick actually leaves on the selection: a footprint of nothing.
+    const PLACEHOLDER: (i32, i32, u32, u32) = (0, 0, 1, 1);
+
+    /// THE regression pin. A portal window cast WITH the compositor's rect measures
+    /// that rect, so the fits-outside test sees the real 1688x1384 footprint instead of a
+    /// 1x1 placeholder, and the toolbar the placement just docked to its right is allowed
+    /// to stay on screen.
+    #[test]
+    fn a_placed_portal_window_measures_the_compositors_rect() {
+        assert_eq!(
+            capture_footprint(true, Some(OWNERS_WINDOW), PLACEHOLDER),
+            Some(OWNERS_WINDOW)
+        );
+    }
+
+    /// The conservative answer, narrowed to the case that earned it: a portal window cast
+    /// nothing could place. `None` is the caller's "assume oversized", and it must stay,
+    /// because the picked window may well be maximized and we genuinely cannot tell.
+    #[test]
+    fn an_unplaceable_portal_window_has_no_footprint() {
+        assert_eq!(capture_footprint(true, None, PLACEHOLDER), None);
+    }
+
+    /// A drawn region, a native window pick and a monitor selection all carry their own
+    /// rectangle and always did, and so does EVERY macOS and Windows capture, where
+    /// `portal_window_cast` is a compile-time `false`. Pinned so the DRAGON-735 rect can
+    /// never reach a session that never needed it: a stale anchor beside a located target
+    /// changes nothing.
+    #[test]
+    fn a_located_capture_measures_its_own_selection() {
+        let region = (400, 300, 900, 600);
+        assert_eq!(capture_footprint(false, None, region), Some(region));
+        assert_eq!(capture_footprint(false, Some(OWNERS_WINDOW), region), Some(region));
+    }
+
+    /// The whole table in one place, so the two facts stay independent: only the
+    /// portal-cast row can ever answer `None`, and only that row can ever read the
+    /// anchor.
+    #[test]
+    fn only_a_portal_cast_ever_reads_the_anchor() {
+        let sel = (10, 20, 30, 40);
+        for anchor in [None, Some(OWNERS_WINDOW)] {
+            assert_eq!(capture_footprint(false, anchor, sel), Some(sel));
+            assert_eq!(capture_footprint(true, anchor, sel), anchor);
+        }
+    }
+}
+
 #[cfg(test)]
 mod toolbar_visibility_tests {
     use super::toolbar_hidden;
@@ -1593,6 +2017,60 @@ mod toolbar_visibility_tests {
         // The single hide case: the user asked to hide AND the toolbar can't fit outside
         // (a full-screen / oversized capture). The tray icon carries the controls.
         assert!(toolbar_hidden(true, true));
+    }
+}
+
+/// DRAGON-745: the ORDER of the two instants, which is the whole of the ticket. The hide
+/// answer above was always right; it was applied 35ms to 2199ms after the file had already
+/// begun, so the opening of a monitor recording carried a toolbar the user had asked to have
+/// hidden, spinner and all, and then watched it vanish.
+#[cfg(test)]
+mod toolbar_reached_the_file_tests {
+    use super::toolbar_reached_the_file;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_bar_the_user_is_keeping_is_never_a_defect() {
+        // `hidden == false` is the common session, and its toolbar is in the file BECAUSE
+        // the user chose to keep it there. Order cannot make that wrong, so neither an
+        // early answer nor a late one reports anything.
+        let zero = Instant::now();
+        assert!(!toolbar_reached_the_file(false, Some(zero - Duration::from_secs(1)), zero));
+        assert!(!toolbar_reached_the_file(false, Some(zero + Duration::from_secs(1)), zero));
+    }
+
+    #[test]
+    fn hidden_and_answered_before_media_zero_is_the_fixed_shape() {
+        // What `App::resolve_recording_toolbar` now guarantees: the answer is applied at
+        // PROMOTION, and the file begins after it. Nothing to report.
+        let zero = Instant::now();
+        assert!(!toolbar_reached_the_file(true, Some(zero - Duration::from_millis(400)), zero));
+    }
+
+    #[test]
+    fn hidden_and_answered_after_media_zero_is_the_bug() {
+        // The shipped behaviour before this ticket: the answer rode `begin_recording_tray`
+        // on the worker's SETTLE, so it landed a whole opening phase past media 0. The two
+        // spans are the extremes measured on the owner's own box, 2026-08-20.
+        let zero = Instant::now();
+        assert!(toolbar_reached_the_file(true, Some(zero + Duration::from_millis(137)), zero));
+        assert!(toolbar_reached_the_file(true, Some(zero + Duration::from_millis(2199)), zero));
+    }
+
+    #[test]
+    fn an_unanswered_session_reports_nothing() {
+        // `None` is a session that never promoted a recording. There is no toolbar answer
+        // to be late, and inventing one would make the net cry on every launch.
+        assert!(!toolbar_reached_the_file(true, None, Instant::now()));
+    }
+
+    #[test]
+    fn the_boundary_is_strict() {
+        // An answer applied AT media 0 is applied in time by the only measure this process
+        // has. What reaches the file below one video tick is the compositor's business, not
+        // a wall-clock comparison's, and claiming otherwise would be a false report.
+        let zero = Instant::now();
+        assert!(!toolbar_reached_the_file(true, Some(zero), zero));
     }
 }
 
@@ -1786,37 +2264,65 @@ mod chip_face_tests {
     }
 }
 
-/// DRAGON-661: what a poll adopts from the worker's two startup signals. The table is the
-/// whole point of the ticket: the elapsed anchor and the live declaration key on DIFFERENT
+/// DRAGON-661: what a poll adopts from the worker's startup signals. The table is the whole
+/// point of the ticket: the elapsed anchor and the live declaration key on DIFFERENT
 /// signals, so a session walks through a state where one has been taken and the other has
-/// not.
+/// not. DRAGON-725 made the signals genuinely different values as well as different
+/// questions.
 #[cfg(test)]
 mod warm_adoption_tests {
     use super::warm_adoption;
     use std::time::{Duration, Instant};
 
-    /// The startup, in order: a worker still coming up gives the poll nothing, and the one
-    /// poll that sees `settled_at` takes BOTH halves — the anchor and the live declaration —
-    /// because they are the same instant.
-    #[test]
-    fn a_session_adopts_nothing_until_it_settles_then_takes_both() {
-        let settled = Instant::now();
+    /// The measured opening phase, so every case below uses a realistic gap rather than a
+    /// round number: `debug test mac-rec-bench largest 5 videotoolbox 30 1245` read a 480ms
+    /// median on the v0.34.0 batch, over a 54 to 562ms range.
+    const OPENING: Duration = Duration::from_millis(480);
 
-        assert_eq!(warm_adoption(false, false, None), (None, false));
-        assert_eq!(warm_adoption(false, false, Some(settled)), (Some(settled), true));
+    /// The startup, in order. A worker still coming up gives the poll nothing. Media 0
+    /// arrives FIRST and takes the anchor on its own, without claiming the recording is
+    /// live. The later poll that sees `settled_at` declares live and adopts no second
+    /// anchor.
+    #[test]
+    fn media_zero_anchors_first_and_settling_declares_live_after_it() {
+        let media_zero = Instant::now();
+        let settled = media_zero + OPENING;
+
+        assert_eq!(warm_adoption(None, false, None, None), (None, false));
+        assert_eq!(
+            warm_adoption(None, false, Some(media_zero), None),
+            (Some(media_zero), false),
+            "media 0 anchors the readout before the pipeline is steady enough to offer STOP"
+        );
+        assert_eq!(
+            warm_adoption(Some(media_zero), false, Some(media_zero), Some(settled)),
+            (None, true),
+            "settling only declares live; the anchor was already taken at media 0"
+        );
     }
 
-    /// The DRAGON-673 case, and the reason the anchor moved. A countdown's worker confirms
-    /// its first frame at countdown START and settles a whole countdown later, so anchoring
-    /// on the frame opened a 10s countdown's recording at 0:10. The anchor is the SETTLED
-    /// instant, which is media 0 — the elapsed readout therefore reads 0:00 exactly when the
-    /// file begins.
+    /// DRAGON-725, the defect this split fixes. Anchoring on `settled_at` put the readout
+    /// and the ink clock a whole opening phase behind the file, so a mark drawn at media T
+    /// was written into the log at T minus the opening and baked onto an earlier frame.
+    /// Anchoring on media 0 makes both exact.
     #[test]
-    fn the_anchor_is_media_zero_not_the_first_frame_a_countdown_ago() {
+    fn the_anchor_is_media_zero_not_the_end_of_the_opening_phase() {
+        let media_zero = Instant::now();
+        let settled = media_zero + OPENING;
+        let (anchor, _) = warm_adoption(None, false, Some(media_zero), Some(settled));
+        assert_eq!(anchor, Some(media_zero), "the readout counts the FILE");
+        assert_ne!(anchor, Some(settled), "the opening phase is not part of the file");
+    }
+
+    /// The DRAGON-673 case, kept because it is the reason the anchor left `warm_at`. A
+    /// countdown's worker confirms its first frame at countdown START, a whole countdown
+    /// before the file begins, so anchoring on the frame opened a 10s countdown's recording
+    /// at 0:10.
+    #[test]
+    fn the_anchor_is_not_the_first_frame_a_countdown_ago() {
         let first_frame = Instant::now();
-        let settled = first_frame + Duration::from_secs(10);
-        let (anchor, live) = warm_adoption(false, false, Some(settled));
-        assert_eq!(anchor, Some(settled), "the readout counts the FILE, not the warmup");
+        let media_zero = first_frame + Duration::from_secs(10);
+        let (anchor, live) = warm_adoption(None, false, Some(media_zero), Some(media_zero));
         assert!(live);
         assert!(
             anchor.expect("anchored") > first_frame,
@@ -1828,17 +2334,86 @@ mod warm_adoption_tests {
     /// nothing, which is what keeps the tray from being re-raised every 100ms.
     #[test]
     fn an_already_live_recording_adopts_nothing_further() {
-        let settled = Instant::now();
-        assert_eq!(warm_adoption(true, true, Some(settled)), (None, false));
+        let media_zero = Instant::now();
+        assert_eq!(
+            warm_adoption(Some(media_zero), true, Some(media_zero), Some(media_zero + OPENING)),
+            (None, false)
+        );
     }
 
-    /// The halves still latch INDEPENDENTLY, so a poll that already anchored can still be the
-    /// one that declares live. Unreachable while both read one `Option`, and pinned so a
-    /// future signal split cannot silently re-raise the tray or lose the declaration.
+    /// The old structural guard, now that the halves read DIFFERENT options: live must never
+    /// be declared with no anchor to count from. The worker fills media 0 strictly first, so
+    /// the pair below cannot occur, and this pins that the guard does not depend on that
+    /// ordering by accident. A settled worker with no media 0 declares live and anchors
+    /// nothing, which is the only honest answer available; the readout stays at 0:00 rather
+    /// than counting from a wrong instant.
     #[test]
-    fn an_anchored_but_undeclared_recording_still_declares_live() {
+    fn settling_without_a_media_zero_never_invents_an_anchor() {
         let settled = Instant::now();
-        assert_eq!(warm_adoption(true, false, Some(settled)), (None, true));
+        assert_eq!(warm_adoption(None, false, None, Some(settled)), (None, true));
+    }
+
+    /// DRAGON-730, the defect the comparison fixes. The Linux pipewire zero-copy worker
+    /// publishes media 0 and can still hand the whole session to the CPU worker, which
+    /// publishes its own, later media 0 into the same slot. A poll that already took the
+    /// abandoned attempt's instant must take the successor's when it lands: it is the one
+    /// the delivered file begins at.
+    #[test]
+    fn a_later_media_zero_replaces_the_one_a_declined_attempt_published() {
+        let declined = Instant::now();
+        let real = declined + Duration::from_secs(3);
+        assert_eq!(
+            warm_adoption(Some(declined), true, Some(real), Some(real + OPENING)),
+            (Some(real), false),
+            "the fallback worker's media 0 is where the file this session delivers begins"
+        );
+    }
+
+    /// The case that rules out the narrow version of this fix, which was to re-adopt only
+    /// while `settled_at` is still `None`. Three of that arm's four fallback-capable returns
+    /// come after `mark_settled` has already run, so the declined attempt is fully settled
+    /// AND fully live by the time it hands over, and gating on `settled_at` would refuse the
+    /// real anchor in exactly the cases whose over-count is largest: a whole abandoned
+    /// session rather than a bring-up.
+    #[test]
+    fn a_settled_and_live_attempt_still_hands_its_anchor_to_the_successor() {
+        let declined = Instant::now();
+        let real = declined + Duration::from_secs(30);
+        let (anchor, live) =
+            warm_adoption(Some(declined), true, Some(real), Some(real + OPENING));
+        assert_eq!(anchor, Some(real), "a settled predecessor does not own the anchor");
+        assert!(!live, "the live latch is DRAGON-661's and stays once-per-recording");
+    }
+
+    /// The retraction half (`record::owned::retract_bring_up`): between the decline and the
+    /// successor's own media 0 the slot reads `None`. Keep the anchor already taken rather
+    /// than dropping the readout to 0:00 for the length of a bring-up, and never invent one.
+    #[test]
+    fn a_retracted_media_zero_keeps_whatever_anchor_was_already_taken() {
+        let declined = Instant::now();
+        assert_eq!(
+            warm_adoption(Some(declined), true, None, None),
+            (None, false),
+            "an emptied slot leaves the anchor alone; the successor will refill it"
+        );
+        assert_eq!(warm_adoption(None, false, None, None), (None, false));
+    }
+
+    /// The no-op that makes the comparison safe to ship on every platform. `media_zero`
+    /// writes the slot once per worker invocation and only a fallback runs a second worker,
+    /// so on macOS, on Windows and on every Linux arm but the one above the value never
+    /// moves, and a poll of a running recording adopts nothing at all.
+    #[test]
+    fn re_adoption_never_fires_while_media_zero_stays_put() {
+        let media_zero = Instant::now();
+        let settled = media_zero + OPENING;
+        for live in [false, true] {
+            assert_eq!(
+                warm_adoption(Some(media_zero), live, Some(media_zero), Some(settled)).0,
+                None,
+                "an unchanged media 0 is adopted exactly once"
+            );
+        }
     }
 }
 

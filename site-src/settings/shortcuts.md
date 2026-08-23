@@ -63,9 +63,9 @@ that would do nothing. Under a Flatpak install that is Capture Active Window and
 Capture Active Monitor, because a sandboxed app cannot ask which window or monitor
 is active.
 
-On Linux, below Global Capture, sits **Global Recording**: five commands that act
+On Linux, below Global Capture, sits **Global Recording**: the commands that act
 on a recording already in progress, being pause or resume, stop and save, cancel
-and delete, and the two audio toggles. They are commands rather than chords for
+and delete, and the audio channels. They are commands rather than chords for
 the same reason, and macOS and Windows do not show the group at all, because their
 in-app Recording tab already reaches a live recording.
 
@@ -94,9 +94,15 @@ These work in the capture overlay whether or not a recording is running.
 
 | Action | Default |
 |---|---|
-| Stop and save recording | Enter |
-| Toggle Microphone | M |
-| Toggle system audio | S |
+| Stop and save recording | Shift+Alt+Enter |
+| Toggle Microphone | Shift+Alt+M |
+| Toggle system audio | Shift+Alt+S |
+
+These three are the only chorded defaults in the app, and they are the same on
+every computer. There is no Cmd version on macOS. They are chords so they
+cannot fire while you are typing, and so the microphone and stop shortcuts can
+be registered with your desktop's own shortcut service, which is what lets hold
+to talk work while the app you are recording has the focus.
 
 ## Preview Editor
 

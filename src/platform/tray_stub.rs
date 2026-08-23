@@ -26,6 +26,12 @@ pub enum TrayEvent {
     Cancel,
     /// Quit the whole capture session/app (DRAGON-174; the idle session icon's Quit).
     Quit,
+    /// A "Live Annotations" radio pick (DRAGON-693). Matched in the shared app handling,
+    /// never constructed here.
+    InkTool(crate::ink::InkTool),
+    /// The "Live Annotations" submenu's "Clear Marks" row (DRAGON-693). Matched in the
+    /// shared app handling, never constructed here.
+    InkClear,
 }
 
 /// A live session tray. Never constructed on this platform (`start_*` return `None`);
@@ -54,6 +60,8 @@ impl TraySession {
     }
 
     pub fn set_audio(&self, _mic: bool, _system_audio: bool) {}
+
+    pub fn set_ink(&self, _tool: crate::ink::InkTool) {}
 
     pub fn set_paused(&self, _paused: bool) {}
 }

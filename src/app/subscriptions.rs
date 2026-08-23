@@ -9,6 +9,14 @@ use super::*;
 /// two in a relationship somebody can read.
 pub(crate) const UPLOAD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How often the Magic Marker's clock ticks while it is merely HOLDING (DRAGON-691).
+///
+/// The hold draws an unchanging scene, so this only has to be frequent enough that the sweep
+/// starts on time; the sweep itself runs at one frame's cadence. `App::ink_sweeping` reads
+/// this to switch over one tick EARLY, so the two are related and the number lives here rather
+/// than being written twice. See `App::sub_ink_fade`.
+pub(in crate::app) const INK_HOLD_TICK_MS: u64 = 100;
+
 // Each tick lives behind its own named, documented trigger condition; `subscriptions`
 // composes them into the one `Subscription` the `cosmic::Application::subscription`
 // trait method returns (application.rs). Every condition/interval is unchanged from
@@ -25,10 +33,12 @@ impl App {
                 self.sub_toast(),
                 self.sub_pixel_capture(),
                 self.sub_scan_shot(),
+                self.sub_scan_control(),
                 self.sub_menu_hold(),
                 self.sub_picker_countdown_arm(),
                 self.sub_picker_reveal(),
                 self.sub_dim_fade(),
+                self.sub_ink_fade(),
                 self.sub_accept_pending(),
                 self.sub_busy_spin(),
                 self.sub_loading_tick(),
@@ -294,7 +304,7 @@ impl App {
     }
 
     /// macOS (DRAGON-153) / Windows (DRAGON-246): while the settings pane is open, watch for
-    /// the focus poke file a blocked second `--settings` launch touches (cross-process
+    /// the focus poke file a blocked second `settings` launch touches (cross-process
     /// activation is cooperative-only on macOS 14+ and foreground-locked on Windows, so the
     /// pane must raise — and on Windows un-hide — ITSELF). 300ms is human-reaction latency for
     /// a rare event; the poll is a bare stat.
@@ -567,6 +577,59 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| Msg::Capture(CaptureMsg::DimFadeTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-691: drive the Magic Marker's dissolve, and ONLY while its clock is running.
+    ///
+    /// The condition is deliberately "is a dissolve clock running", not "is a tool selected":
+    /// ink keeps dissolving after the tool is put back on Pointer, which is the whole point of
+    /// it. Marker ink schedules nothing at all, because it is static: it changes only when the
+    /// user draws or presses Erase, and both of those are messages that redraw on their own.
+    ///
+    /// The tick's own handler is what retires the scene once the sweep is over, so the
+    /// condition goes false by itself and the last magic stroke takes the timer down with it.
+    /// Nothing here reads a clock: the alpha is computed at DRAW time against the wall clock
+    /// (see `crate::ink`'s module doc for why that clock and not painted frames), so this tick
+    /// only has to make sure frames keep being drawn.
+    ///
+    /// TWO cadences, because the clock has two phases and only one of them moves. Through the
+    /// hold every frame would draw the identical scene, rebuilding every stroke's ribbon on a
+    /// machine that is already encoding video, so it ticks at [`INK_HOLD_TICK_MS`]; once the
+    /// sweep is imminent it goes to one frame's cadence, which is what the moving fade front
+    /// needs to look continuous. It cannot simply arm itself late: a subscription is only
+    /// re-evaluated when a message arrives, so with no tick at all through the hold there
+    /// would be no message to notice that the hold had ended.
+    fn sub_ink_fade(&self) -> Option<Subscription<Msg>> {
+        if !self.ink_fading() {
+            return None;
+        }
+        let ms = if self.ink_sweeping() { 16 } else { INK_HOLD_TICK_MS };
+        Some(
+            cosmic::iced::time::every(std::time::Duration::from_millis(ms))
+                .map(|_| Msg::Ink(InkMsg::FadeTick)),
+        )
+    }
+
+    /// DRAGON-695: drain the scanner's control inlet while the scanner is open, so a
+    /// `scan --action refresh` from a desktop hotkey lands. The `sub_tray_poll` shape and the
+    /// same ~80ms cadence: this is a keypress the user is waiting on, so it must not feel
+    /// slower than pressing the scan button would.
+    ///
+    /// Linux-only, because the inlet is. Off Linux the field does not exist and this answers
+    /// `None` unconditionally, so nothing ticks and nothing is compiled that could.
+    fn sub_scan_control(&self) -> Option<Subscription<Msg>> {
+        #[cfg(target_os = "linux")]
+        let listening = self.scan_control.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let listening = false;
+        if listening {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(80))
+                    .map(|_| Msg::Capture(CaptureMsg::ScanControlPoll)),
             )
         } else {
             None
@@ -977,7 +1040,7 @@ impl App {
     /// promptly (a click → action within ~80ms, imperceptible).
     ///
     /// DRAGON-583: the same tick also drains the recording-CONTROL inlet, so a global
-    /// hotkey running `--toggle-mic` acts within the same ~80ms. It is a second gate rather
+    /// hotkey running `record --sound mic` acts within the same ~80ms. It is a second gate rather
     /// than a second subscription because both feed the one `TrayPoll` handler, and it has
     /// to be a gate of its own: a sandboxed child can fail to register a tray item, and
     /// that is precisely the session where the CLI commands are the only control left.

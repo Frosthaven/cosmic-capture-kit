@@ -61,9 +61,11 @@
 //!   measured above. A whole minute of nothing is not a slow machine, it is a dead pipeline.
 //! * A STOPPING session's longest honest silence is the stop tail's own bounded reap
 //!   ([`super::wait_or_kill`], 30s), during which neither file changes because ffmpeg is
-//!   being waited on. The budget is double that, so a stop tail that is merely riding out
-//!   its own worst case is never pre-empted — it gets to finish, salvage and finalize by
-//!   itself, which produces a BETTER file than anything this module can.
+//!   being waited on, plus the covering-write budget that precedes it
+//!   (`owned::COVERING_WRITE_BUDGET`, 3s, DRAGON-711 — a full pipe is retried, not given
+//!   up on). The budget clears the sum with room to spare, so a stop tail that is merely
+//!   riding out its own worst case is never pre-empted — it gets to finish, salvage and
+//!   finalize by itself, which produces a BETTER file than anything this module can.
 //!
 //! Nothing here lengthens an existing timeout, and nothing here is load-sensitive: the test
 //! is "did any bytes move", not "how fast".
@@ -80,8 +82,10 @@ use std::time::{Duration, Instant};
 pub(crate) const SESSION_STALL_SECS: u64 = 60;
 
 /// The longest honest silence inside a STOP tail: [`super::wait_or_kill`]'s bounded reap,
-/// during which neither file changes and the session is behaving perfectly.
-const STOP_TAIL_REAP_SECS: u64 = 30;
+/// during which neither file changes and the session is behaving perfectly. Derived from
+/// the stop tail's own constant (DRAGON-711) rather than restated, so the asserts below
+/// can never quietly compare against a number the tail stopped using.
+const STOP_TAIL_REAP_SECS: u64 = super::owned::STOP_TAIL_REAP.as_secs();
 
 /// The longest honest silence inside a RUNNING session: one Matroska cluster, which the
 /// muxer starts every 2 MB or 5 seconds of media. `wedge_live_tests` measures the real
@@ -109,6 +113,18 @@ const _: () = assert!(
 const _: () = assert!(
     SESSION_STALL_SECS > super::MUXER_LIVENESS_SECS,
     "the session bound is the OUTER ring: every in-process bound must get to fire first"
+);
+
+// DRAGON-711 added a second bound INSIDE the stop tail: the covering writes now retry a
+// full ffmpeg stdin for `owned::COVERING_WRITE_BUDGET` before giving up, and that wait
+// runs BEFORE the reap above, on the same thread, in the same silence. The two therefore
+// add.
+const _: () = assert!(
+    SESSION_STALL_SECS > STOP_TAIL_REAP_SECS + super::owned::COVERING_WRITE_BUDGET.as_secs(),
+    "the stop tail's own worst case is its covering-write budget PLUS its bounded reap \
+     (DRAGON-711), and the session bound must still clear the sum: a budget that pushed \
+     the total past it would have this module tearing down a stop tail that is behaving \
+     exactly as designed, losing the salvage the worker was about to do"
 );
 
 /// What the session has been asked to do, at the moment of one observation.

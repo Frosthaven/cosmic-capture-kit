@@ -5,16 +5,16 @@ title: The colour picker
 # The colour picker
 
 The colour picker reads a colour off your screen and gives you its value in
-seven notations. It is a tool of its own rather than a capture. Nothing is
-saved, and no file is written.
+seven notations. It is a tool of its own rather than a capture: it takes no
+screenshot and saves no capture file.
 
 ## Starting it
 
 | Where | How |
 |---|---|
-| The tray or menu bar | **Color Picker**, the first entry, above Scanner |
+| The tray or menu bar | **Color > Color Picker**, just under the scan row |
 | The preview editor | The pipette button at the left of the image toolbar, just before the colour swatch |
-| A terminal, or your own shortcut | `cosmic-capture-kit --color-picker` |
+| A terminal, or your own shortcut | `cosmic-capture-kit color --picker` |
 | A global key | The **Color Picker** row in [Settings, under Shortcuts](../settings/shortcuts.md) |
 
 **The Color Picker shortcut ships with no key set**, like every other global
@@ -75,14 +75,32 @@ on. See [What it cannot do](#what-it-cannot-do).
 
 ## The result window
 
-Clicking copies the hex to your clipboard and opens a small window. The window is
-a fixed size and cannot be resized, because nothing in it scrolls: it is exactly
-as big as the rows it holds.
+Clicking copies the colour to your clipboard and opens a small window. The window
+is a fixed size and cannot be resized, because nothing in it scrolls: it is
+exactly as big as the parts it holds.
 
-At the top is a wide swatch of the colour. Under it is one row per notation, and
-under those the colours you picked before.
+| Part, top to bottom | What it is |
+|---|---|
+| The square | Saturation and value for the current hue. Drag inside it to move the colour |
+| The controls row | A pipette that starts another pick, a round swatch of the current colour, and the hue and alpha strips stacked beside it |
+| The value row | A copy button, the value boxes, and the notation chooser |
+| The divider | A hairline with an **Add to recents** button sitting on it |
+| The history | Two rows of the colours you kept |
 
-| Row | What it looks like |
+### The value row
+
+It is one row whatever the notation, and the chevron pair at its right end is a
+single button: press it and a menu of the seven notations opens, with the current
+one marked.
+
+**Your choice is remembered between launches**, and it is the spelling a pick
+copies to your clipboard. Changing it copies nothing, so you can read through all
+seven without your clipboard changing seven times.
+
+Each one spells the same colour its own way, and that spelling is what a copy
+gives you:
+
+| Notation | What a copy gives you |
 |---|---|
 | HEX | `#FF8800` |
 | RGB | `rgb(255, 136, 0)` |
@@ -92,16 +110,18 @@ under those the colours you picked before.
 | CMYK | `cmyk(0%, 47%, 100%, 0%)` |
 | LAB | `lab(70.2% 34.4 76.4)` |
 
-Every row has a **copy button** on the right that copies that row's text. The
-button shows a tick for a moment so you know it worked.
+**Hex is one box** holding the whole spelling, so you can paste `#FF8800CC` in as
+one piece. Every other notation splits into a box per component, with its name
+captioned underneath, so you can nudge one number without retyping the rest.
 
-**Every row is editable.** Type a value into any of them and the swatch and all
-the other rows follow it. The boxes are forgiving: the function name, the
-parentheses and the commas are all optional, spaces work as separators, and a
-trailing `%` is accepted. What they will not guess at is the wrong number of
-values, so three numbers typed into the CMYK box is treated as a typo rather
-than as a colour. A half-typed value is left alone until it makes sense, so the
-swatch never flashes through nonsense on the way to what you meant.
+**The boxes are editable, and the colour follows as you type.** A component box
+takes its own number, with the `%` optional where the number is a percentage, and
+the alpha box takes either a percentage or a figure from 0 to 1. The hex box is
+the forgiving one: the leading `#` is optional, the letters may be either case,
+and the short forms work too, so `f80` and `#FF8800` are the same colour.
+A half-typed value is left alone until it makes sense, so the swatch never
+flashes through nonsense on the way to what you meant, and pressing Enter tidies
+what you typed into its canonical spelling.
 
 Two notes on the numbers themselves:
 
@@ -112,30 +132,87 @@ Two notes on the numbers themselves:
   those and the value is brought back to the nearest colour sRGB can hold, rather
   than wrapping round to something unrelated.
 
+Two chords belong to this window, and Tab walks it: the boxes first, then the
+notation chooser, then the history, then the panel when it is open.
+
+| Chord | What it does |
+|---|---|
+| `Ctrl+Enter` (`Cmd+Enter` on macOS) | Keeps the colour: files it into the history, the same as the **Add to recents** button |
+| `Ctrl+Shift+C` (`Cmd+Shift+C` on macOS) | Copies the value. Plain `Ctrl+C` is left alone, so it still copies whatever you selected inside a box |
+
 ### Recent colours
 
-The bottom row holds the colours you picked before, newest first, up to **ten**.
-The oldest falls off the end. Picking a colour off the screen that is already in
-the row moves it back to the front rather than adding a second copy of it. They
-are saved between launches, so they are still there the next time you open the
-tool.
+The bottom two rows hold the colours you kept, newest first, **eighteen** of them,
+nine to a row. The oldest falls off the end. Each is remembered with its own
+transparency, and a see-through one is drawn as a split swatch so you can tell.
+They are saved between launches, so they are still there the next time you open
+the tool.
 
-- **Clicking one loads it** into the swatch and the rows. It does not move it to
+- **Clicking one loads it** into the swatch and the boxes. It does not move it to
   the front. The row stays a stable place to look rather than reshuffling itself
   under your pointer.
-- **Only an actual pick adds to the list.** Loading a recent colour does not, and
-  neither does typing in a box, so the row never fills up with values you were
-  only trying out.
+- **A pick files a colour, and so does swapping the current one out.** Take a
+  colour from the harmonies or from a saved palette and the colour you were
+  holding is filed first, so nothing you had goes missing. The same colour at the
+  same transparency is never filed twice.
+- **Typing never files anything.** The square, the strips and the boxes are for
+  exploring, so only a pick or the explicit add writes to the row.
+- **Right-click a swatch** for its menu. What it offers depends on which swatch it
+  is, between making it the current colour, adding it to the history, copying it,
+  removing it, and sending it to one of your saved palettes.
 
-**The pipette at the right of that same row starts another pick.** The window
+**The pipette at the start of the controls row starts another pick.** The window
 stays open while you do, and the colour you pick lands in the window you already
-have: it becomes the new swatch and the newest entry in the row below. There is
+have: it becomes the new swatch and the newest entry in the history. There is
 only ever one picker window, so picking again from the tray, a shortcut or the
 command line updates that same window rather than stacking up another.
 
 Each pick is still a fresh start that dims your screen again, rather than a
 re-read of the picture the window was opened from. That is deliberate: it leaves
 you free to take the next colour off a different monitor.
+
+## The side panel
+
+The button at the right of the window's title bar **doubles the window's width**
+and opens a panel beside the picker. Nothing on the picker's side moves. Both the
+open state and the tab you were last on are remembered, and `Ctrl+Tab` moves
+between the tabs.
+
+### Harmonies
+
+Five cards, worked out from the colour the window is showing and recomputed as it
+changes: Complementary, Analogous, Triadic, Tetradic and Monochromatic. Each
+heading carries a one-line explanation of the relationship.
+
+Click a swatch to make it the current colour, or right-click it for the same menu
+every swatch in the window has.
+
+### Saved Palettes
+
+Your own named groups of colours, kept between launches.
+
+- **New Palette**, at the top right of the tab, adds a group at the TOP of the
+  list with its name selected, ready to type over. Click a name at any time to
+  rename it in place.
+- Beside that button are a **search field**, which filters the list by name, and a
+  **sort button** offering six one-shot orders: name A to Z or Z to A, lightest or
+  darkest first, warmest or coolest first.
+- Each group's title row carries a **pipette**, which starts a pick that lands
+  straight in that group, and a **plus**, which adds the colour the window is
+  showing.
+- **Dragging** does the rest. Along a group's own bar reorders it. Onto another
+  group **copies** the colour there. Onto the picker's side of the window makes it
+  the current colour. Off the window removes it. A group's NAME drags too, to
+  reorder the groups, or off the window to delete the group, which asks you first.
+  Colours never ask; groups do.
+- The swatch menu keeps the verbs a drag does not offer, including **Move to
+  palette**, which takes the colour out of the group it came from.
+- Clicking a swatch applies it as the current colour, and a colour already in a
+  group is not added to it twice.
+
+Palettes are kept in their own file beside your settings, so a factory reset
+leaves them alone. Before you save any of your own, you start with two groups,
+Catppuccin Latte and Mocha.
 
 ## Picking a colour to draw with
 

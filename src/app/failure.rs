@@ -406,6 +406,42 @@ pub fn crash_alert() -> AlertMessage {
     }
 }
 
+/// The prefix of std's own "I could not write to the console" panic message, from
+/// `library/std/src/io/stdio.rs`: `failed printing to {stdout|stderr}: {error}`.
+///
+/// Matched as a PREFIX rather than by label so a future stream name is covered too. No panic
+/// message we write ourselves begins this way.
+#[cfg(any(target_os = "macos", windows, test))]
+const STDIO_WRITE_PANIC_PREFIX: &str = "failed printing to ";
+
+/// Whether a panic earns the crash alert. Pure, unit-tested.
+///
+/// It does, except for exactly one shape: std's own console-write panic (DRAGON-709). Its
+/// payload reads `failed printing to stderr: The pipe is being closed. (os error 232)`, and on
+/// Windows an ordinary user causes it without doing anything wrong. Piping a run into a
+/// consumer that stops reading early closes the pipe underneath us, and so does closing the
+/// terminal a capture was launched from. Seventeen of these were sitting in `panic.log` across
+/// four days.
+///
+/// Two reasons that one must not speak. The dialog would be a LIE: it says "The capture did
+/// not complete and nothing was saved", and in every observed instance the recording had
+/// completed and the file was on disk. The panic is in the REPORTING, not the work. And the
+/// alert could not describe the fault honestly anyway, because the channel it would have to
+/// name is the one that just failed.
+///
+/// The breadcrumb is kept either way: `panic.log` and the debug log still record it, so a
+/// print site that can still panic stays findable. Only the DIALOG is withheld.
+///
+/// This is the BACKSTOP, not the fix. The fix is that the paths which print during a session
+/// use `crate::diag`'s non-panicking `outln!` / `errln!` family and so never panic in the
+/// first place. This catches whatever is not one of them, including a print inside a
+/// dependency, where we have no call site to change.
+#[cfg(any(target_os = "macos", windows, test))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+pub fn crash_alert_warranted(panic_payload: &str) -> bool {
+    !panic_payload.starts_with(STDIO_WRITE_PANIC_PREFIX)
+}
+
 /// The message for the iced/winit runtime failing outright (`cosmic::app::run` returning
 /// `Err`), where no in-app path ever ran. Names no cause because none is available here.
 pub fn runtime_failure_alert() -> AlertMessage {
@@ -425,15 +461,22 @@ pub fn runtime_failure_alert() -> AlertMessage {
 /// Pure over both folders, so the copy is testable without crashing a process. Either may be
 /// `None` when the path could not be resolved (no home directory), and the sentence for it is
 /// then omitted rather than printed empty.
+///
+/// A named folder goes on a LINE OF ITS OWN and takes no terminal punctuation (DRAGON-709).
+/// `…to {p}.` put a full stop hard against a path that already contains dots, so the owner
+/// read `…\.config\cosmic-capture-kit.` as a truncated path and went looking for the rest of
+/// it. Nothing may follow a path on its line; the sentence that introduces it ends in a colon
+/// instead. This is why the body no longer ends in a full stop, and why the house-style sweep
+/// checks the PROSE rather than the last character.
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_crash_alert(panic_log_dir: Option<&str>, debug_log_dir: Option<&str>) -> AlertMessage {
     let mut body = String::from("The capture did not complete and nothing was saved.");
     if let Some(p) = panic_log_dir {
-        body.push_str(&format!("\n\nDetails were written to {p}."));
+        body.push_str(&format!("\n\nDetails were written to:\n{p}"));
     }
     if let Some(d) = debug_log_dir {
-        body.push_str(&format!("\n\nThe debug log is in {d}."));
+        body.push_str(&format!("\n\nThe debug log is in:\n{d}"));
     }
     AlertMessage { title: "Cosmic Capture Kit stopped unexpectedly.".into(), body }
 }
@@ -452,7 +495,7 @@ pub fn windows_runtime_failure_alert(debug_log_dir: Option<&str>) -> AlertMessag
          This is usually a graphics driver problem, or a remote session with no display.",
     );
     if let Some(d) = debug_log_dir {
-        body.push_str(&format!("\n\nThe debug log is in {d}."));
+        body.push_str(&format!("\n\nThe debug log is in:\n{d}"));
     }
     AlertMessage { title: "Cosmic Capture Kit couldn't start.".into(), body }
 }
@@ -1201,6 +1244,11 @@ mod tests {
 
     /// Both new messages obey the same house rules the `alert_message` sweeps enforce —
     /// they live outside that table, so they need their own sweep or they drift.
+    ///
+    /// The "ends a sentence" rule is checked on the PROSE, not the last character, because
+    /// DRAGON-709 moved every named folder onto a line of its own with no punctuation after
+    /// it. A body may therefore end in a path; every line that is not one must still be a
+    /// finished sentence.
     #[test]
     fn the_app_less_windows_messages_follow_the_house_style() {
         let messages = [
@@ -1212,11 +1260,77 @@ mod tests {
         for m in messages {
             assert!(!m.title.is_empty() && !m.body.is_empty());
             assert!(m.title.ends_with('.'), "{}", m.title);
-            assert!(m.body.ends_with('.'), "{}", m.body);
+            for line in m.body.lines().filter(|l| !l.trim().is_empty()) {
+                if line.starts_with(r"C:\") {
+                    continue;
+                }
+                assert!(line.ends_with('.') || line.ends_with(':'), "{line:?} in {}", m.body);
+            }
             assert!(!m.title.contains('—') && !m.body.contains('—'), "{}", m.body);
             // These fire with no App and no TCC probe, so they must never blame a grant.
             assert!(!m.body.contains("Screen Recording"), "{}", m.body);
             assert!(!m.body.contains("permission"), "{}", m.body);
+        }
+    }
+
+    /// DRAGON-709. A folder is named on a line of its OWN and nothing follows it, because a
+    /// full stop against a path that already contains dots reads as part of the path: the
+    /// owner saw `…\.config\cosmic-capture-kit.` and concluded the path had been truncated.
+    #[test]
+    fn a_named_folder_stands_alone_with_no_punctuation_after_it() {
+        let dir = r"C:\Users\x\.config\cosmic-capture-kit";
+        let logs = r"C:\Users\x\AppData\Local\cosmic-capture-kit\logs";
+        for body in [
+            windows_crash_alert(Some(dir), Some(logs)).body,
+            windows_runtime_failure_alert(Some(logs)).body,
+        ] {
+            for path in [dir, logs] {
+                if !body.contains(path) {
+                    continue;
+                }
+                // The path IS a whole line, so nothing can be mistaken for part of it.
+                assert!(body.lines().any(|l| l == path), "{body}");
+            }
+            // The old shape, and the specific string the owner misread.
+            assert!(!body.contains("cosmic-capture-kit."), "{body}");
+            assert!(!body.contains("logs."), "{body}");
+            // The introducing sentence ends in a colon so the line below it reads as its
+            // object rather than as a new sentence that lost its full stop.
+            assert!(body.contains("written to:\n") || body.contains("is in:\n"), "{body}");
+        }
+    }
+
+    /// DRAGON-709: the one panic that must NOT put the crash dialog up. std panics when a
+    /// `println!` / `eprintln!` write fails, which on Windows an ordinary user causes by
+    /// piping a run into a consumer that stops reading, or by closing the terminal a capture
+    /// was launched from. The dialog would say "nothing was saved" over a finished recording.
+    #[test]
+    fn a_console_write_panic_does_not_earn_the_crash_dialog() {
+        // The exact payloads std produces, both streams.
+        assert!(!crash_alert_warranted(
+            "failed printing to stderr: The pipe is being closed. (os error 232)"
+        ));
+        assert!(!crash_alert_warranted("failed printing to stdout: Broken pipe (os error 32)"));
+        // A future stream name is covered too, because the match is on the prefix.
+        assert!(!crash_alert_warranted("failed printing to somewhere: nope"));
+    }
+
+    /// The complement, and it is the important half: this gate exists to silence ONE shape,
+    /// so every real defect must still reach the user. A gate that swallowed a panic would
+    /// re-create the DRAGON-442 problem it sits inside: an app that closes with nothing said.
+    #[test]
+    fn every_other_panic_still_earns_the_crash_dialog() {
+        for payload in [
+            "index out of bounds: the len is 3 but the index is 7",
+            "called `Option::unwrap()` on a `None` value",
+            "attempt to subtract with overflow",
+            "CCK_TEST_PANIC=1: forced main-thread panic (DRAGON-442 QA hook)",
+            "",
+            // Near misses: the words appear, but not as std's prefix.
+            "the encoder was failed printing to stderr",
+            "failed printing",
+        ] {
+            assert!(crash_alert_warranted(payload), "{payload:?}");
         }
     }
 

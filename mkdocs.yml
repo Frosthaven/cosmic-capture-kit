@@ -53,6 +53,22 @@ plugins:
 extra_css:
   - "assets/custom.css"
 
+# The landing page's platform-aware download button and the download analytics
+# events (DRAGON-704). Wired the same way the stylesheet above is, so both live
+# beside the pages they serve.
+#
+# It loads on every page rather than only on the landing page, and that is
+# deliberate. Material's `navigation.instant` swaps page content without ever
+# loading a new document, so a script that only shipped with the landing page
+# would never run for a reader who arrives there from a documentation page.
+# Loading it everywhere means its listener is always alive; on a page with no
+# download button it returns immediately and does nothing.
+#
+# Material emits these AFTER its own bundle, which is what lets the file
+# subscribe to the theme's `document$` observable.
+extra_javascript:
+  - "assets/download.js"
+
 markdown_extensions:
   - admonition
   - toc:
@@ -119,9 +135,9 @@ extra:
   consent:
     title: Cookie consent
     description: >-
-      This site uses Google Analytics to count visits and see which pages
-      help people. Analytics only runs if you accept. Rejecting changes
-      nothing about how the site works.
+      This site uses Google Analytics to count visits and downloads, and to
+      see which pages help people. Analytics only runs if you accept.
+      Rejecting changes nothing about how the site works.
     actions:
       - accept
       - reject

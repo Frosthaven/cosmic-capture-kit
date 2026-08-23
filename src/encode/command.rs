@@ -303,8 +303,64 @@ fn build_media_clock_command(
     cmd.args([
         "-c:a", "aac", "-b:a", "192k",
         "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "title=system",
-        "-shortest",
     ]);
+    // DRAGON-710: NO `-shortest` here either, and its absence is the fix. This is the
+    // SAME flag DRAGON-457 removed from the zero-copy sibling, for a different reason and
+    // with a different symptom, and the claim it left behind ("the raw-frame sibling never
+    // notices") turned out to be false. Both paths are now free of it.
+    //
+    // ffmpeg 6+ implements `-shortest` with an output SYNC QUEUE, and that queue does not
+    // buffer only when it has to: it holds every stream back by `shortest_buf_duration`,
+    // TEN SECONDS by default, and releases frames only when one stream overruns the window
+    // (`sq: N overflow heardbeat`). So the muxer runs a fixed ten seconds behind wall time
+    // on a healthy recording, and everything downstream of it is ten seconds late.
+    //
+    // What that costs, measured on the Windows dev box at 5120x1440 with the muxer's own
+    // `-loglevel debug`:
+    //
+    // * The FILE does not grow. Matroska closes a cluster on a video keyframe, or when the
+    //   cluster spans matroskaenc's 5s / 5MB limits — all three in MEDIA time. Ten seconds
+    //   of lag means the muxer had reached media 1.9s at wall 12s, so no limit was near,
+    //   and the ONE keyframe it had was the first frame: `-g 60` asks for one every 60
+    //   frames and the starved encoder had produced 57. Every block written in the whole
+    //   session went into a single unclosed cluster holding 1.4MB in memory, and the file
+    //   sat at its 1041-byte header. `MuxerWatchdog` (`MUXER_LIVENESS_SECS`, 12s) then
+    //   killed it as wedged and the recording was LOST. That is DRAGON-710's whole bug.
+    // * `hevc_mf` lost outright (3 runs of 3) and `h264_nvenc` passed by under a second:
+    //   its first cluster landed between wall 11.3s and 12.3s. The Media Foundation tier
+    //   was not the defect, it was the tier slow enough to be over the line, and every
+    //   other tier on every platform was one hiccup from the same kill.
+    // * MEMORY. The queue holds decoded frames, so ten seconds is 300 of them: 588MB
+    //   measured at 1920x540, and 3.3GB at this display's full 5120x1440.
+    // * ~60 captured frames dropped per 15s recording (`WGC capture: encoder backlog`),
+    //   against 1 without the flag.
+    //
+    // `-shortest_buf_duration` bounds the queue and was measured to fix all of the above
+    // (first cluster at wall 4.3s, 95ms of writer block per second against 1000ms), and it
+    // is deliberately NOT the fix taken: it is ffmpeg 6.0+, while a source build on the
+    // LTS distros this project names (Ubuntu 22.04 ships 4.4, Debian 12 ships 5.1) would
+    // then die at "Unrecognized option" on every single recording.
+    //
+    // Losing `-shortest` costs us nothing, for exactly the reason DRAGON-457 gives: it
+    // existed to trim video back to the audio's end, and the owned media clock already
+    // guarantees that relationship from the other side. The stop tail writes covering
+    // video ticks until video ends >= the audio's media end (`VideoTicker::ticks_to_cover`,
+    // CLAUDE.md's stop-tail rule), so what remains is at most a few frames of video past
+    // the last audio sample. Without the flag those frames are kept instead of trimmed,
+    // which is the side the invariant was always willing to pay — and it removes the
+    // failure mode where `-shortest` ends the file with real audio still queued.
+    //
+    // Measured after the change, same box, same 5120x1440 display: `mf` completes a 30s
+    // and a 60s recording, first cluster at wall 3.8s, file growing every ~2s thereafter.
+    //
+    // And with the sync queue gone, libavformat's interleave queue is now the ONLY thing
+    // standing between the encoders and the file, so it stops being left on its default
+    // (DRAGON-710). DRAGON-457 measured that default at TEN SECONDS and measured what it
+    // does when it bites: the header and nothing else, and the watchdog kills the muxer.
+    // That is the same 12s budget this path just proved it can lose against, so the two
+    // builders now share one window rather than differing in the one place that decides
+    // whether a file exists. See [`INTERLEAVE_DELTA_US`] for both edges of the band.
+    cmd.args(["-max_interleave_delta", &INTERLEAVE_DELTA_US.to_string()]);
     // NO -fps_mode cfr / -r pair here (contrast spawn_ffmpeg): the input is already
     // CFR by construction (see above), so ffmpeg's default passthrough vsync is
     // correct: adding a replacement flag would fight a stream that's already
@@ -382,10 +438,14 @@ fn spawn_recording_muxer(
 /// [`spawn_ffmpeg_encoded_media_clock`], mirroring how [`build_media_clock_command`]
 /// splits out of [`spawn_ffmpeg_media_clock`] for the same reason (argv shape
 /// unit-testable without spawning a process).
-/// How far apart the zero-copy muxer's streams may drift before libavformat flushes,
-/// in microseconds. See the long note at its use site in
+/// How far apart a recording muxer's streams may drift before libavformat flushes, in
+/// microseconds. See the long note at its use site in
 /// [`build_media_clock_encoded_command`] for why this is a band with two live edges.
-#[cfg(feature = "zero-copy")]
+///
+/// BOTH recording muxers carry it since DRAGON-710. It was zero-copy-only while the
+/// raw-frame path was believed immune ("it encodes every stream itself, so it produces
+/// video and audio packets in lockstep"), and that path then lost a recording to the same
+/// 12s watchdog by a different route. Neither builder is left on the default now.
 pub(crate) const INTERLEAVE_DELTA_US: u64 = 1_000_000;
 
 // Both edges of that band, pinned at COMPILE time (the same treatment
@@ -394,13 +454,11 @@ pub(crate) const INTERLEAVE_DELTA_US: u64 = 1_000_000;
 // at libavformat's 10s default the watchdog killed the muxer before it wrote a packet
 // (no file at all), and at 1us the streams decoupled far enough that the stop tail
 // ended the file with the audio still queued (a playable, correctly sized, MUTE file).
-#[cfg(feature = "zero-copy")]
 const _: () = assert!(
     INTERLEAVE_DELTA_US * 10 <= crate::record::MUXER_LIVENESS_SECS * 1_000_000,
     "the interleave window must stay an order of magnitude inside the muxer-liveness \
      budget, or ffmpeg is killed as wedged before it writes its first packet"
 );
-#[cfg(feature = "zero-copy")]
 const _: () = assert!(
     INTERLEAVE_DELTA_US >= 100_000,
     "too small decouples the streams and the stop tail strands a whole audio track"
@@ -439,9 +497,15 @@ fn build_media_clock_encoded_command(
     // DRAGON-457: NO `-shortest` here, and its absence is the fix — on this path it
     // silently threw away EVERY audio packet.
     //
-    // ffmpeg 8 implements `-shortest` with an output SYNC QUEUE. The raw-frame sibling
-    // encodes all three streams, so its queue behaves; here video is `-c:v copy` from a
-    // pre-encoded elementary stream while both audio tracks go through the AAC encoders,
+    // ffmpeg 8 implements `-shortest` with an output SYNC QUEUE. This said "the raw-frame
+    // sibling encodes all three streams, so its queue behaves" until DRAGON-710, which
+    // found that it does not: there the queue holds every stream back by its full
+    // `shortest_buf_duration` (10s), which starved the encoder, left matroska one
+    // never-closed cluster, and lost the recording to the muxer watchdog. Neither builder
+    // carries the flag now; see [`build_media_clock_command`] for that measurement.
+    //
+    // Here video is `-c:v copy` from a pre-encoded elementary stream while both audio
+    // tracks go through the AAC encoders,
     // and the queue discards the audio outright. ffmpeg's own accounting, muxing the same
     // 11.9s of h264 plus both audio FIFOs on the owner's box:
     //
@@ -464,9 +528,9 @@ fn build_media_clock_encoded_command(
     // DRAGON-457: WITHOUT this, nothing reaches the file until an input ends.
     //
     // libavformat holds the interleave queue until it has a packet from every stream, or
-    // until the queue spans `max_interleave_delta` — which defaults to TEN SECONDS. The
-    // raw-frame sibling never notices, because there ffmpeg encodes the video itself and
-    // so produces video and audio packets in lockstep. Here input 0 is a pre-encoded
+    // until the queue spans `max_interleave_delta` — which defaults to TEN SECONDS. This
+    // said "the raw-frame sibling never notices" until DRAGON-710; it now carries the same
+    // window, for the reason written at its use site. Here input 0 is a pre-encoded
     // elementary stream with no container timestamps, parsed by the raw `h264`/`hevc`
     // demuxer, and the queue condition is not met promptly enough — so ffmpeg sat on the
     // WHOLE recording, wrote its 928-byte header and nothing else, and `MuxerWatchdog`
@@ -595,7 +659,6 @@ mod tests {
             "the media-clock output must not force cfr — the input is already CFR: {args:?}"
         );
         assert!(!args.iter().any(|a| a == "-itsoffset"), "{args:?}");
-        assert!(args.iter().any(|a| a == "-shortest"), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["-flush_packets", "1"]), "{args:?}");
     }
 
@@ -712,20 +775,31 @@ mod tests {
         }
     }
 
-    /// The raw-frame path stays exactly as it was: it encodes every stream itself, so
-    /// neither the interleave window nor the `-shortest` sync queue ever bit it. Pinned
-    /// so the two fixes above cannot be "tidied" into the shared shape and change a
-    /// command that works.
+    /// DRAGON-710 REVERSES this test. It used to assert the opposite of both halves, on
+    /// DRAGON-457's reading that "the raw-frame path stays exactly as it was: it encodes
+    /// every stream itself, so neither the interleave window nor the `-shortest` sync
+    /// queue ever bit it". That reading was wrong, and it cost a recording: `-shortest`'s
+    /// sync queue holds every stream back by its full `shortest_buf_duration` (10s) on a
+    /// perfectly healthy pipeline, so the muxer had reached media 1.9s at wall 12s, no
+    /// matroska cluster limit was near, the starved encoder had never reached its second
+    /// keyframe, and the file was still its 1041-byte header when `MuxerWatchdog` killed
+    /// it as wedged. `hevc_mf` lost 3 runs of 3; `h264_nvenc` passed by under a second.
+    ///
+    /// So the two builders now agree, and the test pins the agreement rather than the
+    /// difference: no `-shortest` on either, and one bounded interleave window on both.
     #[test]
-    fn the_raw_frame_media_clock_command_is_left_alone() {
+    fn the_raw_frame_media_clock_command_carries_neither_shortest_nor_the_default_window() {
         let args = media_clock_args(&test_plan());
+        let i = args
+            .iter()
+            .position(|a| a == "-max_interleave_delta")
+            .unwrap_or_else(|| panic!("no -max_interleave_delta: {args:?}"));
+        let v: u64 = args[i + 1].parse().expect("numeric");
+        assert_eq!(v, INTERLEAVE_DELTA_US, "{args:?}");
         assert!(
-            !args.iter().any(|a| a == "-max_interleave_delta"),
-            "the raw-frame muxer must keep its historical argv: {args:?}"
-        );
-        assert!(
-            args.iter().any(|a| a == "-shortest"),
-            "the raw-frame muxer KEEPS -shortest; only the zero-copy one drops it: {args:?}"
+            !args.iter().any(|a| a == "-shortest"),
+            "-shortest runs the muxer 10s behind wall time and the watchdog kills it: \
+             {args:?}"
         );
     }
 
@@ -746,6 +820,48 @@ mod tests {
                 "-shortest drops ALL audio on the stream-copy path (hevc={hevc}): {args:?}"
             );
         }
+    }
+
+    /// DRAGON-701: the Media Foundation plan reaches ffmpeg as a whole invocation, with no
+    /// special case anywhere in this module. That is the point of the test rather than an
+    /// incidental property: every encoder tier is data in `EncodePlan`, so the ONE thing
+    /// worth pinning is that a plan shaped like the MF one still comes out as the right
+    /// command line: the NV12 feed on the input side, the encoder's own options in order,
+    /// and the `-b:v` bitrate TARGET that `quality_rc: false` selects. MF needs that last
+    /// one: `mfenc` writes the bitrate into the output media type, where a zero is a media
+    /// type a hardware MFT can refuse.
+    #[test]
+    fn media_clock_command_emits_the_h264_mf_invocation() {
+        let plan = EncodePlan {
+            pre: Vec::new(),
+            codec: vec![
+                "-c:v".into(), "h264_mf".into(), "-hw_encoding".into(), "true".into(),
+                "-rate_control".into(), "pc_vbr".into(),
+                "-scenario".into(), "display_remoting".into(), "-g".into(), "60".into(),
+            ],
+            env: Vec::new(),
+            vf: None,
+            color_tags: false,
+            nv12: true,
+            input_pix_fmt: "rgba",
+            quality_rc: false,
+        };
+        let args = media_clock_args(&plan);
+        // The encoder options survive contiguously, in the order the plan set them.
+        let c = args.iter().position(|a| a == "-c:v").expect("has -c:v");
+        assert_eq!(
+            &args[c..c + 10],
+            [
+                "-c:v", "h264_mf", "-hw_encoding", "true",
+                "-rate_control", "pc_vbr", "-scenario", "display_remoting", "-g", "60",
+            ]
+        );
+        // The NV12 hardware feed, and the bitrate target the plan's `quality_rc: false` asks
+        // for (a quality-RC plan would carry `-maxrate` alone).
+        let pf = args.iter().position(|a| a == "-pix_fmt").expect("has -pix_fmt");
+        assert_eq!(args[pf + 1], "nv12");
+        assert!(args.windows(2).any(|w| w == ["-b:v", "8000k"]), "{args:?}");
+        assert!(!args.iter().any(|a| a == "-filter_complex"), "no upload filter: {args:?}");
     }
 
     #[test]

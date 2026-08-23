@@ -230,7 +230,7 @@ pub(super) fn windowed_fit_size_with(
 /// ([`crate::platform::overlay_point_scale`]) so "how far apart are the two spaces on this
 /// OS" keeps a single answer. Windows: that monitor's `dpi / 96`. macOS / Linux: `1.0`.
 ///
-/// `None` = no NAMED display anchors this preview (`--preview`, a handed-over document, a
+/// `None` = no NAMED display anchors this preview (`editor`, a handed-over document, a
 /// capture whose outputs are already torn down). There is then no capture space to convert
 /// FROM, so the caller has already resolved points and the answer is the identity — exactly
 /// the pre-DRAGON-449 behaviour, never a guess.
@@ -274,7 +274,7 @@ pub(super) fn monitor_fit_points(capture: (u32, u32), point_scale: f32) -> (u32,
 }
 
 /// The largest known output, in LOGICAL POINTS — the monitor bound a preview with NO capture
-/// anchor opens against (`--preview`, and a handed-over document on a host whose own capture
+/// anchor opens against (`editor`, and a handed-over document on a host whose own capture
 /// is long finished). Each output converts through its OWN [`OutputState::point_scale`]
 /// (DRAGON-448/449), so a mixed-DPI desktop compares like with like instead of letting a
 /// high-DPI panel win on physical pixels alone. `None` when no output is known — the caller
@@ -364,7 +364,7 @@ fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
     // Top bar (DRAGON-392): ⟨split⟩ save/save-as/copy/delete(4). The filesize chip that used to
     // sit here for VIDEOS moved to their bottom bar, and the images' info block leads the LEFT
     // side with the annotation tray — like the tray itself it isn't counted, because that whole
-    // leading row wraps gracefully. `--preview` drops Delete, so four is the wider case and the
+    // leading row wraps gracefully. `editor` drops Delete, so four is the wider case and the
     // one to reserve for.
     let top = bar(group(4.0), 2.0);
 
@@ -746,7 +746,7 @@ mod monitor_points_tests {
                 super::shell::preview_min_size((capture.0 as f32, capture.1 as f32)),
             );
         }
-        // An UNKNOWN display (no name to resolve, a `--preview` file, a torn-down capture)
+        // An UNKNOWN display (no name to resolve, an `editor` file, a torn-down capture)
         // is the identity too — never a guess.
         assert_eq!(monitor_point_scale(None), 1.0);
     }
@@ -817,7 +817,7 @@ mod monitor_points_tests {
     }
 
     /// Mixed DPI: the largest output is chosen by its POINT area, so a small high-DPI panel
-    /// can't out-vote a big 100% display on physical pixels alone. (The `--preview` /
+    /// can't out-vote a big 100% display on physical pixels alone. (The `editor` /
     /// handed-over-document bound.)
     #[test]
     fn the_largest_output_is_measured_in_points() {

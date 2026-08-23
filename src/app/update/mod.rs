@@ -6,6 +6,7 @@
 mod capture;
 mod color_picker;
 mod detect;
+mod ink;
 mod recording;
 mod settings;
 mod permissions;

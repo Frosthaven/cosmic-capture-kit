@@ -10,6 +10,8 @@
 //!   with the wallpaper excluded.
 //! - [`WindowCaptureJob`]: the off-thread window-capture pipeline used by the app.
 
+use crate::{err, errln};
+
 use cosmic_client_toolkit::screencopy::{
     CaptureOptions, CaptureSession, CaptureSource, Formats, Rect, ScreencopyCursorSessionData,
     ScreencopyFrameData, ScreencopySessionData,
@@ -831,13 +833,13 @@ pub(crate) fn windows(identifiers: &[String]) -> HashMap<String, RgbaImage> {
 /// stderr; makes no state changes.
 pub fn bench_window_capture() {
     use std::time::Instant;
-    eprintln!("== cosmic-capture-kit capture bench (3 rounds) ==");
+    errln!("== cosmic-capture-kit capture bench (3 rounds) ==");
     for round in 0..3 {
         let t = Instant::now();
         let conn = connect(true);
         let connect_true = t.elapsed();
         let Some((conn, mut queue, mut data)) = conn else {
-            eprintln!("connect(true) failed (is WAYLAND_DISPLAY set?)");
+            errln!("connect(true) failed (is WAYLAND_DISPLAY set?)");
             return;
         };
         let tops: Vec<(String, ExtForeignToplevelHandleV1)> = data
@@ -846,7 +848,7 @@ pub fn bench_window_capture() {
             .map(|t| (t.identifier.clone(), t.foreign_toplevel.clone()))
             .collect();
         let outs = outputs(&data);
-        eprint!("round {round}: toplevels={} connect(true)={connect_true:?}", tops.len());
+        err!("round {round}: toplevels={} connect(true)={connect_true:?}", tops.len());
         if let Some((id, h)) = tops.first() {
             let t = Instant::now();
             let img = capture_source(
@@ -856,7 +858,7 @@ pub fn bench_window_capture() {
                 &CaptureSource::Toplevel(h.clone()),
                 false,
             );
-            eprint!(
+            err!(
                 " | toplevel[{}] capture_source={:?} dims={:?}",
                 id,
                 t.elapsed(),
@@ -867,15 +869,15 @@ pub fn bench_window_capture() {
                 let mut buf = std::io::Cursor::new(Vec::new());
                 let _ = image::DynamicImage::ImageRgba8(img)
                     .write_to(&mut buf, image::ImageFormat::Png);
-                eprint!(" png_encode={:?} ({}KB)", t.elapsed(), buf.into_inner().len() / 1024);
+                err!(" png_encode={:?} ({}KB)", t.elapsed(), buf.into_inner().len() / 1024);
             }
         }
         if let Some((o, name, _, sz)) = outs.into_iter().next() {
             let t = Instant::now();
             let _ = capture_source(&conn, &mut queue, &mut data, &CaptureSource::Output(o), false);
-            eprint!(" | output[{name} {sz:?}] capture_source={:?}", t.elapsed());
+            err!(" | output[{name} {sz:?}] capture_source={:?}", t.elapsed());
         }
-        eprintln!();
+        errln!();
     }
     if let Some(p) = bench_wallpaper_path() {
         let t = Instant::now();
@@ -883,7 +885,7 @@ pub fn bench_window_capture() {
         let cold = t.elapsed();
         let t = Instant::now();
         let _warm = crate::wallpaper::decode_wallpaper(&p);
-        eprintln!(
+        errln!(
             "wallpaper decode [{}] cold={cold:?} warm(memo)={:?} dims={:?}",
             p.display(),
             t.elapsed(),
@@ -897,7 +899,7 @@ pub fn bench_window_capture() {
     {
         let t = Instant::now();
         let _ = connect_for_toplevel(&id);
-        eprintln!("connect_for_toplevel([{id}]) = {:?}", t.elapsed());
+        errln!("connect_for_toplevel([{id}]) = {:?}", t.elapsed());
     }
 }
 

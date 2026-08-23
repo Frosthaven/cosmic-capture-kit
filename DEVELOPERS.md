@@ -5,7 +5,7 @@ Everything day to day runs through [`just`](https://github.com/casey/just).
 what it will do to your machine.
 
 For what the app depends on, at runtime and at build time, see
-[dependencies.md](dependencies.md); for the flag list, [CLI.md](CLI.md).
+[dependencies.md](dependencies.md); for the command list, [CLI.md](CLI.md).
 
 ## The short version
 
@@ -18,9 +18,11 @@ binary, print the path to use. Bind that path to a shortcut once and it survives
 every rebuild, and every SWITCH between artifacts, because it is one stable path
 that every build recipe repoints at whatever it just made.
 
-There is no application window to open. This is a one-shot tool: a bare launch
-goes straight into a region capture and then exits, and `--settings` opens the
-settings window instead of capturing. [CLI.md](CLI.md) lists every flag.
+There is no application window to open. This is a one-shot tool: `capture` goes
+straight into a region capture and then exits, and `settings` opens the settings
+window instead of capturing. A bare launch takes nothing at all: from a terminal
+it prints the help, and from the desktop it starts the tray, or settings when the
+tray is off. [CLI.md](CLI.md) lists every command.
 
 ## Before the first build
 
@@ -80,11 +82,11 @@ prints it in cyan as its last line, absolute and ready to paste:
 ```
 ==> Use this path for shortcuts and CLI commands:
        /home/you/src/cosmic-capture-kit/target/artifacts/cosmic-capture-kit
-       e.g.  /home/you/src/cosmic-capture-kit/target/artifacts/cosmic-capture-kit --region
+       e.g.  /home/you/src/cosmic-capture-kit/target/artifacts/cosmic-capture-kit capture --region
 ```
 
-Flags pass straight through whichever artifact is behind it. The plain binary and
-the AppImage take them directly, and the Flatpak's exported launcher forwards
+Commands pass straight through whichever artifact is behind it. The plain binary
+and the AppImage take them directly, and the Flatpak's exported launcher forwards
 `"$@"`.
 
 This exists because the alternative bit: with one shortcut on the AppImage and
@@ -108,7 +110,7 @@ Two per-platform differences, both because of what the OS can actually launch:
 If you install the app normally there is no symlink and none of this applies. The
 Settings window's Global shortcuts tab shows the command for the package you are
 actually running, which for a Flatpak reads
-`flatpak run dev.thedragon.CosmicCaptureKit --flag`. Both are correct; the
+`flatpak run dev.thedragon.CosmicCaptureKit <command>`. Both are correct; the
 symlink is a developer convenience for a machine carrying three artifacts at
 once, and the settings command is what a normal install needs.
 
@@ -143,8 +145,9 @@ spawning capture children from two different builds.
 
 On Linux it identifies instances by `/proc/<pid>/exe` rather than by command
 line, because a Flatpak instance's argv on the host is a bare
-`cosmic-capture-kit resident` with no path in it, and every path-anchored pattern
-missed it. The exe path always ends in the binary's name, whether it is
+`cosmic-capture-kit tray` with no path in it, and every path-anchored pattern
+missed it. Reading the exe also means an older build still saying `resident`
+gets swept the same way. The exe path always ends in the binary's name, whether it is
 `target/release/…`, a `/tmp/.mount_…/usr/bin/…` AppImage mount or `/app/bin/…`
 inside the sandbox, and matching it cannot accidentally hit an editor with the
 source open, which a name pattern always can (the checkout directory is itself
@@ -248,7 +251,7 @@ cargo install --path .
 ```
 
 Add `--no-default-features` here too if that is how the build works on your
-distro. It lands in `~/.cargo/bin`, so `cosmic-capture-kit --settings` then works
+distro. It lands in `~/.cargo/bin`, so `cosmic-capture-kit settings` then works
 from any directory.
 
 An application-menu entry is a separate step, and has to come after the install,

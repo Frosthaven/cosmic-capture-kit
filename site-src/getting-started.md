@@ -24,7 +24,11 @@ That is the whole shape of the app:
 
 Download the latest `.dmg` from the
 [releases page](https://github.com/Frosthaven/cosmic-capture-kit/releases) and
-drag the app into Applications. macOS 13 or later, on Apple Silicon.
+drag the app into Applications. macOS 13 or later.
+
+There are two builds, one per processor. Take the `aarch64` one for an Apple
+Silicon Mac (M1 and later) and the `x86_64` one for an Intel Mac. The Apple
+menu's "About This Mac" names the chip if you are not sure.
 
 ### Windows
 
@@ -98,25 +102,25 @@ A fresh install ships with **no capture key set**. You choose your own in
 ### Linux
 
 Your desktop owns the keys, so you add them there. Point a custom shortcut at
-the app with the flag for the capture you want. On COSMIC that is
+the app with the command for the capture you want. On COSMIC that is
 Settings, then Keyboard, then Shortcuts, then Custom shortcuts.
 
 | Command | A key that suits it |
 |---|---|
-| `cosmic-capture-kit --region` | `Alt+Shift+1` |
-| `cosmic-capture-kit --active-window` | `Alt+Shift+2` |
-| `cosmic-capture-kit --active-monitor` | `Alt+Shift+3` |
-| `cosmic-capture-kit --color-picker` | `Alt+Shift+C` |
+| `cosmic-capture-kit capture --region` | `Alt+Shift+1` |
+| `cosmic-capture-kit capture --active-window` | `Alt+Shift+2` |
+| `cosmic-capture-kit capture --active-monitor` | `Alt+Shift+3` |
+| `cosmic-capture-kit color --picker` | `Alt+Shift+C` |
 
 The Global tab in Settings shows the same list with the command for each one, so
 you can copy them from there instead of typing them.
 
-Add `--no-editor` to any of them for a variant that skips the editor. The
+Add `--skip-editor` to any of them for a variant that skips the editor. The
 capture is still saved, copied to the clipboard and announced by a
 notification, and clicking that notification opens the folder with the file
 selected.
 
-The [command line page](cli.md) lists every flag.
+The [command line page](cli.md) lists every command.
 
 ## Opening settings
 
@@ -124,7 +128,7 @@ Settings is a normal window, and it does not take a capture.
 
 - **macOS and Windows**: use the menu bar or notification area icon, or the
   Cosmic Capture Kit Settings shortcut in the Start Menu on Windows.
-- **Any platform**: run the app with `--settings`.
+- **Any platform**: run `cosmic-capture-kit settings`.
 
 Everything you change is saved as you change it. There is no Apply button.
 

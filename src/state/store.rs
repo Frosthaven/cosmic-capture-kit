@@ -78,7 +78,7 @@ fn load_raw() -> Option<Persisted> {
 
 /// Current config schema version. Bump when a stored index changes meaning and
 /// add a guarded step in `migrate`.
-pub const CONFIG_VERSION: u32 = 12;
+pub const CONFIG_VERSION: u32 = 13;
 
 /// One-time migrations for configs saved by older versions, keyed on
 /// `config_version`. Idempotent — running it on an already-current config is a
@@ -277,8 +277,26 @@ fn migrate(p: &mut Persisted) {
             p.preferred_encoder = "auto".to_string();
         }
     }
+    if p.config_version < 13 {
+        // v13 (DRAGON-695): the pre-capture countdown was `delay_idx`, an index into the
+        // overlay's four delay chips (0/3/5/10s). It is `countdown_secs` now, the seconds
+        // themselves, because the new `timer <0-99>` command can set a value no chip offers
+        // and an index cannot hold one.
+        //
+        // The v3/v7 shape: read the legacy field ONCE here, map it, and never write it again
+        // (it is `skip_serializing` now). Out-of-range indices clamp to the last preset, which
+        // is what every reader of `delay_idx` already did.
+        const PRESETS: [u64; 4] = [0, 3, 5, 10];
+        if p.countdown_secs == 0 {
+            p.countdown_secs = PRESETS[p.delay_idx.min(PRESETS.len() - 1)];
+        }
+        p.delay_idx = 0;
+    }
     // Version-independent safety net: an empty id (hand-edited config) falls back
     // to the platform default rather than persisting as unset.
+    // DRAGON-695: and a hand-edited countdown outside the command's own range clamps rather
+    // than persisting a value no surface can express.
+    p.countdown_secs = p.countdown_secs.min(99);
     if p.record_backend.is_empty() {
         p.record_backend = crate::platform::backend::native_backend_id().to_string();
     }
@@ -529,7 +547,7 @@ record_fps = 60\n";
         assert!(d.scan_codes);
         assert!(d.scan_text);
         assert_eq!(d.region, None);
-        assert_eq!(d.delay_idx, 0);
+        assert_eq!(d.countdown_secs, 0);
         // Uncalibrated by default; an old config (no key) reads the same way.
         assert_eq!(d.av_calibration_base_ms, 0);
         // Appearance (DRAGON-139): follow the system by default, overrides at their
@@ -545,6 +563,39 @@ record_fps = 60\n";
         assert_eq!(d.appearance_roundness, 1);
         #[cfg(not(target_os = "windows"))]
         assert_eq!(d.appearance_roundness, 0);
+    }
+
+    /// DRAGON-695 v13: the four-preset `delay_idx` becomes exact `countdown_secs`. A config
+    /// written by any older build carries only the index, and the seconds it meant have to
+    /// survive the upgrade, or every user's countdown silently resets to off.
+    #[test]
+    fn migrate_v13_turns_the_delay_preset_into_seconds() {
+        for (idx, secs) in [(0usize, 0u64), (1, 3), (2, 5), (3, 10)] {
+            let mut p = defaults();
+            p.config_version = 12;
+            p.delay_idx = idx;
+            p.countdown_secs = 0;
+            migrate(&mut p);
+            assert_eq!(p.countdown_secs, secs, "preset {idx}");
+            assert_eq!(p.config_version, CONFIG_VERSION);
+        }
+        // An out-of-range index (a hand-edited config) clamps to the last preset, which is
+        // what every reader of `delay_idx` already did.
+        let mut q = defaults();
+        q.config_version = 12;
+        q.delay_idx = 99;
+        migrate(&mut q);
+        assert_eq!(q.countdown_secs, 10);
+        // Idempotent: a CURRENT config with an exact value no preset offers keeps it.
+        let mut r = defaults();
+        r.countdown_secs = 7;
+        migrate(&mut r);
+        assert_eq!(r.countdown_secs, 7);
+        // And a hand-edited value past the command's range clamps rather than persisting.
+        let mut big = defaults();
+        big.countdown_secs = 5000;
+        migrate(&mut big);
+        assert_eq!(big.countdown_secs, 99);
     }
 
     #[test]

@@ -48,16 +48,16 @@ appimage arch="x86_64":
     just appimage-windows
 
 [linux]
-ffmpeg-win:
-    just ffmpeg-win-linux
+ffmpeg-win arch="x86_64":
+    just ffmpeg-win-linux {{arch}}
 
 [macos]
-ffmpeg-win:
-    just ffmpeg-win-linux
+ffmpeg-win arch="x86_64":
+    just ffmpeg-win-linux {{arch}}
 
 [windows]
-ffmpeg-win:
-    just ffmpeg-win-windows
+ffmpeg-win arch="x86_64":
+    just ffmpeg-win-windows {{arch}}
 
 [linux]
 dev:
@@ -109,16 +109,28 @@ build-macos:
         done
         echo "==> Baked cloud ids from GitHub repository variables"
     fi
+    # THE HOST'S OWN ARCHITECTURE, always (DRAGON-700). This is the dev-loop
+    # recipe: it ends by pointing the stable path at what it built, and the
+    # PrintScreen shortcut launches that, so a build this machine cannot execute
+    # would break the one guarantee that path makes. The RELEASE recipe is CI,
+    # which builds both. `mac-package.sh` defaults to aarch64 and
+    # `fetch-mac-vendor.sh` to the host, so naming it here keeps the two from
+    # disagreeing on an Intel Mac.
+    case "$(uname -m)" in
+        arm64)  HOST_LABEL=aarch64; HOST_CPU=arm64 ;;
+        x86_64) HOST_LABEL=x86_64;  HOST_CPU=x86_64 ;;
+        *) echo "==> unknown mac architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
     # Pull the SAME sidecars CI ships, rather than packaging whatever happens to
     # be in vendor/ from some earlier download (DRAGON-531). Idempotent, so this
     # is free once they are present.
-    ./scripts/fetch-mac-vendor.sh
+    ./scripts/fetch-mac-vendor.sh --arch "$HOST_CPU"
     if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
         echo "==> Developer ID identity found; building signed."
-        ./scripts/mac-package.sh --build --icns --bundle --sign
+        ./scripts/mac-package.sh --arch "$HOST_LABEL" --build --icns --bundle --sign
     else
         echo "==> No Developer ID identity in the login keychain; building unsigned."
-        ./scripts/mac-package.sh --build --icns --bundle
+        ./scripts/mac-package.sh --arch "$HOST_LABEL" --build --icns --bundle
     fi
     echo "==> Built: target/release/bundle/Cosmic Capture Kit.app"
     # The shared output dir (DRAGON-590). TWO entries on macOS, because a bundle
@@ -297,14 +309,14 @@ dist:
     # daemon, "the path means my latest build" stops being true and the confusion
     # this all exists to remove comes straight back.
     bash scripts/stop-all.sh
-    setsid -f "$DIST" resident >/dev/null 2>&1
+    setsid -f "$DIST" tray >/dev/null 2>&1
     sleep 1
     # A WARNING, not a failure, unlike the appimage and flatpak recipes. Those two
     # have always ended in a daemon and a broken one means the recipe did not do
     # its job. This one's job is the ARTIFACT, and it took ten minutes of container
     # time to make; a daemon that needed 1.5 seconds instead of 1 must not throw
     # that away.
-    pgrep -f 'cosmic-capture-kit-dist resident' >/dev/null \
+    pgrep -f 'cosmic-capture-kit-dist tray' >/dev/null \
         && echo "==> Daemon restarted on the shipping binary" \
         || echo "==> WARNING: the shipping-binary daemon did not come up (the artifact is fine)"
     cck_stable "$DIST"
@@ -391,15 +403,17 @@ flatpak:
     # so the recipe never actually stopped the thing it was about to reinstall. Read
     # scripts/stop-all.sh before adding a pattern anywhere else.
     bash scripts/stop-all.sh
-    # Seed `resident = true` in the Flatpak's own config, which is the one thing that
-    # makes this recipe's promise true.
+    # Seed `resident = true` in the Flatpak's own config, so the sandbox's own settings
+    # agree with what this recipe leaves running.
     #
     # The sandbox has a PRIVATE config dir (~/.var/app/<id>/config), so it starts fresh
     # no matter what the host's copy says, and `default_resident()` is FALSE on Linux by
     # design: PrintScreen there is a COSMIC custom shortcut, not something a daemon owns.
-    # A bare `resident` launch therefore falls straight through to `app::run` and tries to
-    # CAPTURE instead of becoming the daemon, which looks exactly like "the daemon did not
-    # start" while a process is very much running.
+    # The SETTING is still spelled `resident`; only the argv word became `tray`
+    # (DRAGON-695), and `tray` runs the daemon whatever the setting says, so the seed is
+    # no longer what makes the daemon start. It is here so the tray's own menu, the
+    # autostart entry and anything else reading the setting say the same thing the
+    # running process does.
     CFG="$HOME/.var/app/$APP/config/cosmic-capture-kit/config.toml"
     mkdir -p "$(dirname "$CFG")"
     if [ -f "$CFG" ] && grep -q '^resident *=' "$CFG"; then
@@ -407,13 +421,13 @@ flatpak:
     else
         echo 'resident = true' >> "$CFG"
     fi
-    setsid -f flatpak run --user "$APP" resident >/dev/null 2>&1
+    setsid -f flatpak run --user "$APP" tray >/dev/null 2>&1
     sleep 3
     # Match the RESIDENT specifically, not merely "some instance of this app is alive".
     # The host CAN see the argv through the bwrap wrapper (`bwrap ... -- cosmic-capture-kit
-    # resident`), so this is a real check; `flatpak ps` is not, because it answers true for
+    # tray`), so this is a real check; `flatpak ps` is not, because it answers true for
     # a capture child, a settings window, or a lingering one-shot that never became a daemon.
-    pgrep -f 'cosmic-capture-kit resident' >/dev/null \
+    pgrep -f 'cosmic-capture-kit tray' >/dev/null \
         && echo "==> Daemon restarted as the Flatpak" \
         || { echo "==> ERROR: the Flatpak daemon did not come up"; exit 1; }
     echo "==> App:  $APP (user installation)"
@@ -493,9 +507,9 @@ appimage-linux:
     # path. See scripts/stop-all.sh, which also explains why more than one can be
     # running at once (the single-instance locks cannot see across a sandbox).
     bash scripts/stop-all.sh
-    setsid -f "$APPIMAGE" resident >/dev/null 2>&1
+    setsid -f "$APPIMAGE" tray >/dev/null 2>&1
     sleep 2
-    pgrep -f 'CosmicCaptureKit-[^/]*\.AppImage resident' >/dev/null \
+    pgrep -f 'CosmicCaptureKit-[^/]*\.AppImage tray' >/dev/null \
         && echo "==> Daemon restarted on the AppImage" \
         || { echo "==> ERROR: the AppImage daemon did not come up"; exit 1; }
     echo "==> AppImage:    $APPIMAGE"
@@ -592,16 +606,27 @@ appimage-windows:
 # installs. It does NOT publish either: the archive lands in target/artifacts/
 # and the build prints the `gh release upload` line plus the two pins.env lines
 # to paste, because putting a binary in front of users is a human's decision.
-ffmpeg-win-linux:
+#
+# TWO ARCHITECTURES since DRAGON-702: `just ffmpeg-win` is the x86_64 build and
+# `just ffmpeg-win aarch64` the ARM64 one. They are separate images and separate
+# published archives, pinned under separate keys. Both producer runs landed
+# 2026-08-17 (cck2, published and pinned, from the Linux box);
+# scripts/ffmpeg-win/build.sh's header carries the status and what remains.
+ffmpeg-win-linux arch="x86_64":
     #!/usr/bin/env bash
     set -euo pipefail
     command -v docker >/dev/null 2>&1 || { echo "==> docker is required to build the Windows ffmpeg"; exit 1; }
+    ARCH="{{arch}}"
+    case "$ARCH" in x86_64|aarch64) ;; *) echo "==> arch must be x86_64 or aarch64, got '$ARCH'"; exit 1 ;; esac
     OUT="$PWD/target-ffmpeg-win"
     mkdir -p "$OUT"
+    # ONE image per target architecture, tagged apart (DRAGON-702), so building
+    # both does not make each rebuild the other's layers from scratch.
+    IMAGE="cck-ffmpeg-win-$ARCH"
     # NOT `-q`: the first run compiles x264, x265, SDL2 and oneVPL for several
     # minutes, and a silent terminal for that long reads as a hang.
-    echo "==> Preparing the build image (cached after the first run)..."
-    docker build -f scripts/ffmpeg-win/Dockerfile -t cck-ffmpeg-win scripts
+    echo "==> Preparing the build image for $ARCH (cached after the first run)..."
+    docker build --build-arg "CCK_WIN_ARCH=$ARCH" -f scripts/ffmpeg-win/Dockerfile -t "$IMAGE" scripts
     # As the CALLING user on Linux, so nothing in target-ffmpeg-win/ comes back
     # root-owned. macOS virtualises the bind mount's uid already.
     #
@@ -614,7 +639,7 @@ ffmpeg-win-linux:
     fi
     docker run --rm "${USER_ARGS[@]+"${USER_ARGS[@]}"}" \
         -v "$PWD:/src:ro" -v "$OUT:/out" \
-        cck-ffmpeg-win bash /src/scripts/ffmpeg-win/build.sh
+        "$IMAGE" bash /src/scripts/ffmpeg-win/build.sh
     # The script reports the artifact's NAME; the path is the host's, not the
     # container's (they are the same file under two different roots).
     . "$OUT/ffmpeg-win.env"
@@ -623,13 +648,49 @@ ffmpeg-win-linux:
     # log: target/artifacts/ holds one finished artifact per recipe, and the
     # hash's real home is the pins.env line the build just printed.
     ARCHIVE="$(cck_publish_move "$OUT/$CCK_FFMPEG_WIN_ARCHIVE")"
-    echo "==> NVENC API: $CCK_FFMPEG_WIN_NVENC_API (the NVIDIA driver floor this build declares)"
+    # Empty on ARM64: there is no NVENC there, so there is no driver floor to
+    # declare and printing a blank one would read as a missing value.
+    if [ -n "${CCK_FFMPEG_WIN_NVENC_API:-}" ]; then
+        echo "==> NVENC API: $CCK_FFMPEG_WIN_NVENC_API (the NVIDIA driver floor this build declares)"
+    fi
     # The stable path is deliberately untouched: this is not the app, and on two
     # of the three hosts it is not even a runnable binary.
     cck_say_artifact "$ARCHIVE"
 
-ffmpeg-win-windows:
-    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 ffmpeg-win
+ffmpeg-win-windows arch="x86_64":
+    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 ffmpeg-win {{arch}}
+
+# Build the macOS ffmpeg (DRAGON-689). macOS ONLY, and unlike its Windows
+# counterpart there is no container: an ObjC build against the macOS SDK needs a
+# Mac, so this is a thin wrapper over the script and the script is the whole
+# thing.
+#
+# WHY WE BUILD SOMEBODY ELSE'S PROGRAM HERE: the mac used to bundle two STATIC
+# prebuilts, so every codec library was compiled into BOTH programs and the pair
+# was 132 MB of a 175 MiB .app. One shared build is one copy of that code, and
+# the deployment target, which decides which Macs can run the app at all, becomes
+# a pin we set rather than one we inherit.
+#
+# THIS IS A PRODUCER, run once per pin move. Nothing else here ever builds the
+# macOS ffmpeg: CI, `just build` and the dmg all FETCH the published archive
+# through scripts/fetch-mac-vendor.sh, so the dev loop runs the exact bytes a
+# customer's .app carries. It does NOT publish either: the archive lands in
+# target/artifacts/ and the build prints the `gh release upload` line plus the
+# two pins.env lines to paste, because putting a binary in front of users is a
+# human's decision.
+#
+# ONE ARCHIVE PER ARCHITECTURE since DRAGON-700, and they are only ever published
+# as a pair, because both are built from the same pins and a half-moved pair
+# means one dmg ships an ffmpeg the other does not:
+#
+#   just ffmpeg-mac            # arm64, the default
+#   just ffmpeg-mac x86_64     # Intel, cross-compiled on this same Mac
+#
+# The x86_64 build needs nasm for x264's SIMD (`brew install nasm`); the arm64
+# one has no use for it and does not ask.
+[macos]
+ffmpeg-mac arch="arm64":
+    bash scripts/ffmpeg-mac/build.sh --arch {{arch}}
 
 # Update the RUNNING resident daemon to the freshly built binary, on any
 # platform: build, stop the old daemon, start the new one, and print the
@@ -651,9 +712,9 @@ dev-linux:
     # the daemon: it keeps running against a now-deleted inode, so its
     # `current_exe` respawns fail silently while it goes on serving the old code.
     bash scripts/stop-all.sh
-    setsid -f target/release/cosmic-capture-kit resident >/dev/null 2>&1
+    setsid -f target/release/cosmic-capture-kit tray >/dev/null 2>&1
     sleep 1
-    pgrep -f 'target/release/cosmic-capture-kit resident' >/dev/null \
+    pgrep -f 'target/release/cosmic-capture-kit tray' >/dev/null \
         && echo "==> Daemon restarted on the fresh binary" \
         || { echo "==> ERROR: daemon did not come up"; exit 1; }
     # `just build` already pointed the stable path here; say it again, last, so it
@@ -686,7 +747,7 @@ dev-macos:
     # reproduction (this recipe's own shebang) never showed the bug. `open -a`
     # sidesteps the whole class of problem: it is the same mechanism already
     # used everywhere else to relaunch this app reliably during development.
-    open -a "$(pwd)/target/release/bundle/Cosmic Capture Kit.app" --args resident
+    open -a "$(pwd)/target/release/bundle/Cosmic Capture Kit.app" --args tray
     sleep 1
     pgrep -f 'Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit' >/dev/null \
         && echo "==> Daemon restarted on the fresh binary" \

@@ -1,7 +1,7 @@
 //! General settings page section builder.
 
 use super::super::*;
-use super::super::row::{opacity_slider, reset_button, toggle, Item, SectionSpec};
+use super::super::row::{num_input, opacity_slider, reset_button, toggle, Item, SectionSpec};
 
 impl crate::app::App {
     /// Every General-page section (both in-page tabs concatenated). The single
@@ -26,17 +26,29 @@ impl crate::app::App {
                 title: "Behavior",
                 items: {
                     // DRAGON-351: the "Allow multiple capture instances" toggle used to
-                    // lead this section; the behaviour is unconditional now, so the row
-                    // is gone and the section starts empty.
-                    #[cfg_attr(
-                        not(any(
-                            target_os = "macos",
-                            target_os = "linux",
-                            target_os = "windows"
-                        )),
-                        allow(unused_mut)
-                    )]
-                    let mut items: Vec<Item<'_>> = Vec::new();
+                    // lead this section; the behaviour is unconditional now.
+                    //
+                    // DRAGON-695 gave the section its first row back: the DEFAULT countdown.
+                    // It had no settings row at all before, only the overlay's four delay
+                    // chips and the tray's Countdown Timer submenu, so a value none of those
+                    // offers (the `timer 7` the new command can write) was visible nowhere.
+                    // Free text for the same reason: the presets are a convenience, not the
+                    // range.
+                    let mut items: Vec<Item<'_>> = vec![
+                        Item::new(
+                            "Countdown before capture",
+                            "Every screenshot and recording waits this long before it starts.                              0 turns it off.",
+                            num_input("0", &self.countdown_secs.text, |a0| {
+                                Msg::Settings(SettingsMsg::SetCountdownSecs(a0))
+                            }),
+                        )
+                        .suffix("seconds")
+                        .reset_with(
+                            self.countdown_secs.text.clone(),
+                            d.countdown_secs.to_string(),
+                            |a0| Msg::Settings(SettingsMsg::SetCountdownSecs(a0)),
+                        ),
+                    ];
                     // Stay resident: keep the tray/menu-bar RESIDENT process alive so a
                     // capture is always one click away. macOS (DRAGON-130) is a menu-bar
                     // daemon with a global hotkey; Windows (DRAGON-237) is a Win32 tray

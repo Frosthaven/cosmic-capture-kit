@@ -14,7 +14,7 @@
 //! Settings buttons ([`crate::app::settings::deps`]); this is the RICHER, dedicated
 //! surface a first run / a missing-permission capture routes to, with the caveat
 //! text and the Relaunch affordance the compact Health rows can't carry. It mirrors
-//! the `--settings` window plumbing exactly (a `PermissionsState` like
+//! the `settings` window plumbing exactly (a `PermissionsState` like
 //! `SettingsState`, `open_permissions_window` like `open_config_window`, a
 //! `view_window` branch, a `sub_*` live poll), so the two never diverge.
 //!
@@ -195,8 +195,8 @@ pub struct Probe {
 pub struct PermissionsState {
     /// The permissions toplevel window, when open (`None` while closed).
     pub window: Option<window::Id>,
-    /// Launched via `--permissions` (or first-run routing): closing the window exits
-    /// the app, exactly as `SettingsState::only` does for `--settings`.
+    /// Launched via `permissions` (or first-run routing): closing the window exits
+    /// the app, exactly as `SettingsState::only` does for `settings`.
     pub only: bool,
     /// The most recent live-status snapshot (seeded at open, refreshed each poll).
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]

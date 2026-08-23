@@ -75,6 +75,27 @@ impl Default for Presets {
     }
 }
 
+/// The speed/quality preset the recording metadata line reports for `encoder`: the NVENC
+/// `p1`-`p7` ladder, the x264 named ladder, VAAPI's compression level (`cl3`, or
+/// `cl-default` when left to the driver), and `-` for every tier that has no preset of its
+/// own (AMF, QSV, Media Foundation, VideoToolbox).
+///
+/// Pure, unit-tested. It is a function of [`Presets`] alone because two callers need the
+/// same answer from different places (DRAGON-754): `App::preset_label` builds the line at
+/// spawn time, and `record::annotate_session_encoder` rewrites the field once the worker
+/// knows which tier actually won. A second copy of this table would let the two disagree.
+pub fn session_preset_label(encoder: &str, presets: &Presets) -> String {
+    match encoder {
+        "nvenc" => presets.nvenc.clone(),
+        "software" => presets.x264.clone(),
+        "vaapi" => match presets.vaapi_cl {
+            -1 => "cl-default".to_string(),
+            cl => format!("cl{cl}"),
+        },
+        _ => "-".to_string(),
+    }
+}
+
 /// Validate a persisted/CLI NVENC preset against the known ladder, falling back to
 /// the default so a bad value can never reach ffmpeg.
 pub(crate) fn valid_nvenc_preset(p: &str) -> &str {
@@ -129,6 +150,7 @@ pub fn hevc_encoder_for(tier: &str) -> Option<&'static str> {
         "nvenc" => Some("hevc_nvenc"),
         "amf" => Some("hevc_amf"),
         "qsv" => Some("hevc_qsv"),
+        "mf" => Some("hevc_mf"),
         "vaapi" => Some("hevc_vaapi"),
         "videotoolbox" => Some("hevc_videotoolbox"),
         _ => None,
@@ -202,7 +224,19 @@ pub(crate) fn hardware_hevc_ok_with(encoders: &str, tier: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        super::plan::hw_encoder_probe_ok(name)
+        // Media Foundation is probed with hardware FORCED (DRAGON-701), the same question
+        // its H.264 gate asks: a bare `hevc_mf` probe can be answered by a software MFT,
+        // and "this tier can encode HEVC" would then be true on machines where it is only
+        // true on the CPU. Every other tier names real hardware by construction.
+        //
+        // Through `mf_probe_args`, so it also carries the NV12 the recording feeds
+        // (DRAGON-708). Forcing hardware WITHOUT that fails on every machine, so this gate
+        // was answering "no HEVC" everywhere rather than asking about the hardware at all.
+        if tier == "mf" {
+            super::plan::hw_encoder_probe_ok_with(name, &super::plan::mf_probe_args())
+        } else {
+            super::plan::hw_encoder_probe_ok(name)
+        }
     }
     #[cfg(not(windows))]
     {
@@ -294,6 +328,7 @@ mod hevc_offer_tests {
             ("nvenc", "hevc_nvenc"),
             ("amf", "hevc_amf"),
             ("qsv", "hevc_qsv"),
+            ("mf", "hevc_mf"),
             ("vaapi", "hevc_vaapi"),
             ("videotoolbox", "hevc_videotoolbox"),
         ] {
@@ -322,14 +357,14 @@ mod hevc_offer_tests {
     fn a_hardware_tier_with_a_working_probe_offers_hevc() {
         // The whole point of the ticket is that this stays true: HEVC is worth having
         // wherever it can actually be recorded, and mac VideoToolbox most of all.
-        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+        for tier in ["nvenc", "amf", "qsv", "mf", "vaapi", "videotoolbox"] {
             assert!(hevc_offerable(tier, Some(true)), "{tier}");
         }
     }
 
     #[test]
     fn a_hardware_tier_with_a_failing_probe_hides_hevc() {
-        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+        for tier in ["nvenc", "amf", "qsv", "mf", "vaapi", "videotoolbox"] {
             assert!(!hevc_offerable(tier, Some(false)), "{tier}");
         }
     }
@@ -340,7 +375,7 @@ mod hevc_offer_tests {
     /// `Some(false)` to occur at all.
     #[test]
     fn an_unresolved_probe_still_offers_hevc() {
-        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+        for tier in ["nvenc", "amf", "qsv", "mf", "vaapi", "videotoolbox"] {
             assert!(hevc_offerable(tier, None), "{tier}");
         }
     }
@@ -359,6 +394,47 @@ mod hevc_offer_tests {
         for probe in [Some(true), Some(false), None] {
             assert!(!hevc_offerable("wxyz", probe), "probe={probe:?}");
             assert!(!hevc_offerable("", probe), "probe={probe:?}");
+        }
+    }
+}
+
+/// DRAGON-754: the metadata line's preset field, in the ONE place both the app and the
+/// worker read it from.
+#[cfg(test)]
+mod session_preset_label_tests {
+    use super::{Presets, session_preset_label};
+
+    fn presets() -> Presets {
+        Presets {
+            nvenc: "p5".to_string(),
+            x264: "veryfast".to_string(),
+            vaapi_cl: 3,
+            codec: "auto".to_string(),
+        }
+    }
+
+    #[test]
+    fn each_family_reports_its_own_preset_namespace() {
+        let p = presets();
+        assert_eq!(session_preset_label("nvenc", &p), "p5");
+        assert_eq!(session_preset_label("software", &p), "veryfast");
+        assert_eq!(session_preset_label("vaapi", &p), "cl3");
+    }
+
+    #[test]
+    fn a_driver_default_compression_level_is_named_rather_than_numbered() {
+        let p = Presets { vaapi_cl: -1, ..presets() };
+        assert_eq!(session_preset_label("vaapi", &p), "cl-default");
+    }
+
+    /// The tiers with no preset of their own, plus anything unrecognised, all report the
+    /// same placeholder. AMF, QSV and Media Foundation are the Windows rows this matters
+    /// for: the worker rewrites the field with whichever of them won.
+    #[test]
+    fn tiers_without_a_preset_report_a_dash() {
+        let p = presets();
+        for tier in ["amf", "qsv", "mf", "videotoolbox", "auto", "wxyz", ""] {
+            assert_eq!(session_preset_label(tier, &p), "-", "{tier}");
         }
     }
 }

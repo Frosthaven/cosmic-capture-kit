@@ -153,18 +153,24 @@ pub enum SignalProbe {
     NoCaptureEvent,
 }
 
-/// The argv token that asks this binary to come back as the RESIDENT (the macOS menu-bar
+/// The argv word that asks this binary to come back as the RESIDENT (the macOS menu-bar
 /// daemon, the Windows tray daemon, the Linux ksni resident) rather than as a capture.
 ///
-/// It is not a `--flag` because it is not a user-facing option: it is how a LAUNCHER
-/// states its intent to `main`. `main`'s bare-launch check ignores it on purpose, so a
-/// launch carrying it still counts as "bare" and still reads the persisted `resident`
-/// setting.
+/// DRAGON-695 renamed the word from `resident` to `tray` and, with it, turned a launcher's
+/// private handshake into a PUBLIC command: `cosmic-capture-kit tray` is one of the ten
+/// commands the help lists, and it runs the resident even when the persisted `resident`
+/// setting is off (an explicit command wins for its own run; the setting still gates
+/// autostart registration and what a BARE launch does).
+///
+/// The old word is still RECOGNISED, and deliberately so. An autostart entry, a login item
+/// and a Windows Run value are all written to disk by a build the user has already replaced,
+/// so the first launch after an upgrade arrives with the old spelling, and refusing it would
+/// mean the tray simply not coming back. See [`LEGACY_RESIDENT_ARG`].
 ///
 /// Every launcher that builds an ARGV uses this constant: the settings resident toggle
 /// (`app::update::settings`, `SetResident`) and the Windows post-update relaunch
-/// (`update::post_update_relaunch_args`), plus `daemon_intent_from_args`, which is what
-/// `main` reads them back with.
+/// (`update::post_update_relaunch_args`), and `cli::parse`, which is what `main` reads them
+/// back with.
 ///
 /// The two autostart modules (`platform::{linux,windows}::autostart`) are the exception and
 /// keep their own private copies, because they build a command LINE for a `.desktop` Exec=
@@ -172,35 +178,40 @@ pub enum SignalProbe {
 /// cannot drift silently either. Before DRAGON-465 the resident toggle held a fourth raw
 /// copy with no test at all; that is the shape this constant exists to stop.
 // Live on all three real platforms: the settings toggle builds an argv with it everywhere,
-// `daemon_intent_from_args` reads it on Linux + Windows, and the post-update relaunch spends
-// it on Windows. No dead-code allowance is honest here.
-pub const RESIDENT_ARG: &str = "resident";
+// `cli::parse` reads it on every one, and the post-update relaunch spends it on Windows. No
+// dead-code allowance is honest here.
+pub const TRAY_ARG: &str = "tray";
 
-/// Whether an argv carries DAEMON intent: an explicit request to raise the resident, as
-/// opposed to a truly bare launch, which means "capture NOW" (DRAGON-180).
+/// The pre-DRAGON-695 spelling of [`TRAY_ARG`], accepted for the UPGRADE WINDOW and never
+/// written by anything again.
 ///
-/// The distinction is load-bearing and, until DRAGON-465, it was spelled out twice inline in
-/// `main`. It decides three things at once: how hard to try for the daemon lock
-/// ([`daemon_lock_attempts`]), what a failed takeover does ([`after_failed_takeover`]), and —
-/// the one that bit us — whether a launch that BECOMES the daemon also owes the user a
-/// capture overlay (`daemon::run(!daemon_intent)` on Windows, the `if !daemon_intent` spawn on
-/// Linux). So any launcher that spawns this binary bare is asking for a capture, whether it
-/// meant to or not. The Windows post-update relaunch did exactly that, which is why an update
-/// install came back with both the About page (wanted) and a capture overlay (not).
-///
-/// It scans the WHOLE argv including `argv[0]`, deliberately: that is what both former
-/// inline sites in `main` did, and this must stay a faithful move of them. The contrast is
-/// [`crate::diag::component_from_args`], which DOES `skip(1)` because it matches `--flags`
-/// and a path could plausibly contain one. Here the token is matched whole against one
-/// argument, so only an executable literally invoked as `resident` could false-positive, and
-/// ours is `cosmic-capture-kit`. Do not "fix" this into a skip without checking `main`.
-///
-/// Pure + unit-tested; the callers in `main` are the only readers.
-// Compiled everywhere and gate-free since DRAGON-473: all three `main` branches now ask, macOS
-// included, because `daemon::run` there grew the intent argument the other two always had.
-pub fn daemon_intent_from_args<S: AsRef<str>>(args: &[S]) -> bool {
-    args.iter().any(|a| a.as_ref() == RESIDENT_ARG)
-}
+/// It is not a nicety. Three things on disk carry it and none of them is rewritten by
+/// installing a new build: the Linux XDG autostart `.desktop`, the Windows HKCU `Run` value,
+/// and the macOS login item. Each launches the binary with the word it was registered with,
+/// so the first login after an upgrade runs `cosmic-capture-kit resident`. If that no longer
+/// read as tray intent the resident would come up as an ordinary bare launch, which under
+/// DRAGON-695's rules opens the settings window: the user's tray would be gone and a window
+/// they did not ask for would be on screen instead. The autostart writers RECONCILE their
+/// entries to the new word when they next run (`platform::linux::autostart`), so this is a
+/// bridge with an end, not a second supported spelling.
+pub const LEGACY_RESIDENT_ARG: &str = "resident";
+
+// `daemon_intent_from_args` lived here from DRAGON-465 until DRAGON-695, and its removal is
+// the shape of the fix rather than a tidy-up.
+//
+// It answered "does this argv ask for the tray, or is it a bare launch?", and `main` used the
+// answer three ways: how hard to try for the daemon lock, what a failed takeover does, and
+// whether a launch that BECAME the daemon also owed the user a capture overlay. That third
+// job rested on a premise DRAGON-695 deleted: that a BARE launch means "capture NOW". It never
+// did for a login item, and that is exactly how a login could put a region overlay on screen
+// with nobody having pressed anything. A bare launch now raises the tray (setting on) or the
+// settings window (setting off) and never captures, so both answers lead to the same place and
+// there is nothing left to ask.
+//
+// The word itself did not go anywhere: [`TRAY_ARG`] is now a public COMMAND, recognised by
+// `cli::parse` along with [`LEGACY_RESIDENT_ARG`], and `main` passes tray intent to the
+// daemon unconditionally because both routes into it are tray intent. The two functions below
+// still take the flag, because the daemons' own signatures do.
 
 /// How many times to try the daemon lock, by launch INTENT (DRAGON-180's rule, ported to
 /// Windows by DRAGON-438). `31` is ~1.5s at the 50ms step: the first attempt is immediate
@@ -703,7 +714,7 @@ pub fn acquire_settings_lock() -> bool {
 ///
 /// Inherently a TOCTOU answer: a pane can open or close between this call and whatever the
 /// caller does next. That is acceptable at the only call site — the worst case is a
-/// `--settings` child that finds the lock taken and (per platform) either pokes the holder
+/// `settings` child that finds the lock taken and (per platform) either pokes the holder
 /// or returns quietly, i.e. exactly what the other branch would have done.
 #[cfg(unix)]
 pub fn settings_pane_is_open() -> bool {
@@ -730,10 +741,10 @@ pub fn settings_pane_is_open() -> bool {
 /// Windows: always `false` — deliberately, not as a stub.
 ///
 /// The Windows settings guard is a NAMED MUTEX with no non-retaining probe, and it does not
-/// need one: a blocked `--settings` launch there does not vanish (as it historically did on
+/// need one: a blocked `settings` launch there does not vanish (as it historically did on
 /// Linux) — it writes the focus POKE the live holder polls (`main.rs`'s settings_only
 /// branch → `compositor::activate_title`). So the caller's open-vs-refocus decision is moot
-/// on Windows: spawning `--settings` unconditionally produces the right behaviour either
+/// on Windows: spawning `settings` unconditionally produces the right behaviour either
 /// way, which is what answering `false` here arranges.
 #[cfg(windows)]
 pub fn settings_pane_is_open() -> bool {
@@ -899,10 +910,26 @@ const PREVIEW_SOCKET_MARKER: &str = "preview.sock";
 /// (DRAGON-583), the unix-socket sibling of its [`RECORDING_MARKER`], in exactly the
 /// shape [`PREVIEW_SOCKET_MARKER`] established. The transport and the verbs are the
 /// existing resident relay's ([`crate::daemon_ipc`]); this is the address a process that
-/// is NOT the resident uses to reach the recording, which is what the `--toggle-mic` /
-/// `--finish-recording` family of CLI commands needs on Linux, where no in-app shortcut
+/// is NOT the resident uses to reach the recording, which is what the `record --sound mic` /
+/// `record --action save` family of CLI commands needs on Linux, where no in-app shortcut
 /// can be delivered to a recording that owns no focused surface.
 const RECORDING_SOCKET_MARKER: &str = "recording.sock";
+/// Marker suffix: this pid has the SCANNER overlay open (DRAGON-695).
+///
+/// The discovery half of `scan --action refresh`, and the exact analogue of
+/// [`RECORDING_MARKER`] one feature over: a scanner is owned by ONE live process, and the
+/// process that wants it to re-read the screen is a different one (a desktop hotkey running
+/// our binary). A marker plus a socket beside it is how every other cross-process reach in
+/// this app is addressed, so there is no second registry here either.
+///
+/// Deliberately NOT a sparing rule. A scanner overlay is a selection overlay, which is
+/// exactly what [`close_other_instances`] exists to collapse, so this suffix is absent from
+/// [`should_spare_sibling`] and only [`sweep_when_owner_is_dead`] reads it.
+const SCANNER_MARKER: &str = "scanner";
+/// Marker suffix: this pid's scanner overlay is LISTENING for control commands
+/// (DRAGON-695), the unix-socket sibling of its [`SCANNER_MARKER`], in exactly the shape
+/// [`RECORDING_SOCKET_MARKER`] established (which copied [`PREVIEW_SOCKET_MARKER`]).
+const SCANNER_SOCKET_MARKER: &str = "scanner.sock";
 /// Marker suffix: the recording-session LEDGER (DRAGON-421) — this pid's live recording
 /// names its ffmpeg muxer, its audio FIFOs and its temp file here, so a LATER session can
 /// tell that wreckage apart from a live session's working files. Written and cleared by
@@ -981,6 +1008,11 @@ fn sweep_when_owner_is_dead(suffix: &str) -> bool {
             | SHARE_MARKER
             | COLOR_PICKER_MARKER
             | COLOR_PICKER_SOCKET_MARKER
+            // DRAGON-695: the scanner's marker + control socket, on identical terms to the
+            // recording pair above. A scanner killed outright leaves both behind, and a
+            // recycled pid must never inherit a socket nothing listens on.
+            | SCANNER_MARKER
+            | SCANNER_SOCKET_MARKER
     ) || is_audio_fifo_suffix(suffix)
 }
 
@@ -1042,6 +1074,19 @@ pub(crate) fn sweep_stale_markers_in(
 /// video preview) so other overlays re-enable the video kind promptly.
 pub(crate) fn set_recording_marker(active: bool) {
     set_self_marker(RECORDING_MARKER, active);
+}
+
+/// Create (`active`) or remove this instance's SCANNER marker (DRAGON-695). Set while the
+/// scanner kind is the live one, cleared when the overlay leaves it, so `scan --action
+/// refresh` reaches a process that can actually act on it.
+///
+/// LINUX-only, like the socket it advertises: the marker's whole purpose is to be found by
+/// [`live_scanner_hosts`], and nothing off Linux can send a scanner command. The SUFFIX stays
+/// portable (it is in [`sweep_when_owner_is_dead`]'s set on every platform) so a runtime dir
+/// shared with a Linux session still gets swept correctly.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_scanner_marker(active: bool) {
+    set_self_marker(SCANNER_MARKER, active);
 }
 
 /// Create (`active`) or remove this instance's PREVIEW-open marker. Set when a preview
@@ -1383,7 +1428,7 @@ fn live_marker_hosts_in(
 // ── Live RECORDING discovery (DRAGON-583) ────────────────────────────────────
 //
 // A recording is owned by ONE live process, and something that is not that process (the
-// `--toggle-mic` / `--finish-recording` CLI commands a Linux global hotkey runs) has to
+// `record --sound mic` / `record --action save` CLI commands a Linux global hotkey runs) has to
 // find it. There is deliberately no second registry, exactly as with the preview hosts
 // above: a live recording is exactly a pid whose [`RECORDING_MARKER`] exists and is LIVE,
 // the marker `close_other_instances` already spares and `any_other_recording` already
@@ -1416,6 +1461,24 @@ pub(crate) fn live_recording_hosts() -> Vec<u32> {
         std::process::id(),
         RECORDING_MARKER,
         RECORDING_SOCKET_MARKER,
+    )
+}
+
+/// The scanner-control socket path for `pid` (DRAGON-695), the sibling of that pid's
+/// scanner marker. The recording pair's shape, one feature over.
+#[cfg(target_os = "linux")]
+pub(crate) fn scanner_socket_path(pid: u32) -> String {
+    state_marker_path(pid, SCANNER_SOCKET_MARKER)
+}
+
+/// Every live scanner OTHER than ours, newest first (the preview hosts' ordering rule).
+#[cfg(target_os = "linux")]
+pub(crate) fn live_scanner_hosts() -> Vec<u32> {
+    live_marker_hosts_in(
+        &crate::util::runtime_dir(),
+        std::process::id(),
+        SCANNER_MARKER,
+        SCANNER_SOCKET_MARKER,
     )
 }
 
@@ -1510,7 +1573,7 @@ pub(crate) fn pid_is_live(pid: u32) -> bool {
 /// harmless no-op, so no bookkeeping file is needed.
 ///
 /// Settings windows are deliberately spared: a settings pane is its own thing (often
-/// a separate `--settings` process), and ending a capture must never close it.
+/// a separate `settings` process), and ending a capture must never close it.
 ///
 /// DRAGON-322 (unconditional since DRAGON-351): a RECORDING or PREVIEW sibling is also
 /// spared (its per-pid state marker) so a recording session + a capture — including a
@@ -1580,6 +1643,11 @@ pub fn close_other_instances() {
         // holder covers a bare-launch daemon (DRAGON-181), the `resident` argv
         // covers a daemon mid-restart before it wins the lock.
         if is_resident_instance(pid) {
+            continue;
+        }
+        // Nor the `--duck` media babysitter (DRAGON-733): killing it strands the user's
+        // music paused, because a SIGTERM skips the resume its whole contract is built on.
+        if is_media_babysitter(pid) {
             continue;
         }
         if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
@@ -1806,6 +1874,11 @@ pub fn close_other_instances() {
         if is_resident_instance(pid) {
             continue;
         }
+        // DRAGON-733, the mac twin of the Linux spare above: never SIGTERM the `--duck`
+        // babysitter, or the Now Playing app it paused is left paused for good.
+        if is_media_babysitter(pid) {
+            continue;
+        }
         if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
             let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
         }
@@ -1857,30 +1930,111 @@ pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool, bool, bool, bool) {
 }
 
 /// Whether `pid` is the resident daemon: the daemon-lock holder, or a process
-/// launched with the literal `resident` argument (the autostart / toggle-on shape;
-/// also covers a restarting daemon that hasn't won the lock yet). Never swept by
+/// launched with the literal tray word (the autostart / toggle-on shape; also covers a
+/// restarting daemon that hasn't won the lock yet). Never swept by
 /// [`close_other_instances`]. LINUX ONLY (DRAGON-459) — see the mac twin below.
+///
+/// DRAGON-695: BOTH spellings, and this is the sniffer where it matters most. The process
+/// being asked about was started by whatever was on disk at the time, which after an upgrade
+/// is the old autostart entry, and answering `false` for it would let a capture commit
+/// SIGTERM the user's live tray.
 #[cfg(target_os = "linux")]
 fn is_resident_instance(pid: u32) -> bool {
     if daemon_lock_pid() == Some(pid) {
         return true;
     }
     std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|c| c.split(|b| *b == 0).any(|arg| arg == b"resident"))
+        .map(|c| {
+            c.split(|b| *b == 0)
+                .any(|arg| arg == TRAY_ARG.as_bytes() || arg == LEGACY_RESIDENT_ARG.as_bytes())
+        })
         .unwrap_or(false)
 }
 
-/// Whether `pid` is a settings window — either launched with `--settings` (cmdline)
-/// or the instance that became the settings pane via the gear button (it owns the
+/// **Pure**, unit-tested: whether an argument list is the `--duck` media babysitter's
+/// (DRAGON-733). THE decision behind every arm of [`is_media_babysitter`], so no platform
+/// can drift into its own idea of what that child looks like.
+///
+/// It asks for the flag as a WHOLE argv element and never as a substring of the command
+/// line, which is what makes it safe to hand a Windows command line to. The exe path is on
+/// that line too, so a substring test would spare every sibling of a user whose checkout
+/// happens to sit under a `--duck` directory, and sparing a capture overlay leaves it on
+/// screen after the capture that should have swept it.
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
+fn argv_is_media_babysitter<'a>(args: impl IntoIterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|arg| arg == crate::audio::ducking::DUCK_FLAG)
+}
+
+/// Whether `pid` is the `--duck` media babysitter (DRAGON-733). Never swept by
+/// [`close_other_instances`]. ALL THREE platforms spawn it through `crate::audio::ducking`
+/// (Linux over MPRIS, macOS through `duck_mac`, Windows through `media_control`), and since
+/// DRAGON-746 all three spare it.
+///
+/// It is the same executable as every other instance and it holds none of the markers the
+/// spare list is built from, so the sweep used to SIGTERM it. That is the one way this
+/// feature can strand a user's music: the babysitter resumes what it paused when its parent
+/// closes the keepalive pipe, and a SIGTERM gives it no chance to, so the players it paused
+/// stay paused with nothing left in the system that knows about them.
+///
+/// Sparing it is unconditionally safe, and the argument is worth stating: the child cannot
+/// outlive its purpose on its own. When its parent is spared, the pause is still wanted; when
+/// its parent is swept, the OS closes the pipe, the child resumes and exits by itself. There
+/// is no state in which killing it is the correct outcome.
+///
+/// It is sniffed from argv rather than given a marker file (the DRAGON-519 share-helper
+/// shape) because the babysitter is a bare re-exec with no config, no state directory and a
+/// lifetime measured against a pipe. A marker would be one more thing to write, sweep and
+/// leave stale on a crash, for a process whose argv already names it exactly.
+///
+/// DRAGON-746 added the Windows arm, and it is where this cost a user something: that sweep
+/// matches siblings by exe path off a Toolhelp snapshot and read no argv at all, so the
+/// babysitter fell straight through to `TerminateProcess`, which skips the resume exactly as
+/// a SIGTERM does. The READ is a syscall and lives in the plugin
+/// (`platform::windows::instance::process_argv`, the strict split); the DECISION is
+/// [`argv_is_media_babysitter`] above, shared with the other two arms. It FAILS CLOSED: a
+/// command line that cannot be read answers `false`, so the sweep behaves exactly as it did
+/// before the spare existed, and only a positive identification earns the spare.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub(crate) fn is_media_babysitter(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Dropping a non-UTF-8 element is exactly the byte comparison this arm used to do:
+        // no such element can equal `--duck`, whose bytes are all ASCII.
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|c| {
+                argv_is_media_babysitter(
+                    c.split(|b| *b == 0).filter_map(|arg| std::str::from_utf8(arg).ok()),
+                )
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        argv_is_media_babysitter(mac_argv(pid).iter().map(String::as_str))
+    }
+    #[cfg(windows)]
+    {
+        crate::platform::windows::instance::process_argv(pid)
+            .is_some_and(|argv| argv_is_media_babysitter(argv.iter().map(String::as_str)))
+    }
+}
+
+/// Whether `pid` is a settings window — either launched with the `settings` command
+/// (cmdline) or the instance that became the settings pane via the gear button (it owns the
 /// settings lock and recorded its pid there). Such instances are never auto-closed.
 /// LINUX ONLY (DRAGON-459) — see the mac twin below.
+///
+/// DRAGON-695 respells the argv half (`settings` became the `settings` subcommand) and
+/// keeps the old flag for the upgrade window, for the same reason the resident sniffer above
+/// does: the process being asked about may predate the new build.
 #[cfg(target_os = "linux")]
 fn is_settings_instance(pid: u32) -> bool {
     if settings_lock_pid() == Some(pid) {
         return true;
     }
     std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| b.split(|&c| c == 0).any(|a| a == b"--settings"))
+        .map(|b| b.split(|&c| c == 0).any(|a| a == b"settings" || a == b"--settings"))
         .unwrap_or(false)
 }
 
@@ -1891,7 +2045,7 @@ fn is_resident_instance(pid: u32) -> bool {
     if daemon_lock_pid() == Some(pid) {
         return true;
     }
-    mac_argv(pid).iter().any(|arg| arg == "resident")
+    mac_argv(pid).iter().any(|arg| arg == TRAY_ARG || arg == LEGACY_RESIDENT_ARG)
 }
 
 /// macOS (DRAGON-459) twin of [`is_settings_instance`]: same two checks, argv sourced
@@ -1901,7 +2055,7 @@ fn is_settings_instance(pid: u32) -> bool {
     if settings_lock_pid() == Some(pid) {
         return true;
     }
-    mac_argv(pid).iter().any(|arg| arg == "--settings")
+    mac_argv(pid).iter().any(|arg| arg == "settings" || arg == "--settings")
 }
 
 /// macOS (DRAGON-TBD): whether `pid` is a COLOUR PICKER instance, read the same way
@@ -1925,9 +2079,14 @@ fn is_settings_instance(pid: u32) -> bool {
 /// decided that the picker's OVERLAY phase stays sweepable ("a bare selector overlay is what
 /// this sweep is for") and only its RESULT WINDOW is spared. This answers a different
 /// question, whether the overlay may be PHOTOGRAPHED, and leaves that decision untouched.
+///
+/// DRAGON-695: the picker's spelling became `color --picker`, two argv words. Matching the
+/// SECOND one (`--picker`) is enough and is what this does, because no other command of ours
+/// carries it; the legacy `color --picker` stays recognised for the upgrade window, since the
+/// process being asked about may have been started by the previous build.
 #[cfg(target_os = "macos")]
 pub(crate) fn is_color_picker_instance(pid: u32) -> bool {
-    mac_argv(pid).iter().any(|arg| arg == "--color-picker")
+    mac_argv(pid).iter().any(|arg| arg == "--picker" || arg == "--color-picker")
 }
 
 #[cfg(test)]
@@ -2179,49 +2338,6 @@ mod tests {
     // Windows-only decisions, run on every host: this is a dual-boot shared tree and the
     // suite is the only gate, so the table has to be verifiable wherever it runs.
 
-    /// DRAGON-465: intent comes from the argv shape, and ONLY the resident token sets it.
-    /// Every other launch — including one carrying capture flags, and including a launch
-    /// with no arguments at all — is capture intent, which is what makes a launcher that
-    /// spawns this binary bare an implicit request for an overlay.
-    #[test]
-    fn daemon_intent_is_the_resident_token_and_nothing_else() {
-        // REAL argv shapes, argv[0] included: that is what `main` passes, and it is the
-        // shape that matters. A launcher's exe path plus the token is daemon intent; the
-        // exe path ALONE is the bare launch the post-update relaunch used to be.
-        const EXE: &str = r"C:\Users\x\AppData\Local\Programs\cosmic-capture-kit\cosmic-capture-kit.exe";
-        assert!(daemon_intent_from_args(&[EXE, "resident"]));
-        assert!(!daemon_intent_from_args(&[EXE]));
-        assert!(daemon_intent_from_args(&["/usr/bin/cosmic-capture-kit", "resident"]));
-        assert!(!daemon_intent_from_args(&["/usr/bin/cosmic-capture-kit"]));
-
-        // Token-only shapes, for the rule itself.
-        assert!(daemon_intent_from_args(&["resident"]));
-        // Position does not matter (the autostart entry and the settings toggle both pass
-        // it as the only argument, but nothing depends on that).
-        assert!(daemon_intent_from_args(&["--settings", "resident"]));
-        // An empty argv can't happen in practice, but the predicate must not care.
-        assert!(!daemon_intent_from_args::<&str>(&[]));
-        // Near misses are not the token: it is matched whole, not by prefix or substring.
-        for argv in [
-            vec!["--resident"],
-            vec!["resident-mode"],
-            vec!["Resident"],
-            vec!["--region"],
-            vec!["--settings"],
-        ] {
-            assert!(!daemon_intent_from_args(&argv), "{argv:?} is not daemon intent");
-        }
-        // A path that CONTAINS the token as a directory component is still one argument,
-        // so it cannot match. This is why not skipping argv[0] is safe.
-        assert!(!daemon_intent_from_args(&["/opt/resident/cosmic-capture-kit"]));
-        // The documented false-positive, pinned so the no-skip decision stays visible: an
-        // executable invoked as literally `resident` would read as daemon intent. Ours
-        // never is, and both former inline sites in `main` behaved exactly this way.
-        assert!(daemon_intent_from_args(&["resident"]));
-        // It reads an owned argv (what `main` has) the same as a borrowed one.
-        assert!(daemon_intent_from_args(&[String::from(RESIDENT_ARG)]));
-    }
-
     /// DRAGON-471/473: the held-lock branch used to pulse a capture on the LOCK being held,
     /// which is not a statement about what the launch wanted. The whole table, since the
     /// interesting content of this decision is which cells DON'T ask for a capture.
@@ -2291,14 +2407,23 @@ mod tests {
     /// tickets' decisions cannot drift into disagreeing.
     #[test]
     fn the_post_update_relaunch_argv_is_what_reaches_restore_about() {
+        // DRAGON-695: the reader is the GRAMMAR now, not a private argv predicate. Stated
+        // through it, so the relaunch's argv and what `main` does with it stay one fact.
         let argv = crate::update::post_update_relaunch_args(true);
-        let intent = daemon_intent_from_args(argv);
-        assert!(intent, "the resident relaunch must read as daemon intent");
-        assert_eq!(held_lock_action(intent, true), HeldLockAction::RestoreAbout);
-        // With `resident` off there is no daemon branch at all, so the held-lock decision is
-        // never reached; if it somehow were, it must not silently ask for a capture either.
+        let line: Vec<String> = std::iter::once("cosmic-capture-kit")
+            .chain(argv.iter().copied())
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            crate::cli::parse(&line),
+            Ok(crate::cli::Plan::Tray),
+            "the resident relaunch must read as a tray launch"
+        );
+        assert_eq!(held_lock_action(true, true), HeldLockAction::RestoreAbout);
+        // With `resident` off the relaunch carries nothing at all, so it is a BARE launch,
+        // which since DRAGON-695 opens the settings window rather than capturing.
         let bare = crate::update::post_update_relaunch_args(false);
-        assert!(!daemon_intent_from_args(bare));
+        assert!(bare.is_empty());
     }
 
     /// The intent split (DRAGON-180's Linux rule, now Windows'): a daemon-intent launch
@@ -2858,23 +2983,23 @@ mod tests {
         buf.extend_from_slice(&3i32.to_ne_bytes());
         buf.extend_from_slice(b"/bin/foo\0");
         buf.extend_from_slice(&[0u8; 3]); // padding before argv[0]
-        buf.extend_from_slice(b"foo\0--region\0--no-editor\0");
+        buf.extend_from_slice(b"foo\0capture\0--region\0");
         // Trailing bytes (environment) must never be read past argc strings.
         buf.extend_from_slice(b"SOME_ENV=1\0");
-        assert_eq!(parse_procargs2(&buf), vec!["foo", "--region", "--no-editor"]);
+        assert_eq!(parse_procargs2(&buf), vec!["foo", "capture", "--region"]);
     }
 
-    /// A resident daemon's argv is a single bare token — the exact shape
+    /// A resident daemon's argv is a single bare word — the exact shape
     /// `is_resident_instance` looks for.
     #[cfg(target_os = "macos")]
     #[test]
-    fn parse_procargs2_finds_the_bare_resident_argument() {
+    fn parse_procargs2_finds_the_bare_tray_argument() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1i32.to_ne_bytes());
         buf.extend_from_slice(b"/Applications/Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit\0");
         buf.extend_from_slice(&[0u8; 1]);
-        buf.extend_from_slice(b"resident\0");
-        assert_eq!(parse_procargs2(&buf), vec!["resident"]);
+        buf.extend_from_slice(b"tray\0");
+        assert_eq!(parse_procargs2(&buf), vec!["tray"]);
     }
 
     /// `argc=0` and a too-short buffer both yield an empty argv rather than panicking —
@@ -2937,6 +3062,62 @@ mod same_program_tests {
             Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
             Path::new("/home/u/repo/target/release/cosmic-capture-kit"),
         ));
+    }
+}
+
+/// DRAGON-733 / DRAGON-746: which argv belongs to the `--duck` media babysitter. The ONE
+/// decision all three sweeps delegate to, so it is provable on any host.
+#[cfg(test)]
+mod media_babysitter_tests {
+    use super::argv_is_media_babysitter;
+    use crate::audio::ducking::DUCK_FLAG;
+
+    /// The child as every platform actually spawns it: a bare re-exec of our own exe
+    /// carrying the one flag.
+    #[test]
+    fn the_babysitters_own_argv_is_recognized() {
+        assert!(argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", DUCK_FLAG]));
+        assert!(argv_is_media_babysitter([
+            r"C:\Program Files\CCK\cosmic-capture-kit.exe",
+            DUCK_FLAG,
+        ]));
+    }
+
+    /// Every other instance the sweep meets is still swept. These are the launches that
+    /// share the exe path with the babysitter and must NOT buy its spare.
+    #[test]
+    fn ordinary_instances_are_not_the_babysitter() {
+        assert!(!argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit"]));
+        assert!(!argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", "capture", "--region"]));
+        assert!(!argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", "tray"]));
+        assert!(!argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", "settings"]));
+    }
+
+    /// THE CASE THE WHOLE-ELEMENT RULE EXISTS FOR (DRAGON-746). Windows hands over a
+    /// command LINE, and the exe path is on it: a substring test would spare every sibling
+    /// of a user whose checkout sits under a folder named for the flag, leaving the
+    /// overlays a committed capture should have swept still on screen.
+    #[test]
+    fn the_flag_inside_a_path_is_not_the_babysitter() {
+        assert!(!argv_is_media_babysitter([r"C:\src\--duck build\cosmic-capture-kit.exe"]));
+        assert!(!argv_is_media_babysitter(["/home/u/--duck/cosmic-capture-kit"]));
+        // Nor a longer flag that merely starts the same way.
+        assert!(!argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", "--ducking"]));
+    }
+
+    /// Position is not part of the question: the flag counts wherever it lands.
+    #[test]
+    fn the_flag_counts_anywhere_in_the_list() {
+        assert!(argv_is_media_babysitter(["/usr/bin/cosmic-capture-kit", DUCK_FLAG, "extra"]));
+    }
+
+    /// FAIL CLOSED. Every reader answers with nothing when a process's argv cannot be read
+    /// (an exited pid, a higher-integrity process, a refused query), and nothing must never
+    /// read as the babysitter: an unreadable sibling is swept exactly as it was before this
+    /// spare existed.
+    #[test]
+    fn an_empty_argv_is_never_the_babysitter() {
+        assert!(!argv_is_media_babysitter(std::iter::empty::<&str>()));
     }
 }
 

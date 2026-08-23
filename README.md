@@ -8,9 +8,8 @@
 
 ![The preview editor's annotation tools, with numbered callouts on the toolbar's shape, redaction, highlight, text and draw groups, the save, copy and upload file actions, a spotlight dimming everything but one strip, freehand writing with an emoji, and the zoom control](site-src/assets/annotations.png)
 
-Quickly capture your screen/audio to the clipboard for sharing with others.
-Supports QR/barcode/OCR scanning, a screen color picker, cloud upload with
-automatic sharing links, and post-capture annotations.
+Screen capture/recording with live annotations, OCR/QR/barcode scanning,
+color picker with saved palettes, and cloud uploads for every platform.
 
 ## 📊 Current Support Status
 
@@ -20,8 +19,8 @@ automatic sharing links, and post-capture annotations.
 
 | Platform                  | Compositor                                  | Common distros                       | Capture method           | Core features | Capture extras | Window aesthetics |
 | ------------------------- | ------------------------------------------- | ------------------------------------ | ------------------------ | ------------- | -------------- | ----------------- |
-| macOS 14+ (Apple Silicon) | Quartz Compositor                           | macOS                                | ScreenCaptureKit         | ✅            | ✅             | ✅                |
-| Windows 10, 11 (x86_64)   | Desktop Window Manager                      | Windows                              | Windows Graphics Capture | ✅            | ✅             | ✅                |
+| macOS 13+ (Apple Silicon, Intel) | Quartz Compositor                    | macOS                                | ScreenCaptureKit         | ✅            | ✅             | ✅                |
+| Windows 10, 11 (x86_64, ARM64) | Desktop Window Manager                  | Windows                              | Windows Graphics Capture | ✅            | ✅             | ✅                |
 | Linux, Wayland            | cosmic-comp (COSMIC)                        | Pop!_OS                              | screencopy / portal      | ✅            | ✅             | ✅                |
 | Linux, Wayland            | KWin 6.6+ (KDE Plasma)                      | Kubuntu, Fedora KDE, SteamOS Desktop | screencopy / portal      | 📅            | ❓             | ❓                |
 | Linux, Wayland            | Mutter 49.2+ (GNOME)                        | Ubuntu, Fedora, Debian               | screencopy / portal      | 📅            | ❓             | ❓                |
@@ -153,7 +152,96 @@ along with their statuses.
 | Delete/cancel recording | ✅     |
 | Mouse click effects     | 📅     |
 | Keypress overlay        | ❓     |
-| Live annotation tools   | ❓     |
+| Live annotation tools   | ✅     |
+
+Live annotation has a section of its own further down, with what each tool does
+and where it works.
+
+#### Hiding the controls in the recording
+
+The controls float on screen while you record, so the next question is whether
+they end up in the video. Where the operating system offers a way to leave one
+window out of a screen capture, they do not.
+
+**Legend:** ✅ the controls are kept out of the recording · ❌ they are recorded
+
+| Platform                  | Region recording | Monitor recording | Window recording |
+| ------------------------- | ---------------- | ----------------- | ---------------- |
+| macOS 14+                 | ✅               | ✅                | ✅               |
+| macOS 13                  | ✅               | ✅                | ✅               |
+| Windows 11                | ✅               | ✅                | ✅               |
+| Windows 10, 2004 or newer | ✅               | ✅                | ✅               |
+| Windows 10, before 2004   | ❌               | ❌                | ✅               |
+| Linux, Wayland            | ❌               | ❌                | ✅               |
+| Linux, X11                | ❌               | ❌                | ✅               |
+
+Window recording is ✅ everywhere for a reason that needs no feature: it records
+one chosen window's own pixels, and the controls are a different window, so they
+were never in it.
+
+On **macOS** the controls are left out of the recording itself, through
+ScreenCaptureKit's content filter. That option has existed since macOS 12.3, so
+13 and 14+ behave identically and the two rows are there to say so rather than
+to record a difference. The reason to state it at all is the other route,
+marking the window as protected content: that one really does depend on the
+version, because macOS 15 stopped honouring it for ScreenCaptureKit, so it is
+not what we use. Either way only our own recordings are affected, and another
+screen recorder running beside us still sees the controls.
+
+On **Windows** the controls are excluded at the window, which the Desktop Window
+Manager has offered since Windows 10 version 2004 (build 19041). Every serviced
+Windows 10 has it, 22H2 included. Anything older is the one case with no
+exclusion at all: what those builds offer instead paints the window as a black
+rectangle in the recording, which is worse than the toolbar it would replace, so
+they record the controls as before. This one is not scoped to us, so another
+recorder on the same machine will not see our controls either.
+
+On **Linux** there is nothing to call. Neither the compositor screencopy
+protocol nor the PipeWire portal has any notion of leaving a window out of a
+display capture, and the planned X11 backend's `x11grab` recording has none
+either. Region and monitor recordings there include the controls, and "Hide
+toolbar on full screen captures" in Settings is what keeps them out of a
+full-screen one.
+
+</details>
+
+<details>
+<summary><b>Live Recording Annotation</b></summary>
+
+Draw on the screen while you are recording, and the drawing is in the video. Pick
+a tool from the recording controls or from the tray's **Live Annotations** menu.
+
+**Pointer** is the normal recording state: nothing draws. **Marker** ink stays.
+**Magic Marker** ink clears itself about three seconds after you stop drawing,
+lifting in the order you drew it. **Clear Marks** clears both kinds at once.
+Escape, **V** and a **right click** all return to Pointer, and none of them can
+stop or cancel the recording.
+
+#### Where it works
+
+**Legend:** 🥇 gold · 🥈 silver · 🥉 bronze · 📅 planned
+
+| Platform                                      | Region | Monitor | Window |
+| --------------------------------------------- | ------ | ------- | ------ |
+| macOS 13 and newer                            | 🥇     | 🥇      | 🥇     |
+| Windows 11                                    | 🥇     | 🥇      | 🥇     |
+| Windows 10                                    | 🥇     | 🥇      | 🥇     |
+| Linux, Wayland, COSMIC                        | 🥇     | 🥇      | 🥇     |
+| Linux, Wayland, other compositors <sup>1</sup> | 🥇     | 🥇      | 🥉 <sup>3</sup> |
+| Linux, Wayland without layer shell <sup>2</sup> | 🥈     | 🥈      | 🥉 <sup>3</sup> |
+| Linux, X11                                    | 📅     | 📅      | 📅     |
+
+🥇 **Gold:** annotate and control at once, marks persist until cleared.
+🥈 **Silver:** annotate or control, Pointer clears marks.
+🥉 **Bronze:** annotate on a frozen snapshot, Pointer dismisses it.
+
+<sup>1</sup> KDE, Sway, Hyprland, niri and the rest. A window recording there
+goes through the desktop portal, which never says where the recorded window is,
+so window mode gets Bronze. Region and monitor recordings are unaffected.
+<sup>2</sup> GNOME sessions and Flatpak builds, where every recording goes
+through the desktop portal.
+<sup>3</sup> Bronze places ink against the frozen moment; the window keeps
+recording live underneath. The armed window says so on screen.
 
 </details>
 
@@ -176,9 +264,14 @@ along with their statuses.
 <details>
 <summary><b>macOS</b></summary>
 
-1. Download the latest `CosmicCaptureKit-<version>-aarch64.dmg` from
+There are two builds, one per processor. Take `aarch64` for an Apple Silicon Mac
+(M1 and later) and `x86_64` for an Intel one. If you are not sure, the Apple
+menu's "About This Mac" names the chip, or `uname -m` prints `arm64` on Apple
+Silicon and `x86_64` on Intel.
+
+1. Download the latest `CosmicCaptureKit-<version>-<arch>.dmg` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and
-   drag the app to Applications. Apple Silicon only.
+   drag the app to Applications.
 2. First launch: grant Screen Recording (System Settings > Privacy &
    Security), then relaunch. Microphone is optional (for recordings with mic).
 
@@ -187,9 +280,11 @@ along with their statuses.
 <details>
 <summary><b>Windows 11</b></summary>
 
-1. Download the latest `CosmicCaptureKit-<version>-x86_64.msi` from
+1. Download the latest `CosmicCaptureKit-<version>-<arch>.msi` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and run
-   it (x86_64 only). It installs per-user (no admin prompt) to
+   it. There are **x86_64** and **aarch64** builds; take the one matching your
+   machine (Settings > System > About > System type, where "ARM-based processor"
+   means aarch64). It installs per-user (no admin prompt) to
    `%LOCALAPPDATA%\Programs\cosmic-capture-kit`, bundles ffmpeg, and adds Start
    Menu shortcuts (Cosmic Capture Kit, and Cosmic Capture Kit Settings), so
    there is nothing else to install.
@@ -222,15 +317,15 @@ Raspberry Pi 5 desktops and ARM laptops.
    mkdir -p ~/.local/bin && mv CosmicCaptureKit-*.AppImage ~/.local/bin/
    ```
 
-   Every command below works the same way, so `cosmic-capture-kit --settings`
-   becomes `CosmicCaptureKit-<arch>.AppImage --settings`. A symlink named
+   Every command below works the same way, so `cosmic-capture-kit settings`
+   becomes `CosmicCaptureKit-<arch>.AppImage settings`. A symlink named
    `cosmic-capture-kit` pointing at it keeps the shorter form.
 
    The filename carries no version on purpose: this file updates itself in
    place, so a version in the name would be wrong as soon as the first update
    landed. Check the version in Settings, under About. Whatever path you bind a
    shortcut to keeps working forever, because updates never rename it.
-3. Run it with `--settings` to look around and set your save folders, then bind
+3. Run it with `settings` to look around and set your save folders, then bind
    the [shortcuts](#shortcuts) below.
 
 The AppImage carries its own **ffmpeg 9.0 and tesseract**, so recording and
@@ -272,7 +367,7 @@ without root, and the update will say so rather than fail quietly.
 
    If your shell cannot find it afterwards, `~/.local/bin` is not on your
    `PATH` yet.
-3. Run `cosmic-capture-kit --settings` to look around and set your save
+3. Run `cosmic-capture-kit settings` to look around and set your save
    folders, then bind the [shortcuts](#shortcuts) below.
 
 The zip holds one binary and nothing else, so recording and OCR use your
@@ -318,19 +413,19 @@ put the binary on your `PATH`, and what each `just` recipe does.
 Cosmic Capture Kit ships with no keybindings of its own. Add your own in
 **Settings → Keyboard → Shortcuts → Custom shortcuts**.
 
-**One key is enough.** A bare launch opens the capture overlay, and the overlay
-is the whole tool. Its toolbar switches between region, window and monitor
-without relaunching, and it also carries the screenshot / recording / scan
-choice, the countdown, and the capture toggles. Pressing the active selector is
-what takes the capture.
+**One key is enough.** `capture --region` opens the capture overlay, and the
+overlay is the whole tool. Its toolbar switches between region, window and
+monitor without relaunching, and it also carries the screenshot / recording /
+scan choice, the countdown, and the capture toggles. Pressing the active selector
+is what takes the capture.
 
 **`cosmic-capture-kit` below means whichever file you installed.** The tables use
-the zip's binary name, but the AppImage takes exactly the same flags. Substitute
-its filename and everything works identically:
+the zip's binary name, but the AppImage takes exactly the same commands.
+Substitute its filename and everything works identically:
 
 ```sh
-cosmic-capture-kit --region                 # the zip's binary
-CosmicCaptureKit-x86_64.AppImage --region   # the AppImage, same flags
+cosmic-capture-kit capture --region                 # the zip's binary
+CosmicCaptureKit-x86_64.AppImage capture --region   # the AppImage, same commands
 ```
 
 A custom shortcut runs a command directly instead of searching your `PATH` the
@@ -338,16 +433,21 @@ way a shell does, so give the **full path** unless the file sits somewhere
 already on it:
 
 ```
-/home/you/.local/bin/CosmicCaptureKit-x86_64.AppImage --region
+/home/you/.local/bin/CosmicCaptureKit-x86_64.AppImage capture --region
 ```
 
 A symlink named `cosmic-capture-kit` pointing at the AppImage keeps the short
 form in every command below, and keeps working across updates, since an update
 replaces the file without renaming it.
 
-| Command              | Suggested keys |
-| -------------------- | -------------- |
-| `cosmic-capture-kit` | `Print`        |
+| Command                               | Suggested keys |
+| ------------------------------------- | -------------- |
+| `cosmic-capture-kit capture --region` | `Print`        |
+
+Give the shortcut the whole command. The binary on its own captures nothing on
+purpose: a launch with no command opens the tray, or settings when the tray is
+off, so that starting the app at login can never take a screenshot of your
+desktop. `capture` wants a target too, and says so rather than guessing one.
 
 With a region drawn, `Ctrl+C` copies it to the clipboard without opening the
 editor.
@@ -355,55 +455,66 @@ editor.
 The rest are for landing somewhere directly, if you would rather skip the
 toolbar for a mode you use constantly:
 
-| Command                               | What it does                                    | Suggested keys |
-| ------------------------------------- | ----------------------------------------------- | -------------- |
-| `cosmic-capture-kit --region`         | The overlay, region selected (same as bare)      | `Alt+Shift+1`  |
-| `cosmic-capture-kit --window`         | The overlay, window selected                     | `Alt+Shift+2`  |
-| `cosmic-capture-kit --monitor`        | The overlay, monitor selected                    | `Alt+Shift+3`  |
-| `cosmic-capture-kit --active-window`  | Captures the active window at once, no overlay   | `Alt+Shift+4`  |
-| `cosmic-capture-kit --active-monitor` | Captures the monitor under the cursor, no overlay | `Alt+Shift+5` |
-| `cosmic-capture-kit --color-picker`   | Picks a color off the screen (magnifier overlay)  | `Alt+Shift+C` |
+| Command                                       | What it does                                    | Suggested keys |
+| --------------------------------------------- | ----------------------------------------------- | -------------- |
+| `cosmic-capture-kit capture --region`         | The overlay, region selected (the one above)     | `Alt+Shift+1`  |
+| `cosmic-capture-kit capture --window`         | The overlay, window selected                     | `Alt+Shift+2`  |
+| `cosmic-capture-kit capture --monitor`        | The overlay, monitor selected                    | `Alt+Shift+3`  |
+| `cosmic-capture-kit capture --active-window`  | Captures the active window at once, no overlay   | `Alt+Shift+4`  |
+| `cosmic-capture-kit capture --active-monitor` | Captures the monitor under the cursor, no overlay | `Alt+Shift+5` |
+| `cosmic-capture-kit scan`                     | Opens the scanner on a region (QR codes, text)   | `Alt+Shift+Q`  |
+| `cosmic-capture-kit color --picker`           | Picks a color off the screen (magnifier overlay)  | `Alt+Shift+C` |
 
-The two `--active-*` commands are not available when the app runs as a Flatpak: a
+The two `--active-*` options are not available when the app runs as a Flatpak: a
 sandboxed app cannot ask the compositor which window or monitor is active.
 
-Add `--no-editor` to any of these for a variant that skips the preview editor:
-the capture is saved, copied to the clipboard and notified, with no editor to
-dismiss. The notification names what it captured, and clicking it opens the
-folder with the file selected. Bind both variants of a mode and pick per
-keypress:
+Add `--skip-editor` to any of the `capture` commands for a variant that skips the
+preview editor: the capture is saved, copied to the clipboard and notified, with
+no editor to dismiss. The notification names what it captured, and clicking it
+opens the folder with the file selected. Bind both variants of a mode and pick
+per keypress:
 
-| Command                                           | Suggested keys |
-| ------------------------------------------------- | -------------- |
-| `cosmic-capture-kit --no-editor`                  | `Alt+Shift+6`  |
-| `cosmic-capture-kit --active-window --no-editor`  | `Alt+Shift+7`  |
-| `cosmic-capture-kit --active-monitor --no-editor` | `Alt+Shift+8`  |
+| Command                                                    | Suggested keys |
+| ---------------------------------------------------------- | -------------- |
+| `cosmic-capture-kit capture --region --skip-editor`        | `Alt+Shift+6`  |
+| `cosmic-capture-kit capture --active-window --skip-editor` | `Alt+Shift+7`  |
+| `cosmic-capture-kit capture --active-monitor --skip-editor` | `Alt+Shift+8` |
+
+Swap `capture` for `record` to record instead of screenshot:
+`cosmic-capture-kit record --region` records a region, and `--timer` and
+`--sound` set the countdown and the audio channels for that one recording.
 
 **Controlling a recording that is already running.** These are shortcuts too,
 bound the same way, but they do not launch anything: each one reaches the
 recording in progress and acts on it.
 
-| Command                                    | What it does                            | Suggested keys |
-| ------------------------------------------ | --------------------------------------- | -------------- |
-| `cosmic-capture-kit --pause-recording`     | Pauses the recording, or resumes it      | `Alt+Shift+P`  |
-| `cosmic-capture-kit --finish-recording`    | Finishes the recording and saves it      | `Alt+Shift+Enter` |
-| `cosmic-capture-kit --cancel-recording`    | Cancels the recording and deletes it     | `Alt+Shift+Backspace` |
-| `cosmic-capture-kit --toggle-mic`          | Toggles the microphone                   | `Alt+Shift+M`  |
-| `cosmic-capture-kit --toggle-system-audio` | Toggles system audio                     | `Alt+Shift+S`  |
+| Command                                         | What it does                            | Suggested keys |
+| ----------------------------------------------- | --------------------------------------- | -------------- |
+| `cosmic-capture-kit record --action pause`      | Pauses the recording, or resumes it      | `Alt+Shift+P`  |
+| `cosmic-capture-kit record --action save`       | Finishes the recording and saves it      | `Alt+Shift+Enter` |
+| `cosmic-capture-kit record --action cancel`     | Cancels the recording and deletes it     | `Alt+Shift+Backspace` |
+| `cosmic-capture-kit record --sound system`      | Drops the microphone, keeps system audio | `Alt+Shift+M`  |
+| `cosmic-capture-kit record --sound both`        | Brings the microphone back               | `Alt+Shift+S`  |
+
+`--sound` sets the channels rather than flipping one of them, so bind the two
+states you actually switch between. `--tool` is here too, for the live annotation
+tool: `record --tool marker`, and `record --tool erase` to clear the marks. The
+options combine in one line, so `record --sound none --action save` mutes the
+rest of the recording and then saves it.
 
 They have to be desktop shortcuts rather than shortcuts inside the app. Once a
 recording starts, the app hands the keyboard back to the window you are
 recording, so that you can keep typing into it, and COSMIC's desktop portal has
 no way to give an app a shortcut that works without focus. A shortcut in your own
 keyboard settings has neither problem. The app's Settings → Keyboard Shortcuts
-page shows these five commands for the same reason, instead of key bindings it
-could not honour.
+page shows these commands for the same reason, instead of key bindings it could
+not honour.
 
 With no recording in progress, the command prints `no recording is in progress`
 and does nothing.
 
-See [CLI.md](CLI.md) for every flag, including `--video`, `--audio`, `--scan`
-and `--countdown`.
+See [CLI.md](CLI.md) for every command, including `record`, `scan`, `editor`, and
+`timer` and `sound`, which write the defaults every later launch starts from.
 
 #### Dependencies
 

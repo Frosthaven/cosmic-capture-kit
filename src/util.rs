@@ -2,6 +2,8 @@
 //! `~/` expansion, and `file://` URI building. Centralised so the fallback and format
 //! live in one place instead of being re-derived at every call site.
 
+use crate::errln;
+
 use std::path::{Path, PathBuf};
 
 /// Startup-latency instrumentation. Prints `[+<ms since process start>] <label>` to stderr
@@ -36,7 +38,7 @@ pub fn timing_mark(label: &str) {
     let t0 = *TIMING_T0.get_or_init(std::time::Instant::now);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if to_stderr {
-        eprintln!("[+{ms:>7.1}ms] {label}");
+        errln!("[+{ms:>7.1}ms] {label}");
     }
     // Its own target so a reader can isolate the launch timeline with one filter, and so it
     // never looks like an application warning.
@@ -1032,7 +1034,7 @@ pub fn ffprobe_command() -> std::process::Command {
     quiet_command(ffprobe_path())
 }
 
-/// Which `vendor/<dir>/macos-arm64/` directory a tool is vendored into.
+/// Which `vendor/<dir>/macos-<arch>/` directory a tool is vendored into.
 ///
 /// **Pure**, unit-tested. Not simply `name`, because ffprobe ships alongside ffmpeg from
 /// the same upstream archive and so shares its directory; everything else vendors under
@@ -1044,6 +1046,23 @@ fn vendor_subdir(name: &str) -> &str {
         "ffprobe" | "ffplay" => "ffmpeg",
         other => other,
     }
+}
+
+/// The ARCHITECTURE half of a dev vendor path, `vendor/<tool>/macos-<this>` (DRAGON-700).
+///
+/// **Pure**, unit-tested. It is APPLE's CPU spelling, `arm64` rather than the Rust triple's
+/// `aarch64`, because `scripts/fetch-mac-vendor.sh` names the directories after what
+/// `uname -m` and `lipo -archs` print.
+///
+/// It matters because a dev build can now be either architecture on a Mac: an x86_64 build
+/// reading `macos-arm64/` would spawn an ffmpeg its own process cannot exec, which reads as
+/// "recording is broken" rather than as a wrong path. Only the DEV path needs this; a
+/// packaged `.app` carries one architecture's sidecars in `Contents/Resources`, with no arch
+/// in the name at all.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn vendor_arch_dir(is_aarch64: bool) -> &'static str {
+    if is_aarch64 { "macos-arm64" } else { "macos-x86_64" }
 }
 
 // ── Re-executing ourselves (DRAGON-510) ──────────────────────────────────────
@@ -1392,7 +1411,8 @@ fn locate_tool(name: &str, env_override: &str) -> PathBuf {
         if let Some(dir) = exe_dir {
             candidates.push(dir.join("..").join("Resources").join(name));
         }
-        // Dev vendor dir: the checked-out repo's vendored arm64 sidecars.
+        // Dev vendor dir: the checked-out repo's vendored sidecars, for THIS build's
+        // architecture (DRAGON-700 made that a question worth asking on a Mac).
         // `CARGO_MANIFEST_DIR` is baked at compile time, so it points at the repo for a
         // dev build and simply doesn't exist in a shipped bundle (harmless fall-through).
         //
@@ -1407,7 +1427,7 @@ fn locate_tool(name: &str, env_override: &str) -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("vendor")
                 .join(vendor_subdir(name))
-                .join("macos-arm64")
+                .join(vendor_arch_dir(cfg!(target_arch = "aarch64")))
                 .join(name),
         );
     }
@@ -1725,6 +1745,29 @@ pub fn collapse_home(path: &str) -> String {
 
 /// **Pure**, unit-tested: [`collapse_home`]'s decision, with the home directory injected.
 pub fn collapse_home_from(path: &str, home: Option<&Path>) -> String {
+    collapse_home_sep(path, home, cfg!(windows))
+}
+
+/// **Pure**, unit-tested: [`collapse_home_from`]'s decision with the platform's SEPARATOR rule
+/// injected, so either platform's behaviour is provable from any host (DRAGON-655).
+///
+/// `windows_separators` makes both `\` and `/` count as the boundary after the home directory.
+/// It has to be a parameter and not a bare `cfg!` inside the match, because the rule is not
+/// symmetric and the wrong one is a lie rather than a cosmetic difference:
+///
+/// * On Windows a real home path is `C:\Users\name\…`, so a forward-slash-only match NEVER
+///   fires. That is the bug this fixes: the account name the owner wanted kept out of
+///   screenshots was being printed in full on every Windows settings row, silently, because
+///   the collapse simply never happened there.
+/// * On Unix a backslash is an ORDINARY filename character, so counting it as a separator
+///   would collapse `/home/shane\notes` (a file called `shane\notes` sitting in `/home`) into
+///   `~\notes` and claim a directory the user does not have. That is the same class of
+///   mistake the `frost-backup` guard below exists to prevent.
+///
+/// The path's OWN separator is what comes back: `C:\Users\name\Capture` collapses to
+/// `~\Capture`, not `~/Capture`. The rest of the string is untouched either way, so a row
+/// mixing the two reads as the one path it is, and Linux output is byte-identical to before.
+fn collapse_home_sep(path: &str, home: Option<&Path>, windows_separators: bool) -> String {
     let Some(home) = home.map(|h| h.to_string_lossy().into_owned()) else {
         return path.to_string();
     };
@@ -1737,10 +1780,15 @@ pub fn collapse_home_from(path: &str, home: Option<&Path>) -> String {
     }
     // The separator has to be part of the match, or `/home/frost-backup` would collapse
     // against `/home/frost` and name a directory the user does not have.
-    let with_sep = format!("{home}/");
-    match path.strip_prefix(&with_sep) {
-        Some(rest) => format!("~/{rest}"),
-        None => path.to_string(),
+    let Some(rest) = path.strip_prefix(&home) else {
+        return path.to_string();
+    };
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(sep) if sep == '/' || (windows_separators && sep == '\\') => {
+            format!("~{sep}{}", chars.as_str())
+        }
+        _ => path.to_string(),
     }
 }
 
@@ -2243,13 +2291,19 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    // The mac locator must find the checked-out static ffmpeg/ffprobe under
-    // vendor/ffmpeg/macos-arm64 in a dev build (CARGO_MANIFEST_DIR is baked at compile
+    // The mac locator must find the checked-out ffmpeg/ffprobe under
+    // vendor/ffmpeg/macos-<arch> in a dev build (CARGO_MANIFEST_DIR is baked at compile
     // time). Skips loudly if the vendored binaries aren't present in this checkout.
+    //
+    // The directory is derived, not spelled, since DRAGON-700: an x86_64 dev build must
+    // look under `macos-x86_64`, and hard-coding the arm64 name here would make this test
+    // assert the very bug that change removed.
     #[cfg(target_os = "macos")]
     #[test]
     fn locate_tool_finds_dev_vendor_ffmpeg() {
-        let vendor = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/ffmpeg/macos-arm64");
+        let vendor = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/ffmpeg")
+            .join(vendor_arch_dir(cfg!(target_arch = "aarch64")));
         if !vendor.join("ffmpeg").is_file() {
             eprintln!("skipping: no vendored ffmpeg at {}", vendor.display());
             return;
@@ -2761,6 +2815,28 @@ mod vendor_subdir_tests {
     }
 }
 
+/// DRAGON-700: which ARCHITECTURE's vendor directory a mac dev build reads.
+#[cfg(test)]
+mod vendor_arch_dir_tests {
+    use super::vendor_arch_dir;
+
+    /// APPLE'S SPELLING, not the Rust triple's. `scripts/fetch-mac-vendor.sh` names these
+    /// dirs from `uname -m`, which prints `arm64`, so an `aarch64` here would point at a
+    /// directory nothing ever creates and every tool would silently fall through to PATH.
+    #[test]
+    fn the_names_are_apple_cpu_spellings() {
+        assert_eq!(vendor_arch_dir(true), "macos-arm64");
+        assert_eq!(vendor_arch_dir(false), "macos-x86_64");
+    }
+
+    /// The two must differ, which is the whole point: an x86_64 dev build reading the arm64
+    /// dir would spawn an ffmpeg its own process cannot execute.
+    #[test]
+    fn the_two_architectures_never_share_a_directory() {
+        assert_ne!(vendor_arch_dir(true), vendor_arch_dir(false));
+    }
+}
+
 /// DRAGON-531: seeding must mirror the WHOLE tessdata tree.
 #[cfg(test)]
 mod collect_files_tests {
@@ -3165,6 +3241,81 @@ mod collapse_home_tests {
     }
 }
 
+/// The separator half of the same decision (DRAGON-655). Both platforms' rules are injected
+/// rather than compiled, so every host proves both: the Windows one was dead for months
+/// precisely because no Linux gate could see it.
+#[cfg(test)]
+mod collapse_home_separator_tests {
+    use super::collapse_home_sep;
+    use std::path::Path;
+
+    const WIN_HOME: &str = r"C:\Users\shane";
+    const NIX_HOME: &str = "/home/frosthaven";
+
+    /// THE bug. A real Windows home path uses backslashes, so the forward-slash-only match
+    /// never fired and every settings row printed `C:\Users\shane\…` in full, account name
+    /// and all, which is exactly what the collapse exists to prevent.
+    #[test]
+    fn a_windows_home_collapses_under_the_windows_rule() {
+        let got = collapse_home_sep(r"C:\Users\shane\Capture", Some(Path::new(WIN_HOME)), true);
+        assert_eq!(got, r"~\Capture");
+        assert!(!got.contains("shane"), "the account name must not survive: {got}");
+    }
+
+    /// The path's OWN separator comes back, so a Windows row reads as a Windows path and a
+    /// Linux row is byte-identical to what it printed before this change.
+    #[test]
+    fn the_paths_own_separator_is_what_comes_back() {
+        assert_eq!(
+            collapse_home_sep(r"C:\Users\shane/Capture", Some(Path::new(WIN_HOME)), true),
+            "~/Capture"
+        );
+        assert_eq!(
+            collapse_home_sep("/home/frosthaven/Capture", Some(Path::new(NIX_HOME)), false),
+            "~/Capture"
+        );
+    }
+
+    /// A backslash is an ORDINARY filename character on Unix, so `/home/frosthaven\notes` is a
+    /// file called `frosthaven\notes` sitting in `/home`, NOT something inside home. Counting
+    /// it as a separator there would name a directory the user does not have, the same lie the
+    /// `frosthaven-backup` guard prevents.
+    #[test]
+    fn a_backslash_is_not_a_separator_under_the_unix_rule() {
+        let p = r"/home/frosthaven\notes";
+        assert_eq!(collapse_home_sep(p, Some(Path::new(NIX_HOME)), false), p);
+        // ...and the Windows rule is the one that treats it as a boundary.
+        assert_eq!(collapse_home_sep(p, Some(Path::new(NIX_HOME)), true), r"~\notes");
+    }
+
+    /// The prefix guard still holds with the separator set widened: a sibling that merely
+    /// shares the characters is a different directory under either rule.
+    #[test]
+    fn a_windows_sibling_sharing_the_prefix_is_left_alone() {
+        for p in [r"C:\Users\shane-backup\Capture", r"C:\Users\shane2", r"C:\Users\shaneX\x"] {
+            assert_eq!(collapse_home_sep(p, Some(Path::new(WIN_HOME)), true), p);
+        }
+    }
+
+    /// Home itself is a bare tilde whichever rule is in force: there is no separator left to
+    /// preserve, so this case never reaches the branch that picks one.
+    #[test]
+    fn home_itself_is_a_bare_tilde_under_either_rule() {
+        assert_eq!(collapse_home_sep(WIN_HOME, Some(Path::new(WIN_HOME)), true), "~");
+        assert_eq!(collapse_home_sep(NIX_HOME, Some(Path::new(NIX_HOME)), false), "~");
+    }
+
+    /// The rule this build actually ships is the one its target needs, which is the whole
+    /// point of the parameter existing.
+    #[test]
+    fn the_shipped_rule_matches_the_target() {
+        let home = if cfg!(windows) { WIN_HOME } else { NIX_HOME };
+        let sep = std::path::MAIN_SEPARATOR;
+        let path = format!("{home}{sep}Capture");
+        assert_eq!(super::collapse_home_from(&path, Some(Path::new(home))), format!("~{sep}Capture"));
+    }
+}
+
 /// The delivery-kind vocabulary shared by the About page and the debug log.
 #[cfg(test)]
 mod package_kind_tests {
@@ -3294,19 +3445,24 @@ mod launch_command_tests {
     fn each_package_kind_gets_its_own_spelling() {
         let exe = PathBuf::from("/opt/cck/cosmic-capture-kit");
         assert_eq!(
-            launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]),
-            "/opt/cck/cosmic-capture-kit --region"
+            launch_command_from(
+                PackageKind::Binary,
+                Some(&exe),
+                FLATPAK_APP_ID,
+                &["capture", "--region"]
+            ),
+            "/opt/cck/cosmic-capture-kit capture --region"
         );
         // An AppImage names the .AppImage FILE, which is what `self_exe` resolves there.
         let img = PathBuf::from("/opt/CosmicCaptureKit.AppImage");
         assert_eq!(
-            launch_command_from(PackageKind::AppImage, Some(&img), FLATPAK_APP_ID, &["--region"]),
-            "/opt/CosmicCaptureKit.AppImage --region"
+            launch_command_from(PackageKind::AppImage, Some(&img), FLATPAK_APP_ID, &["scan"]),
+            "/opt/CosmicCaptureKit.AppImage scan"
         );
         // A Flatpak's own path is unreachable from the host, so the app id is the handle.
         assert_eq!(
-            launch_command_from(PackageKind::Flatpak, Some(&exe), FLATPAK_APP_ID, &["--region"]),
-            "flatpak run dev.thedragon.CosmicCaptureKit --region"
+            launch_command_from(PackageKind::Flatpak, Some(&exe), FLATPAK_APP_ID, &["settings"]),
+            "flatpak run dev.thedragon.CosmicCaptureKit settings"
         );
     }
 
@@ -3316,25 +3472,25 @@ mod launch_command_tests {
     fn a_flatpak_never_prints_its_own_path() {
         let inside = PathBuf::from("/app/bin/cosmic-capture-kit");
         for exe in [Some(inside.as_path()), None] {
-            let c = launch_command_from(PackageKind::Flatpak, exe, FLATPAK_APP_ID, &["--scan"]);
-            assert_eq!(c, "flatpak run dev.thedragon.CosmicCaptureKit --scan");
+            let c = launch_command_from(PackageKind::Flatpak, exe, FLATPAK_APP_ID, &["scan"]);
+            assert_eq!(c, "flatpak run dev.thedragon.CosmicCaptureKit scan");
             assert!(!c.contains("/app/bin"), "{c}");
         }
     }
 
-    /// Several flags keep their order and are separated by single spaces, so the no-editor
-    /// twins (`<capture flag> --no-editor`) read exactly as the daemons spawn them.
+    /// Every argv token keeps its order and is separated by a single space, so the no-editor
+    /// twins (`capture --active-window --skip-editor`) read exactly as the daemons spawn them.
     #[test]
-    fn every_flag_survives_in_order() {
+    fn every_token_survives_in_order() {
         let exe = PathBuf::from("/opt/cck/cosmic-capture-kit");
         assert_eq!(
             launch_command_from(
                 PackageKind::Binary,
                 Some(&exe),
                 FLATPAK_APP_ID,
-                &["--active-window", "--no-editor"]
+                &["capture", "--active-window", "--skip-editor"]
             ),
-            "/opt/cck/cosmic-capture-kit --active-window --no-editor"
+            "/opt/cck/cosmic-capture-kit capture --active-window --skip-editor"
         );
         // No flags at all is a bare launch, and prints as one.
         assert_eq!(
@@ -3348,8 +3504,8 @@ mod launch_command_tests {
     #[test]
     fn a_missing_exe_falls_back_to_the_program_name() {
         assert_eq!(
-            launch_command_from(PackageKind::Binary, None, FLATPAK_APP_ID, &["--region"]),
-            "cosmic-capture-kit --region"
+            launch_command_from(PackageKind::Binary, None, FLATPAK_APP_ID, &["scan"]),
+            "cosmic-capture-kit scan"
         );
         assert_eq!(
             launch_command_from(PackageKind::AppImage, None, FLATPAK_APP_ID, &[]),
@@ -3362,10 +3518,10 @@ mod launch_command_tests {
     #[test]
     fn a_path_with_a_space_survives_a_paste() {
         let exe = PathBuf::from("/somewhere/My Apps/cosmic-capture-kit");
-        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]);
-        assert_eq!(c, "'/somewhere/My Apps/cosmic-capture-kit' --region");
-        // And the flag stays OUTSIDE the quoted word, still its own argument.
-        assert!(c.ends_with(" --region"), "{c}");
+        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["scan"]);
+        assert_eq!(c, "'/somewhere/My Apps/cosmic-capture-kit' scan");
+        // And the command word stays OUTSIDE the quoted word, still its own argument.
+        assert!(c.ends_with(" scan"), "{c}");
     }
 
     /// The quoting rule itself, both directions. An ordinary path must come back untouched, so
@@ -3375,7 +3531,7 @@ mod launch_command_tests {
         for plain in [
             "/opt/cck/cosmic-capture-kit",
             "cosmic-capture-kit",
-            "--toggle-system-audio",
+            "--skip-editor",
             "/home/u/.local/bin/cck-1.2",
             "~/apps/cck",
             "~",
@@ -3408,15 +3564,29 @@ mod launch_command_tests {
 
     /// The command SHOWS a home-collapsed path, like every other path this app prints
     /// (`collapse_home`'s privacy rule), and it still runs: the shell expands `~` itself.
+    ///
+    /// The path is built with one `join` per COMPONENT (DRAGON-655). Joining a single
+    /// `"apps/cosmic-capture-kit"` literal onto a Windows home yields
+    /// `C:\Users\name\apps/cosmic-capture-kit`, a mixed-separator shape no platform ever
+    /// actually hands us, so the test was asking about a path that does not occur while the
+    /// real Windows bug (a home that never collapsed at all) went unpinned underneath it.
     #[test]
     fn the_command_collapses_the_home_directory() {
         let Some(home) = dirs::home_dir() else {
             eprintln!("skipping: no home directory on this runner");
             return;
         };
-        let exe = home.join("apps/cosmic-capture-kit");
-        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]);
-        assert_eq!(c, "~/apps/cosmic-capture-kit --region");
+        let exe = home.join("apps").join(BIN_NAME);
+        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["scan"]);
+        // The privacy property, and it holds on every platform: the account name is gone.
         assert!(!c.contains(&*home.to_string_lossy()), "{c}");
+        // The exact spelling is POSIX, because `shell_word` quotes for a POSIX shell. A
+        // backslash is outside its safe set, so a Windows path arrives quoted; that is not
+        // user-visible, since the settings row showing this command is Linux-only (see
+        // `settings::pages::keyboard::global_recording_items`).
+        #[cfg(unix)]
+        assert_eq!(c, "~/apps/cosmic-capture-kit scan");
+        #[cfg(windows)]
+        assert_eq!(c, r"'~\apps\cosmic-capture-kit' scan");
     }
 }

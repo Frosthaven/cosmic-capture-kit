@@ -119,8 +119,8 @@ this file:
 >   Voice Activity" for the voice gate.
 >
 > (Listed here, against the doc's crates-aren't-repeated rule, precisely because they
-> *replace* what would otherwise be external dependencies.) Run `--audio-test` for a
-> synthetic self-test of the chain.
+> *replace* what would otherwise be external dependencies.) The app's own diagnostics
+> can run a synthetic self-test of the chain.
 
 ---
 
@@ -323,14 +323,14 @@ changes with it, which is what forces the re-fetch.
 
 | Component | Version | Where it comes from | Verified by |
 |---|---|---|---|
-| ffmpeg + ffprobe (macOS arm64) | **9.0** | martin-riedl.de, a permanent per-build URL with a published `.sha256` | SHA-256 |
+| ffmpeg + ffprobe (macOS arm64 and x86_64) | **9.0** | **built by us** (DRAGON-689): `scripts/ffmpeg-mac/`, from the same signed source tarball the Linux artifacts use, then hosted on our own `vendor-mirror` release. ONE ARCHIVE PER ARCHITECTURE since DRAGON-700, both produced on an Apple Silicon Mac, arm64 natively and x86_64 cross-compiled with `clang -arch`. SHARED rather than static, so the two programs share one set of libav dylibs instead of each carrying a copy: 132 MB down to 23 MB. Previously two static prebuilts from martin-riedl.de | **GPG signature** on the source + SHA-256 on each archive |
 | ffmpeg + ffprobe + ffplay (Windows x86_64) | **9.0** | **built by us** (DRAGON-675): cross-compiled with mingw-w64 in a container, `scripts/ffmpeg-win/`, from the same signed source tarball the Linux artifacts use, then hosted on our own `vendor-mirror` release. Previously gyan.dev's `full_build-shared`, and before that BtbN's | **GPG signature** on the source + SHA-256 on the archive |
-| tesseract (macOS arm64) | **5.5.3** | built from source, with leptonica **1.87.0** and libpng **1.6.50** | SHA-256 |
+| tesseract (macOS arm64 and x86_64) | **5.5.3** | built from source, with leptonica **1.87.0** and libpng **1.6.50**, once per architecture (DRAGON-700; the x86_64 one cross-compiles from Apple Silicon) | SHA-256 |
 | tesseract (Windows x86_64) | **5.5.3** | the official installer published as a GitHub release asset by the tesseract project, unpacked with 7-Zip (never executed) | SHA-256 |
 | `eng.traineddata` | `tessdata_fast` tag **4.1.0** | the same file and hash on both platforms, so OCR results match | SHA-256 |
 | ffmpeg **source** (Linux artifact) | **9.0** | ffmpeg.org, built inside the Rocky 9 container only to supply the headers `ffmpeg-sys-next` compiles against | **GPG signature** + SHA-256 |
 | ffmpeg **source** (Linux AppImage) | **9.0** | the same tarball, built wider (x264, pulse, VAAPI, NVENC) because the AppImage *ships* the binary and its libraries rather than just compiling against the headers | **GPG signature** + SHA-256 |
-| x264 (Linux AppImage) | git **0480cb0** (2025-09-10) | Debian's immutable pool tarball. x264 publishes no releases and no tags, videolan's snapshot directory stopped in 2019, and GitLab's `/-/archive/` tarballs are generated per request so their bytes can change under a hash | SHA-256 |
+| x264 (every platform) | git **0480cb0** (2025-09-10) | Debian's immutable pool tarball, mirrored on our own `vendor-mirror` release. x264 publishes no releases and no tags, videolan's snapshot directory stopped in 2019, and GitLab's `/-/archive/` tarballs are generated per request so their bytes can change under a hash. All three platforms' software H.264 encoder compiles from this one pin | SHA-256 |
 | nv-codec-headers (Linux AppImage) | **13.0.19.1** | header-only NVENC interface; links nothing, and decides only whether the bundled ffmpeg has `h264_nvenc` at all | SHA-256 |
 | tesseract + leptonica + libpng (Linux AppImage) | **5.5.3** / **1.87.0** / **1.6.50** | the same sources and the same static-link recipe the macOS package uses | SHA-256 |
 | AppImage runtime | tag **20251108** | AppImage/type2-runtime, the **dated** release rather than the moving `continuous` tag, which cannot carry a checksum that stays true | SHA-256 |
@@ -346,15 +346,15 @@ project produced them. The build imports the key into a throwaway keyring and
 requires the signature to be made by that exact fingerprint, so a compromised key
 URL supplying both a key and a matching signature still fails.
 
-The Windows binaries now inherit that guarantee (DRAGON-675). They used to be a
-third-party build verified by a hash we computed ourselves; they are now OUR
-build of that same signed tarball, so the signature covers the Windows package's
-ffmpeg too, one step further up.
+The Windows binaries inherited that guarantee in DRAGON-675 and the macOS ones in
+DRAGON-689. Both used to be third-party builds verified by a hash we computed
+ourselves; both are now OUR build of that same signed tarball, so the signature
+covers every platform's shipped ffmpeg, one step further up. There is no prebuilt
+ffmpeg left anywhere in this project.
 
-None of the other upstreams publish signatures (probed 2026-08: martin-riedl.de
-offers `.sha256` only, and the libpng, leptonica, tesseract and tessdata
-downloads none at all), so for those a pinned hash is the honest best available
-rather than an equivalent guarantee.
+None of the other upstreams publish signatures (probed 2026-08: the libpng,
+leptonica, tesseract and tessdata downloads offer none at all), so for those a
+pinned hash is the honest best available rather than an equivalent guarantee.
 
 **A PREBUILT binary's pin is never "just a refresh".** What a binary demands of
 the user's machine is decided when it is compiled, and for someone else's build
@@ -390,7 +390,10 @@ The bundled ffmpeg is a GPL build. The app **spawns** it as a separate process
 rather than linking it, which is the arm's-length case the GPL treats as mere
 aggregation, so the obligation attaches to the bundled binary rather than to the
 application. `mac-package.sh` therefore ships the GPLv3 text plus a `NOTICE`
-naming the exact build and offering its source. Tesseract is Apache-2.0 and
+naming the exact build and offering its source, and, since DRAGON-689, the
+`FFMPEG-BUILD.txt` the build itself wrote: the source tarball, the x264 pin and
+the full configure line, so "which source and which configuration produced this"
+is answerable from inside the bundle. Tesseract is Apache-2.0 and
 leptonica BSD-2-Clause; both permit binary redistribution inside a proprietary
 build as long as the notice travels with it, which `TESSERACT-LICENSE` does.
 

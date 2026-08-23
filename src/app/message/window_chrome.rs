@@ -195,7 +195,7 @@ pub enum WindowChromeMsg {
     /// attempt)` because the native finalize is TITLE-matched and the set-title task can
     /// land a frame or two later, exactly like the preview window's.
     ColorPickerWindowOpened(window::Id, u8),
-    /// DRAGON-680: startup-only. Mint the PALETTE VIEWER's window (`--palette-viewer`),
+    /// DRAGON-680: startup-only. Mint the PALETTE VIEWER's window (`color --viewer`),
     /// the colour picker's result window opened with no overlay and no pick.
     ///
     /// Deferred a message-drain past `init` for exactly the reason
@@ -250,7 +250,7 @@ pub enum WindowChromeMsg {
     /// output — the reliable capture-origin monitor for the post-capture preview.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     CursorEnteredWindow(window::Id),
-    /// macOS (DRAGON-153) / Windows (DRAGON-246): a blocked second `--settings` launch
+    /// macOS (DRAGON-153) / Windows (DRAGON-246): a blocked second `settings` launch
     /// touched the focus poke file — bring this (live) settings pane to the front, un-hiding
     /// it natively on Windows (the pane's window may be HIDDEN/orphaned). Fired by
     /// `sub_settings_poke` while the pane is open.

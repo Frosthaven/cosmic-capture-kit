@@ -100,7 +100,7 @@ pub(super) fn png_name(path: &Path) -> PathBuf {
 ///    one that only exists in the session runtime directory because "Automatically save
 ///    originals" is off. The setting is the basis for the Save action, so the folder it names
 ///    is where the picker opens, never the transient location the bytes happen to be in.
-/// 3. **neither** — an external `--preview` document, which has no configured folder of its
+/// 3. **neither** — an external `editor` document, which has no configured folder of its
 ///    own: it stays exactly where it is, so saving a file the user opened offers to write it
 ///    back over itself (again, what Preview and the Snipping Tool do), with the native
 ///    dialog's replace prompt as the guard.

@@ -1,13 +1,13 @@
 //! PNG read/write with text-chunk metadata.
 //!
 //! Screenshots embed their capture provenance as a `Comment` text chunk (read
-//! back by `--inspect`). We go through the `png` crate directly because `image`
+//! back by `debug inspect`). We go through the `png` crate directly because `image`
 //! doesn't expose text chunks.
 
 use image::RgbaImage;
 
 /// Save an RGBA image as PNG, embedding `metadata` as a `Comment` text chunk (read
-/// back by `--inspect`). We encode with the `png` crate directly because `image`
+/// back by `debug inspect`). We encode with the `png` crate directly because `image`
 /// doesn't expose text chunks. Empty `metadata` writes no chunk.
 pub fn save_png(img: &RgbaImage, path: &std::path::Path, metadata: &str) -> bool {
     let Ok(file) = std::fs::File::create(path) else {
@@ -25,7 +25,7 @@ pub fn save_png(img: &RgbaImage, path: &std::path::Path, metadata: &str) -> bool
     }
 }
 
-/// Read the `Comment` text chunk embedded by [`save_png`] (used by `--inspect`).
+/// Read the `Comment` text chunk embedded by [`save_png`] (used by `debug inspect`).
 pub fn read_png_metadata(path: &std::path::Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let reader = png::Decoder::new(std::io::BufReader::new(file)).read_info().ok()?;
@@ -42,7 +42,7 @@ mod tests {
     use super::*;
 
     /// A screenshot's metadata survives a save → read round trip via the PNG
-    /// `Comment` text chunk (what `--inspect` reads back).
+    /// `Comment` text chunk (what `debug inspect` reads back).
     #[test]
     fn png_metadata_roundtrip() {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));

@@ -7,14 +7,40 @@
 //! returns when `stop` is set. Buffers are requested CPU-mapped (`MAP_BUFFERS`),
 //! so no DMA-BUF import is needed; frames a source only offers as DMA-BUF are
 //! skipped.
+//!
+//! ## The stream that never starts (DRAGON-714)
+//!
+//! [`consume_frames`] watches for one thing besides frames: whether the stream ever
+//! reaches Streaming at all. Before this watch existed the only thing that spoke was the
+//! recording worker's generic 10s "no frames from the PipeWire stream", which names a
+//! symptom and not a cause, and the recording was lost either way.
+//!
+//! A failed negotiation can arrive two ways, and this path handles both. MEASURED on
+//! cosmic-comp with PipeWire 1.6.8: it walks `Connecting -> Paused -> Error("no more
+//! output formats")`, with the error 4ms after the connect, so the stream DOES report it
+//! here. On a producer or version that does not report it, the stream simply sits in
+//! Paused and only the clock can tell. "Never reached Streaming" is the condition that
+//! covers both; the error is an early exit from the same wait, not a separate mechanism.
+//!
+//! The rules (how long to wait, which transitions count, what to say) are PURE and live
+//! in the shared tree, unit-tested on every host: `platform::pipewire_stream_watch`,
+//! `platform::pipewire_stall_reason`, `platform::PW_STREAMING_BUDGET`. Only the listener
+//! and the loop timer are here.
+//!
+//! [`consume_dmabuf`] deliberately does NOT carry the watch: a zero-copy attempt that
+//! never delivers is a DECLINE, bounded by its caller's own first-frame budget and
+//! answered by re-running the session on the CPU path (`record::zero_copy`), so it costs
+//! a fallback rather than a recording. This path is the one where the silence is final.
+
+use crate::errln;
 
 use pipewire as pw;
 use pw::spa;
 use spa::pod::Pod;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::pixfmt::{bytes_per_pixel, convert_crop};
 #[cfg(feature = "zero-copy")]
@@ -34,6 +60,31 @@ pub type Crop = Option<(u32, u32, u32, u32)>;
 /// portal backend's `transparency` capability; an experiment variable is
 /// temporary by contract — delete this hook the moment the answer is measured.
 pub const ALPHA_PROBE_ENV: &str = "CCK_ALPHA_PROBE";
+
+/// DRAGON-714 test hook (`CCK_TEST_PW_BREAK_NEGOTIATION=1`), inert unless set: ask for a
+/// video size no producer can meet (a fixed 17x17 rectangle instead of the usual range),
+/// so the format intersection is empty and the stream never reaches Streaming. That is the
+/// exact shape of the failure the negotiation watch exists to catch, and there is no other
+/// way to reach it on a healthy desktop.
+///
+/// It is a HOOK, never a code path: the normal request is byte-identical with the variable
+/// unset. Production must keep sending a `Choice::Range` and must never send a fixed
+/// smaller rectangle, because SPA compares rectangles by AREA, so a narrower request
+/// constrains neither axis and an empty intersection is a lost recording rather than a
+/// fallback (the whole finding this ticket's research landed on).
+pub const TEST_BREAK_NEGOTIATION_ENV: &str = "CCK_TEST_PW_BREAK_NEGOTIATION";
+
+/// What the `state_changed` listener has seen, read by the loop timer that judges it. Both
+/// run on the PipeWire loop thread; the mutex is for the borrow checker, not contention.
+#[derive(Default)]
+struct NegotiationWatch {
+    /// The phase the stream is in NOW.
+    phase: Option<crate::platform::PwStreamPhase>,
+    /// Whether Streaming was EVER reached. Latches: it disarms the watch for good.
+    reached_streaming: bool,
+    /// The stream's own error message, when it had one. A negotiation failure has none.
+    error: Option<String>,
+}
 
 struct UserData<F> {
     format: spa::param::video::VideoInfoRaw,
@@ -114,8 +165,41 @@ where
     )
     .map_err(|e| e.to_string())?;
 
+    // DRAGON-714: what the stream is doing, for the negotiation watch below. Shared with
+    // the loop timer, which is the only thing that judges it.
+    let watch: Arc<Mutex<NegotiationWatch>> = Arc::new(Mutex::new(NegotiationWatch::default()));
+    let watch_cb = watch.clone();
+
     let _listener = stream
         .add_local_listener_with_user_data(data)
+        // DRAGON-714. What this listener is really for is recording whether Streaming was
+        // ever reached, which is the one signal available on every producer. It ALSO
+        // captures the error text when the stream reports one, which cosmic-comp does (see
+        // the module doc): that turns a five second wait into a 4ms diagnosis carrying the
+        // compositor's own words.
+        .state_changed(move |_, _, old, new| {
+            use crate::platform::PwStreamPhase as Phase;
+            let phase = match &new {
+                pw::stream::StreamState::Unconnected => Phase::Unconnected,
+                pw::stream::StreamState::Connecting => Phase::Connecting,
+                pw::stream::StreamState::Paused => Phase::Paused,
+                pw::stream::StreamState::Streaming => Phase::Streaming,
+                pw::stream::StreamState::Error(_) => Phase::Error,
+            };
+            if let Ok(mut w) = watch_cb.lock() {
+                w.phase = Some(phase);
+                w.error = match &new {
+                    pw::stream::StreamState::Error(e) => Some(e.clone()),
+                    _ => None,
+                };
+                if phase == Phase::Streaming {
+                    w.reached_streaming = true;
+                }
+            }
+            // Behaviour, never content: two stream states and nothing about what is on
+            // screen. This is also the only record anywhere of a negotiation that failed.
+            log::debug!("pipewire capture: stream state {old:?} -> {new:?}");
+        })
         .param_changed(|_, ud, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
@@ -131,6 +215,16 @@ where
                 return;
             }
             let _ = ud.format.parse(param);
+            // DRAGON-714: what we ASKED for against what we GOT, once per session. On every
+            // Linux compositor shipping today this is the producer's fixed size and our
+            // request never had a say, so this line is the only thing that will ever tell
+            // us the day that changes.
+            log::debug!(
+                "pipewire capture: negotiated {}x{} fmt {:?}",
+                ud.format.size().width,
+                ud.format.size().height,
+                ud.format.format(),
+            );
         })
         .process(|stream, ud| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -256,6 +350,32 @@ where
             spa::param::video::VideoFormat::RGB,
         )
     };
+    // The size request stays a `Choice::Range`: it costs nothing against a producer that
+    // offers one fixed size (every Linux compositor shipping today), and it cannot break
+    // negotiation. The `CCK_TEST_PW_BREAK_NEGOTIATION` arm asks for something no producer
+    // can meet, on purpose, to reach the failure the watch below exists for.
+    let size_prop = if std::env::var_os(TEST_BREAK_NEGOTIATION_ENV).is_some() {
+        log::warn!(
+            "pipewire capture: {TEST_BREAK_NEGOTIATION_ENV} is set — requesting an \
+             impossible 17x17 video size so this stream's negotiation FAILS. This is a \
+             test hook; unset it for a working capture."
+        );
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoSize,
+            Rectangle,
+            spa::utils::Rectangle { width: 17, height: 17 }
+        )
+    } else {
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            spa::utils::Rectangle { width: 1920, height: 1080 },
+            spa::utils::Rectangle { width: 1, height: 1 },
+            spa::utils::Rectangle { width: 8192, height: 8192 }
+        )
+    };
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
@@ -270,15 +390,7 @@ where
             spa::param::format::MediaSubtype::Raw
         ),
         fmt_prop,
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            spa::utils::Rectangle { width: 1920, height: 1080 },
-            spa::utils::Rectangle { width: 1, height: 1 },
-            spa::utils::Rectangle { width: 8192, height: 8192 }
-        ),
+        size_prop,
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoFramerate,
             Choice,
@@ -298,6 +410,9 @@ where
     .into_inner();
     let mut params = [Pod::from_bytes(&values).ok_or("invalid format pod")?];
 
+    // DRAGON-714: the negotiation clock starts HERE, at the connect, because that is what
+    // the budget is measured against.
+    let connected_at = Instant::now();
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -307,12 +422,57 @@ where
         )
         .map_err(|e| e.to_string())?;
 
-    // Poll the stop flag on the loop thread and quit the loop when it's set.
+    // Filled by the timer below when it gives up on a stream that never started, and read
+    // once the loop has quit. `None` means the loop ended for any ordinary reason.
+    let stall: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // Poll the stop flag on the loop thread and quit the loop when it's set; and, until the
+    // stream has provably started, judge the negotiation watch on the same tick (DRAGON-714).
     let ml = mainloop.clone();
     let stop_check = stop.clone();
+    let watch_timer = watch.clone();
+    let stall_timer = stall.clone();
+    // Latches false the moment the watch settles, so a healthy session stops touching the
+    // mutex for the rest of the recording. An atomic because the loop hands the callback
+    // out as `Fn`, not `FnMut`.
+    let armed = AtomicBool::new(true);
     let timer = mainloop.loop_().add_timer(move |_| {
         if stop_check.load(Ordering::Relaxed) {
             ml.quit();
+            return;
+        }
+        if !armed.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(w) = watch_timer.lock() else { return };
+        // No transition seen yet is `Unconnected`: the state a fresh stream starts in.
+        let phase = w.phase.unwrap_or(crate::platform::PwStreamPhase::Unconnected);
+        let (reached, error) = (w.reached_streaming, w.error.clone());
+        drop(w);
+        match crate::platform::pipewire_stream_watch(
+            connected_at.elapsed(),
+            crate::platform::PW_STREAMING_BUDGET,
+            reached,
+            phase,
+        ) {
+            crate::platform::PwStreamWatch::Settled => armed.store(false, Ordering::Relaxed),
+            crate::platform::PwStreamWatch::Waiting => {}
+            crate::platform::PwStreamWatch::GiveUp => {
+                armed.store(false, Ordering::Relaxed);
+                let reason = crate::platform::pipewire_stall_reason(
+                    crate::platform::PW_STREAMING_BUDGET,
+                    phase,
+                    error.as_deref(),
+                );
+                log::error!("pipewire capture: {reason}");
+                if let Ok(mut g) = stall_timer.lock() {
+                    *g = Some(reason);
+                }
+                // Ending the loop drops the frame sender with it, so a caller waiting on
+                // the channel sees the disconnect at once instead of sitting out its own
+                // (outer, longer) first-frame budget.
+                ml.quit();
+            }
         }
     });
     let _ = timer.update_timer(
@@ -321,7 +481,13 @@ where
     );
 
     mainloop.run();
-    Ok(())
+    // A stream that never started is a NAMED failure, not a silent end (DRAGON-714). The
+    // recording worker repeats this string into `Failure::RecordingFailed`, where it is the
+    // whole diagnosis the user gets.
+    match stall.lock().ok().and_then(|mut g| g.take()) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
 }
 
 /// DRAGON-562 alpha probe: print one frame's raw byte-3 histogram to stderr,
@@ -344,16 +510,16 @@ fn report_alpha_probe(
         V::BGRA | V::RGBA => "a REAL alpha channel",
         V::BGRx | V::RGBx => "a PADDING byte (no alpha format negotiated)",
         _ => {
-            eprintln!("alpha-probe: frame {n}: fmt {fmt:?} carries no fourth byte to read");
+            errln!("alpha-probe: frame {n}: fmt {fmt:?} carries no fourth byte to read");
             return;
         }
     };
     match super::pixfmt::alpha_histogram(src, stride, bpp, cx, cy, cw, ch) {
-        Some((zero, partial, opaque)) => eprintln!(
+        Some((zero, partial, opaque)) => errln!(
             "alpha-probe: frame {n}: fmt {fmt:?} (byte 3 is {channel}) {cw}x{ch}px: \
              alpha==0: {zero}  0<alpha<255: {partial}  alpha==255: {opaque}"
         ),
-        None => eprintln!("alpha-probe: frame {n}: fmt {fmt:?}: bpp {bpp} != 4, nothing to read"),
+        None => errln!("alpha-probe: frame {n}: fmt {fmt:?}: bpp {bpp} != 4, nothing to read"),
     }
 }
 
@@ -498,7 +664,7 @@ where
             }
             let _ = ud.format.parse(param);
             if ud.debug {
-                eprintln!(
+                errln!(
                     "dmabuf-debug: negotiated {:?} {}x{} modifier=0x{:016x}",
                     ud.format.format(),
                     ud.format.size().width,
@@ -521,7 +687,7 @@ where
                     let mut params = [pod];
                     let _ = stream.update_params(&mut params);
                     if ud.debug {
-                        eprintln!(
+                        errln!(
                             "dmabuf-debug: re-sent fixated modifier=0x{:016x}",
                             ud.format.modifier()
                         );
@@ -537,7 +703,7 @@ where
                 ud.logged = true;
                 let types: Vec<String> =
                     buffer.datas_mut().iter().map(|d| format!("{:?}", d.type_())).collect();
-                eprintln!("dmabuf-debug: first buffer data types = [{}]", types.join(", "));
+                errln!("dmabuf-debug: first buffer data types = [{}]", types.join(", "));
             }
             let fw = ud.format.size().width;
             let fh = ud.format.size().height;
@@ -677,10 +843,34 @@ where
     Ok(())
 }
 
+/// The wait [`grab_frame`] gives a stalled stream. Generous on purpose: both of its
+/// callers are seeding a frozen backdrop the session cannot proceed without, so waiting
+/// beats showing nothing.
+pub const GRAB_FRAME_BUDGET: Duration = Duration::from_secs(5);
+
 /// Grab a single frame from `node_id` on the portal `fd`, cropped per `crop`, as
 /// an RGBA image. Blocks on the calling thread (run it off the UI thread). Returns
-/// `None` if no frame arrives within a few seconds.
+/// `None` if no frame arrives within [`GRAB_FRAME_BUDGET`].
 pub fn grab_frame(fd: OwnedFd, node_id: u32, crop: Crop) -> Option<image::RgbaImage> {
+    grab_frame_within(fd, node_id, crop, GRAB_FRAME_BUDGET)
+}
+
+/// [`grab_frame`] with the caller's own bound (DRAGON-737).
+///
+/// Split out because the five second default is right for a backdrop seed and wrong for
+/// anything on a path the user is waiting on: DRAGON-737's tie-break runs between the
+/// portal dialog closing and the countdown starting, where five seconds of silence would
+/// read as a hang. The rule the split serves is DRAGON-118's, that a wait states its own
+/// deadline; this one lets the CALLER state it.
+///
+/// The stop flag is sampled by a 100ms loop timer, so the real ceiling is `budget` plus
+/// one tick. Callers with a tight budget should count on that.
+pub fn grab_frame_within(
+    fd: OwnedFd,
+    node_id: u32,
+    crop: Crop,
+    budget: Duration,
+) -> Option<image::RgbaImage> {
     let stop = Arc::new(AtomicBool::new(false));
     let got: Arc<std::sync::Mutex<Option<image::RgbaImage>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -688,7 +878,7 @@ pub fn grab_frame(fd: OwnedFd, node_id: u32, crop: Crop) -> Option<image::RgbaIm
     {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(budget);
             stop.store(true, Ordering::Relaxed);
         });
     }

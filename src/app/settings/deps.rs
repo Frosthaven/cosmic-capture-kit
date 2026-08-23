@@ -280,9 +280,12 @@ impl crate::app::App {
                 let hw = e.id.contains("nvenc")
                     || e.id.contains("vaapi")
                     || e.id.contains("videotoolbox");
-                // Windows hardware tier (DRAGON-238): NVENC (matched above) / AMF / QSV.
+                // Windows hardware tier (DRAGON-238): NVENC (matched above) / AMF / QSV,
+                // plus Media Foundation (DRAGON-701). That last one is an EXACT match on
+                // purpose: `"mf"` is a substring of `"amf"`, so a `contains` would read as
+                // the AMF row and the two ids would stop being distinguishable here.
                 #[cfg(windows)]
-                let hw = hw || e.id.contains("qsv") || e.id.contains("amf");
+                let hw = hw || e.id.contains("qsv") || e.id.contains("amf") || e.id == "mf";
                 hw
             })
             .map(|e| e.label.as_str())

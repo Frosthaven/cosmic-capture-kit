@@ -586,7 +586,7 @@ impl App {
             ColorPickerMsg::CopyValue => self.copy_picker_value(),
             ColorPickerMsg::PickAgain => {
                 // The SAME route every other launcher takes (the tray entry, the global
-                // shortcut, the editor's toolbar pipette): a detached `--color-picker` child.
+                // shortcut, the editor's toolbar pipette): a detached `color --picker` child.
                 //
                 // A fresh LAUNCH is the point of this, not a shortcut around the work
                 // (DRAGON-594, and this is the owner's own reason). A launch mints overlays
@@ -622,7 +622,7 @@ impl App {
                 // rejected by `color_target_pid`, so this rides the existing rule instead of
                 // adding one, and the spawn seam can only ADD variables, never clear them.
                 crate::recording_ui::spawn_capture_child_args(
-                    &["--color-picker"],
+                    &["color", "--picker"],
                     &[
                         (crate::app::color_picker::COLOR_TO_PID_ENV, "0"),
                         // And "no palette" (DRAGON-687 follow-up), for the same
@@ -1091,7 +1091,7 @@ impl App {
                 log::debug!("color picker: a palette's pipette started a pick");
                 let nonce_str = nonce.to_string();
                 crate::recording_ui::spawn_capture_child_args(
-                    &["--color-picker"],
+                    &["color", "--picker"],
                     &[
                         // "No editor", explicitly, `PickAgain`'s own inheritance guard.
                         (crate::app::color_picker::COLOR_TO_PID_ENV, "0"),

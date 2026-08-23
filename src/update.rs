@@ -19,6 +19,12 @@
 //! ([`one_click_install_available`]); the zip was unpacked wherever the user chose, so
 //! there is no location we own to replace and it stays a link to the releases page.
 //!
+//! Windows is the same question with only the ARCHITECTURE axis (DRAGON-702): it ships
+//! ONE artifact kind, the per-user MSI, in x86_64 and aarch64 builds, so
+//! [`windows_platform_key`] splits it on `cfg!(target_arch)` alone. Both install
+//! themselves the same way; what must not merge is the DOWNLOAD, since an ARM64 machine
+//! handed the x86_64 msi would install an emulated build over a native one.
+//!
 //! HISTORY: while the source repo was fully private the channel was a separate
 //! Pages repo (`cosmic-capture-kit-updates`), and `publish-release.yml` shipped to
 //! BOTH for a transition period. DRAGON-372 retired it: the Pages repo is gone, so
@@ -148,7 +154,7 @@ pub fn seeded_status_from_cache() -> Option<UpdateStatus> {
 /// version tag, and the only thing it has to be is "not what the old builds wrote".
 ///
 /// What it buys: a marker written by THIS code proves the installer that wrote it also
-/// relaunches with [`crate::instance::RESIDENT_ARG`], so a BARE launch found next to it
+/// relaunches with [`crate::instance::TRAY_ARG`], so a BARE launch found next to it
 /// cannot be that relaunch and must be a real keypress. Builds up to and including the one
 /// this ticket ships against wrote `"1"`, and could only relaunch bare, so their marker
 /// cannot carry that proof. See [`PostUpdateMarker`].
@@ -257,7 +263,7 @@ pub fn take_post_update_marker() -> bool {
 ///
 /// An installer's last act is to start the app again. That relaunch has to say what it is,
 /// because this binary reads a launch with no arguments as "the user pressed the capture
-/// key" (see [`crate::instance::daemon_intent_from_args`]): on Windows a bare launch with
+/// key" (see [`crate::instance::TRAY_ARG`]): on Windows a bare launch with
 /// `resident` on becomes the tray daemon AND spawns the overlay it thinks it owes the user,
 /// and Linux's resident has the same rule. A finished update owes the user nothing of the
 /// kind, so DRAGON-465 makes the relaunch state its intent instead:
@@ -284,7 +290,7 @@ pub fn take_post_update_marker() -> bool {
 #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub fn post_update_relaunch_args(resident: bool) -> &'static [&'static str] {
     if resident {
-        &[crate::instance::RESIDENT_ARG]
+        &[crate::instance::TRAY_ARG]
     } else {
         &[]
     }
@@ -458,6 +464,10 @@ pub fn check_floor_remainder(
 /// zip's URL (or the reverse) would install the wrong artifact the moment either side gains
 /// a one-click install.
 ///
+/// macOS ships TWO artifacts too since DRAGON-700, one dmg per architecture, but that split
+/// is entirely compile-time: see [`macos_platform_key`]. The unsuffixed `macos` key means
+/// aarch64 and must never gain a suffix, exactly as `linux` and `appimage` mean x86_64.
+///
 /// There is deliberately NO `flatpak` key, and a Flatpak build never computes one
 /// (DRAGON-561): every path that reads the manifest is gated off by [`channel_available`]
 /// before it gets here, and [`one_click_install_available`]'s Flatpak arm answers before
@@ -476,11 +486,17 @@ pub fn check_floor_remainder(
 pub fn platform_key() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "macos"
+        // ONE axis on macOS, and it is compile-time: the two dmgs are genuinely
+        // different binaries, so `cfg!` settles it (DRAGON-700). Linux needs a
+        // runtime input beside the arch because its two artifact KINDS are the
+        // same compiled code; nothing like that exists here.
+        macos_platform_key(cfg!(target_arch = "aarch64"))
     }
     #[cfg(target_os = "windows")]
     {
-        "windows"
+        // ONE artifact kind, two architectures, so the only axis is a compile-time one
+        // (DRAGON-702).
+        windows_platform_key(cfg!(target_arch = "aarch64"))
     }
     #[cfg(target_os = "linux")]
     {
@@ -664,6 +680,79 @@ pub fn one_click_install_available() -> bool {
     {
         false
     }
+}
+
+/// The x86_64 (Intel) macOS dmg (DRAGON-700). See [`MACOS_PLATFORM_KEY`] for why the
+/// aarch64 one is the unsuffixed name and this one carries the suffix.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MACOS_X86_64_PLATFORM_KEY: &str = "macos-x86_64";
+
+/// The aarch64 (Apple Silicon) macOS dmg.
+///
+/// **The unsuffixed name means aarch64, forever.** It was the only macOS key from the day
+/// the update channel shipped, so every installed Mac build already looks for exactly this
+/// string, and a published manifest is read by versions we can no longer change. Renaming it
+/// to `macos-aarch64` would stop updates dead for every existing user while adding a
+/// suffixed SIBLING for the new architecture cannot. This is the same rule the unsuffixed
+/// `linux` / `appimage` keys carry, for the same reason.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MACOS_PLATFORM_KEY: &str = "macos";
+
+/// **Pure**, unit-tested: [`platform_key`]'s macOS decision, with the architecture injected.
+///
+/// ONE input, unlike the Linux twin, because macOS has one artifact KIND: a dmg. The arch is
+/// a `cfg!(target_arch)`, a compile-time fact, since an x86_64 build cannot run on Apple
+/// Silicon except through Rosetta and an aarch64 one cannot run on Intel at all.
+///
+/// Getting it wrong is the WORSE of the two failure modes the Linux keys guard against: the
+/// manifest entry carries the download URL, so a merged key would hand an Intel Mac the
+/// Apple Silicon dmg, whose binaries that CPU cannot execute at all.
+///
+/// Kept OUT of any platform module so it is compiled and tested on every host, per the
+/// repo's decision-in-the-shared-tree rule.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_platform_key(is_aarch64: bool) -> &'static str {
+    if is_aarch64 { MACOS_PLATFORM_KEY } else { MACOS_X86_64_PLATFORM_KEY }
+}
+
+/// The two Windows manifest keys, one per architecture (DRAGON-702).
+///
+/// **The unsuffixed one means x86_64, and must stay that way.** It was the only Windows key
+/// when it shipped (DRAGON-241), so every installed build already looks for exactly that
+/// string, and a published manifest is read by versions we can no longer change. Renaming it
+/// to `windows-x86_64` would stop updates dead for everyone already on it; adding a suffixed
+/// sibling cannot. The same rule the Linux and macOS keys live under.
+///
+/// Both are Windows-only and honestly dead elsewhere. `test` is in the gate so the tests that
+/// pin the strings still run on every host, which is where a typo would otherwise reach a
+/// release unnoticed.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_PLATFORM_KEY: &str = "windows";
+/// The aarch64 MSI (DRAGON-702). See [`WINDOWS_PLATFORM_KEY`] for why this one carries the
+/// suffix and the x86_64 one does not.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_AARCH64_PLATFORM_KEY: &str = "windows-aarch64";
+
+/// **Pure**, unit-tested: [`platform_key`]'s Windows decision, with its one input injected.
+///
+/// Simpler than [`linux_platform_key`] because Windows ships ONE artifact kind: there is no
+/// runtime axis to read, only `cfg!(target_arch)`. It is still a named function rather than
+/// an inline `if`, for the same reason the Linux one is: the strings are a contract with a
+/// published manifest, and a decision in the shared tree is one `cargo test` proves on any
+/// host, where a `cfg` block inside `platform_key` is compiled on Windows alone.
+///
+/// The arch must reach the key. An ARM64 machine that resolved the `windows` entry would
+/// download the x86_64 msi and install it over a native build: it would RUN, under emulation,
+/// which is worse than a hard failure because nothing would report the downgrade.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_platform_key(is_aarch64: bool) -> &'static str {
+    if is_aarch64 { WINDOWS_AARCH64_PLATFORM_KEY } else { WINDOWS_PLATFORM_KEY }
 }
 
 /// The four Linux manifest keys, one per (artifact kind x architecture) pair. Named rather
@@ -951,7 +1040,7 @@ pub fn should_notify_on_daemon_startup(status: &UpdateStatus, notify_updates: bo
 /// check fails / reports up-to-date, this does nothing. Otherwise it calls
 /// `spawn_settings` (injected so the pure decision is unit-testable without
 /// spawning a real process) — in practice
-/// `crate::recording_ui::spawn_capture_child("--settings")`. The spawned child
+/// `crate::recording_ui::spawn_capture_child("settings")`. The spawned child
 /// inherits the environment (so its own check sees the same manifest / any
 /// `CCK_UPDATE_URL` override) and shows the dialog.
 ///
@@ -1025,10 +1114,23 @@ fn parse_version(v: &str) -> Option<Vec<u64>> {
     }
 }
 
+/// **Pure**, unit-tested: the canonical macOS dmg filename, with the architecture injected.
+///
+/// TWO dmgs since DRAGON-700, and the suffix is the only thing that separates them, so it
+/// has to be derived from the running build rather than written once as a literal. The
+/// spelling is the RELEASE LABEL (`aarch64` / `x86_64`), which is what `mac-package.sh`
+/// writes and what the manifest key suffix uses, not Apple's `arm64`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_artifact_name(version: &str, is_aarch64: bool) -> String {
+    let arch = if is_aarch64 { "aarch64" } else { "x86_64" };
+    format!("CosmicCaptureKit-{version}-{arch}.dmg")
+}
+
 /// The canonical macOS artifact filename for a version on the update channel.
 /// Kept in ONE place so the workflow (which names the file) and any app-side
 /// expectation agree. Matches `mac-package.sh`'s
-/// `CosmicCaptureKit-<version>-aarch64.dmg` (arch-suffixed since DRAGON-508).
+/// `CosmicCaptureKit-<version>-<arch>.dmg` (arch-suffixed since DRAGON-508, and
+/// two architectures since DRAGON-700).
 /// In the binary only the macOS install flow consumes it (Linux has no published
 /// artifact yet); the tests cover it everywhere.
 ///
@@ -1039,7 +1141,7 @@ fn parse_version(v: &str) -> Option<Vec<u64>> {
 /// so a log line or a stray temp file still reads as the thing it is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn artifact_name(version: &str) -> String {
-    format!("CosmicCaptureKit-{version}-aarch64.dmg")
+    mac_artifact_name(version, cfg!(target_arch = "aarch64"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2016,6 +2118,17 @@ mod tests {
         );
     }
 
+    /// A relaunch argv, read back through the ACTUAL command grammar `main` uses. The
+    /// program name is prepended because `cli::parse` skips `argv[0]`, exactly as `main`
+    /// hands it the real one.
+    fn as_plan(argv: &[&str]) -> Result<crate::cli::Plan, crate::cli::parse::Usage> {
+        let line: Vec<String> = std::iter::once("cosmic-capture-kit")
+            .chain(argv.iter().copied())
+            .map(String::from)
+            .collect();
+        crate::cli::parse(&line)
+    }
+
     /// DRAGON-465. The bug this pins: the Windows installer relaunched the app with NO
     /// arguments, `main` read that as "the user pressed the capture key", and a resident
     /// install came back with the About page AND a capture overlay over it.
@@ -2026,17 +2139,17 @@ mod tests {
     #[test]
     fn a_post_update_relaunch_never_asks_for_a_capture() {
         // Resident on: the relaunch says so, exactly as the autostart entry does.
-        assert_eq!(post_update_relaunch_args(true), [crate::instance::RESIDENT_ARG]);
+        assert_eq!(post_update_relaunch_args(true), [crate::instance::TRAY_ARG]);
         // Resident off: nothing to raise; the marker turns this into a settings launch.
         assert!(post_update_relaunch_args(false).is_empty());
 
-        // The property, stated through `main`'s own reader: a resident relaunch is daemon
-        // intent, so the daemon it starts owes no overlay.
-        assert!(crate::instance::daemon_intent_from_args(post_update_relaunch_args(true)));
-        // A non-resident relaunch is not daemon intent, and must not be: with `resident`
-        // off there is no daemon branch to reach at all, and the launch has to fall through
-        // to `app::run` for the marker to become the About window.
-        assert!(!crate::instance::daemon_intent_from_args(post_update_relaunch_args(false)));
+        // The property, stated through `main`'s own reader: a resident relaunch parses as the
+        // tray command, so the daemon it starts owes no overlay.
+        assert_eq!(as_plan(post_update_relaunch_args(true)), Ok(crate::cli::Plan::Tray));
+        // A non-resident relaunch carries nothing, and must not: with `resident` off there is
+        // no daemon branch to reach at all, and the launch has to fall through to `app::run`
+        // for the marker to become the About window.
+        assert_eq!(as_plan(post_update_relaunch_args(false)), Ok(crate::cli::Plan::Bare));
 
         // Neither shape may ever carry a capture-mode flag: those are what `main` turns into
         // a mode/kind, and they would open an overlay even with the daemon out of the way.
@@ -2150,7 +2263,7 @@ mod tests {
         // `post_update_relaunch_args` gave it the resident token, and it finds the re-armed
         // marker. No capture, nothing deferred: this is the launch that shows About.
         let relaunch_argv = post_update_relaunch_args(true);
-        assert!(crate::instance::daemon_intent_from_args(relaunch_argv));
+        assert_eq!(as_plan(relaunch_argv), Ok(crate::cli::Plan::Tray));
         let relaunch = post_update_start(false, Some(PostUpdateMarker::V2));
         assert!(!relaunch.owes_capture, "the relaunch must not add an overlay of its own");
         assert!(!relaunch.rearm_marker, "the relaunch delivers the notes, so it spends them");
@@ -2335,11 +2448,28 @@ mod tests {
     }
 
     /// The name has to match what `scripts/mac-package.sh` writes, including the architecture
-    /// suffix DRAGON-508 added. Pinned as a literal rather than rebuilt from parts, because
-    /// this string's whole job is to be the same string the packaging script produces.
+    /// suffix DRAGON-508 added and the second architecture DRAGON-700 added. Pinned as
+    /// literals rather than rebuilt from parts, because this string's whole job is to be the
+    /// same string the packaging script produces.
+    ///
+    /// BOTH arms are pinned here, on every host, so the Intel name is covered even though
+    /// almost every run of this suite is on Apple Silicon or Linux.
     #[test]
     fn artifact_name_matches_packaging() {
-        assert_eq!(artifact_name("0.3.0"), "CosmicCaptureKit-0.3.0-aarch64.dmg");
+        assert_eq!(mac_artifact_name("0.3.0", true), "CosmicCaptureKit-0.3.0-aarch64.dmg");
+        assert_eq!(mac_artifact_name("0.3.0", false), "CosmicCaptureKit-0.3.0-x86_64.dmg");
+        // And the real entry point answers with THIS build's architecture.
+        assert_eq!(
+            artifact_name("0.3.0"),
+            mac_artifact_name("0.3.0", cfg!(target_arch = "aarch64"))
+        );
+    }
+
+    /// The two dmg names can never collide, which is what lets both sit in `target/` and on
+    /// one release, and what lets `publish-release.yml` pick each by its suffix.
+    #[test]
+    fn the_two_dmg_names_are_distinct() {
+        assert_ne!(mac_artifact_name("1.2.3", true), mac_artifact_name("1.2.3", false));
     }
 
     // DRAGON-177: the launch dialog's show/don't-show decision, the full matrix of
@@ -2453,10 +2583,15 @@ mod tests {
     // fall through to "unknown" and could never match one.
     #[test]
     fn platform_key_is_the_manifest_json_key() {
+        // Windows is arch-split since DRAGON-702, so this asserts the same rule the pure
+        // `windows_platform_key` encodes rather than a literal that is only right on x86_64.
         #[cfg(target_os = "windows")]
-        assert_eq!(platform_key(), "windows");
+        assert_eq!(platform_key(), super::windows_platform_key(cfg!(target_arch = "aarch64")));
+        // macOS answers per ARCHITECTURE since DRAGON-700, so this asserts the rule rather
+        // than the Apple Silicon literal: pinning "macos" here would fail the x86_64 build
+        // for being correct. `macos_platform_key_tests` pins both strings.
         #[cfg(target_os = "macos")]
-        assert_eq!(platform_key(), "macos");
+        assert_eq!(platform_key(), macos_platform_key(cfg!(target_arch = "aarch64")));
         // Linux is asserted by `linux_platform_key_tests` instead: the answer depends on
         // `$APPIMAGE`, and `cargo test` must not care whether the runner happens to have it.
         // Whatever the key is, a manifest carrying an artifact under it must parse for
@@ -2664,7 +2799,7 @@ mod appimage_relaunch_script_tests {
     /// launch and NOT a daemon they never asked for.
     #[test]
     fn the_relaunch_matches_how_the_user_runs_the_app() {
-        assert!(script(true).contains(r#"setsid "$APPIMAGE" 'resident'"#));
+        assert!(script(true).contains(r#"setsid "$APPIMAGE" 'tray'"#));
         assert!(script(false).contains(r#"setsid "$APPIMAGE" >"#));
     }
 
@@ -2723,7 +2858,7 @@ mod appimage_relaunch_script_tests {
     #[test]
     fn the_generated_script_is_valid_sh() {
         use std::io::Write as _;
-        for (label, s) in [("resident", script(true)), ("bare", script(false))] {
+        for (label, s) in [("tray", script(true)), ("bare", script(false))] {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg("-n")
                 .stdin(std::process::Stdio::piped())
@@ -2755,6 +2890,153 @@ mod appimage_relaunch_script_tests {
         assert!(!s.contains("mv "), "no move");
         assert!(!s.contains("cp "), "no copy");
         assert!(!s.contains("rm "), "nothing removed");
+    }
+}
+
+/// DRAGON-700: which manifest entry a macOS build reads. Compiled and run on EVERY host,
+/// like the Linux module below, because the decision is a pure function of an injected
+/// architecture and the Linux gate is where most runs of this suite happen.
+#[cfg(test)]
+mod macos_platform_key_tests {
+    use super::{MACOS_PLATFORM_KEY, MACOS_X86_64_PLATFORM_KEY, macos_platform_key};
+
+    /// THE RULE THAT CANNOT CHANGE. `macos` is what every already-installed Mac build looks
+    /// for, and a published manifest is read by versions we can no longer ship a fix to, so
+    /// renaming it to `macos-aarch64` would end updates for all of them at once.
+    #[test]
+    fn apple_silicon_reads_the_unsuffixed_entry() {
+        assert_eq!(macos_platform_key(true), "macos");
+        assert_eq!(MACOS_PLATFORM_KEY, "macos");
+    }
+
+    /// The publisher writes this literal into `update.json`, so a typo on either side reads
+    /// as "no update available" rather than as an error, which is the kind of break nothing
+    /// reports.
+    #[test]
+    fn intel_reads_its_own_suffixed_entry() {
+        assert_eq!(macos_platform_key(false), "macos-x86_64");
+        assert_eq!(MACOS_X86_64_PLATFORM_KEY, "macos-x86_64");
+    }
+
+    /// THE POINT OF THE SPLIT, and the same failure the Linux arch split guards: the entry
+    /// carries the DOWNLOAD URL, so one shared key would hand an Intel Mac the Apple Silicon
+    /// dmg. A wrong KIND at least still executes; a wrong ARCH does not run at all.
+    #[test]
+    fn the_two_architectures_never_share_a_key() {
+        assert_ne!(macos_platform_key(true), macos_platform_key(false));
+    }
+
+    /// Neither macOS key may collide with a key another platform reads. They all live in one
+    /// `platforms` object in one published manifest, so a collision would serve one
+    /// platform's artifact to another.
+    #[test]
+    fn the_macos_keys_collide_with_no_other_platform() {
+        for key in [MACOS_PLATFORM_KEY, MACOS_X86_64_PLATFORM_KEY] {
+            for other in ["windows", "linux", "linux-aarch64", "appimage", "appimage-aarch64"] {
+                assert_ne!(key, other, "macOS key {key} collides with {other}");
+            }
+        }
+    }
+
+    /// A real published manifest carries EVERY key at once, so each build must slice out its
+    /// own entry. The two macOS keys share a prefix, and `macos` is a substring of
+    /// `macos-x86_64`, which is precisely the shape a sloppy substring search gets wrong: an
+    /// Apple Silicon build must not resolve the Intel entry just because the name starts the
+    /// same way.
+    #[test]
+    fn each_macos_build_slices_its_own_artifact_out_of_one_manifest() {
+        const PUBLISHED: &str = r#"{
+            "version": "9.9.9",
+            "notes": "n",
+            "published": "d",
+            "platforms": {
+                "macos":        { "url": "https://example.com/arm.dmg",   "sha256": "a", "size": 1 },
+                "macos-x86_64": { "url": "https://example.com/intel.dmg", "sha256": "b", "size": 2 },
+                "windows":      { "url": "https://example.com/w.msi",     "sha256": "c", "size": 3 }
+            }
+        }"#;
+        let arm = super::Manifest::parse_platform(PUBLISHED, MACOS_PLATFORM_KEY).expect("parse");
+        let intel =
+            super::Manifest::parse_platform(PUBLISHED, MACOS_X86_64_PLATFORM_KEY).expect("parse");
+        assert_eq!(arm.artifact.expect("arm artifact").url, "https://example.com/arm.dmg");
+        assert_eq!(intel.artifact.expect("intel artifact").url, "https://example.com/intel.dmg");
+    }
+}
+
+/// DRAGON-702: which manifest entry a Windows build reads. Compiled and run on EVERY host,
+/// because the strings are a contract with a manifest that older installs also read, and a
+/// typo here is silent: it reads as "no update available" rather than as an error.
+#[cfg(test)]
+mod windows_platform_key_tests {
+    use super::{WINDOWS_AARCH64_PLATFORM_KEY, WINDOWS_PLATFORM_KEY, windows_platform_key};
+
+    /// The x86_64 MSI, unchanged since DRAGON-241.
+    #[test]
+    fn an_x86_64_build_reads_the_unsuffixed_entry() {
+        assert_eq!(windows_platform_key(false), "windows");
+    }
+
+    #[test]
+    fn an_aarch64_build_reads_its_own_entry() {
+        assert_eq!(windows_platform_key(true), WINDOWS_AARCH64_PLATFORM_KEY);
+    }
+
+    /// THE POINT OF THE SPLIT. The entry carries the DOWNLOAD URL, so one shared key would
+    /// hand an ARM64 machine the x86_64 msi. That install SUCCEEDS, under Windows on ARM's
+    /// x64 emulation, which is the bad part: a native build would be silently replaced by an
+    /// emulated one and nothing anywhere would say so.
+    #[test]
+    fn the_two_architectures_never_share_a_key() {
+        assert_ne!(windows_platform_key(false), windows_platform_key(true));
+    }
+
+    /// The publisher writes these literals into `update.json`. The UNSUFFIXED one means
+    /// x86_64 and may never gain a suffix: it is what every already-installed Windows build
+    /// looks for, and a published manifest is read by versions we can no longer change.
+    #[test]
+    fn the_key_strings_are_stable() {
+        assert_eq!(WINDOWS_PLATFORM_KEY, "windows");
+        assert_eq!(WINDOWS_AARCH64_PLATFORM_KEY, "windows-aarch64");
+    }
+
+    /// THE BACKWARD-COMPATIBILITY TEST, the Windows half of the DRAGON-529 one below.
+    ///
+    /// [`super::platform_object`] resolves a key by SUBSTRING search, so `"windows"` could in
+    /// principle match inside `"windows-aarch64"` and send every existing x86_64 install to
+    /// the ARM download. It cannot, because the search includes BOTH quotes and the suffixed
+    /// key has a hyphen where the closing quote would be. Pinned in the worst arrangement:
+    /// the suffixed key placed FIRST, so a prefix match would be found before the real one.
+    #[test]
+    fn adding_the_windows_aarch64_key_does_not_disturb_the_existing_one() {
+        const NEW: &str = r#"{"version":"0.31.0","notes":"","published":"","platforms":{
+            "windows-aarch64": {"url":"https://e.com/arm.msi","sha256":"aa","size":1},
+            "windows":         {"url":"https://e.com/x86.msi","sha256":"bb","size":2},
+            "macos":           {"url":"https://e.com/a.dmg",  "sha256":"cc","size":3}}}"#;
+        for (key, want) in [
+            ("windows", "https://e.com/x86.msi"),
+            ("windows-aarch64", "https://e.com/arm.msi"),
+        ] {
+            let a = super::Manifest::parse_platform(NEW, key)
+                .unwrap_or_else(|| panic!("{key} must parse"))
+                .artifact
+                .unwrap_or_else(|| panic!("{key} must resolve"));
+            assert_eq!(a.url, want, "{key} resolved the wrong architecture's artifact");
+        }
+    }
+
+    /// A manifest published BEFORE this key existed (every release up to the one that first
+    /// attached an ARM64 msi) must leave an ARM64 build with NO artifact rather than falling
+    /// back to the x86_64 entry. No artifact means "Update Available" with no install button,
+    /// which is honest; falling back would install the emulated build over the native one.
+    #[test]
+    fn an_older_manifest_gives_the_aarch64_build_no_artifact() {
+        const OLD: &str = r#"{"version":"0.30.0","notes":"","published":"","platforms":{
+            "macos":{"url":"https://e.com/a.dmg","sha256":"aa","size":1},
+            "windows":{"url":"https://e.com/a.msi","sha256":"bb","size":2}}}"#;
+        let m =
+            super::Manifest::parse_platform(OLD, WINDOWS_AARCH64_PLATFORM_KEY).expect("parse");
+        assert_eq!(m.version, "0.30.0", "the version still reads, so the check still works");
+        assert!(m.artifact.is_none(), "no windows-aarch64 entry must not fall back to x86_64");
     }
 }
 
@@ -2835,9 +3117,10 @@ mod linux_platform_key_tests {
         assert!(is_appimage_key(APPIMAGE_AARCH64_PLATFORM_KEY));
         assert!(!is_appimage_key(LINUX_PLATFORM_KEY));
         assert!(!is_appimage_key(LINUX_AARCH64_PLATFORM_KEY));
-        // And nothing else is, including the other platforms' keys.
+        // And nothing else is, including the other platforms' keys, at either architecture.
         assert!(!is_appimage_key("macos"));
         assert!(!is_appimage_key("windows"));
+        assert!(!is_appimage_key("windows-aarch64"));
     }
 
     /// A real published manifest carries ALL FOUR keys at once (`publish-release.yml` emits

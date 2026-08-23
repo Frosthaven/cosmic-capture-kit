@@ -274,6 +274,41 @@ mod placement_tests {
         assert_eq!(r.y, BADGE_GAP);
     }
 
+    /// DRAGON-740, over DRAGON-735: the owner's failing take, in numbers, and the reason
+    /// the two halves of the toolbar decision have to agree.
+    ///
+    /// A 1688x1384 portal-cast window at (12, 44) on a 5120x1440 ultrawide leaves no room
+    /// above or below, so the bar docks to its RIGHT and stacks. What matters as much as
+    /// where it lands is that it CLEARS the capture: `recording_toolbar_oversized` runs
+    /// exactly this overlap test over exactly this rect, and if it disagrees the bar is
+    /// placed perfectly and then hidden for not fitting, which is what the owner saw.
+    #[test]
+    fn a_portal_window_docks_clear_to_the_right_with_room_to_spare() {
+        // The LIVE recording bar's real footprint, from the toolbar's own group widths:
+        // ink (172) + audio (88) + the record chip (186) plus two 8pt gaps laid out in a
+        // row, and stacked it is the widest group by three group heights plus its gaps.
+        const REC_H: (f32, f32) = (462.0, GROUP_H_BASE);
+        const REC_V: (f32, f32) = (186.0, 3.0 * GROUP_H_BASE + 2.0 * 8.0);
+        let o = out((0, 0), (5120, 1440), 1.0);
+        let win = (12, 44, 1688u32, 1384u32);
+        let (r, horizontal) =
+            placement_in(o.0, o.1, win, REC_H.0, REC_H.1, REC_V.0, REC_V.1).unwrap();
+        // A window 1384 tall on a 1440 output has neither slot, and its left margin is 12
+        // points, so the only side that fits is the right one.
+        assert!(!horizontal, "no horizontal slot above or below a near-full-height window");
+        assert_eq!(r.x, 12.0 + 1688.0 + BADGE_GAP);
+        assert_eq!((r.width, r.height), REC_V);
+        // The fits-outside test, spelled out: at factor 1.0 the capture rect needs no
+        // conversion, so this is byte for byte what `recording_toolbar_oversized` computes.
+        let (cx, cy, cw, ch) = (12.0, 44.0, 1688.0, 1384.0);
+        let overlap_x = r.x < cx + cw && r.x + r.width > cx;
+        let overlap_y = r.y < cy + ch && r.y + r.height > cy;
+        assert!(!(overlap_x && overlap_y), "the bar must not overlap the window it records");
+        // And there is a great deal of room left over, which is the owner's point: 3420
+        // points of empty desktop sat to the right of the window while the bar was gone.
+        assert!(o.1.0 - (cx + cw) > 3000.0);
+    }
+
     /// The DRAGON-448 defect, in numbers. A 5120x2880 monitor at 150% is a 3413x1920
     /// VIEWPORT; a region drawn across its right half sits at capture x≈2560, which the old
     /// code fed straight in as a point coordinate. That is past the viewport's right edge,

@@ -347,6 +347,22 @@ fn install_button<'a>(version: &str, installing: bool, width: f32) -> Element<'a
     )
 }
 
+/// The tagline's fallback measure, in characters: what the block wraps to when the
+/// description's first sentence cannot set the measure itself (DRAGON-706, below).
+///
+/// The number is not invented. It is the width the About layout was already built
+/// around, read off the descriptions that DRAGON-578 was written for: their opening
+/// sentences ran 75 characters ("Quickly capture your screen/audio to the clipboard
+/// for sharing with others.") and 78 ("A cross-platform tool for quickly capturing
+/// and sharing what's on your screen."). 76 sits inside that band, so a description
+/// that takes the fallback renders at the same width as one that sets its own
+/// measure, and the hero block keeps its shape either way.
+///
+/// It is also the CAP on a first-sentence measure. A first sentence wider than this
+/// would put a line past the design width no matter what the remainder does, so such
+/// a description takes the fallback too.
+const TAGLINE_MEASURE: usize = 76;
+
 /// Wrap the Cargo description "generally around where the first sentence ends"
 /// (the owner's rule, DRAGON-578, third reading of the same request: not a fixed
 /// pixel width, not sentence-per-line). The opening sentence is line one and
@@ -355,17 +371,49 @@ fn install_button<'a>(version: &str, installing: bool, width: f32) -> Element<'a
 /// the caption font is proportional, but "around" is the spec, and a pure count
 /// keeps the decision testable with no font stack (the `text_annot::wrap_with`
 /// precedent). Words are never split; a word longer than the measure gets its
-/// own line. A description with no ". " boundary comes back as a single line.
+/// own line.
+///
+/// AMENDED by DRAGON-706, because the DRAGON-578 rule degenerates when the whole
+/// description IS one sentence. "The first sentence sets the measure" then reads
+/// "the whole text is line one", and the tagline rendered as a single unwrapped
+/// line running off the hero block. The 2026-08-17 description is exactly that
+/// shape, and a description is free to be one sentence, so the rule needs an
+/// answer for it rather than a shorter sentence. The old rule was not wrong, it
+/// was incomplete: it only ever described the two-sentence case.
+///
+/// So there are two regimes, and which one applies is decided FIRST:
+///
+/// - The first sentence is a proper prefix of the description AND fits
+///   [`TAGLINE_MEASURE`]: the DRAGON-578 rule, unchanged, byte for byte.
+/// - Otherwise (one sentence, or an opening sentence too wide to be a line):
+///   the WHOLE description wraps greedily to [`TAGLINE_MEASURE`].
+///
+/// An empty description renders nothing.
 /// Pure; unit-tested in `tagline_wrap_tests`.
 fn wrap_tagline(desc: &str) -> Vec<String> {
-    let Some((first, rest)) = desc.split_once(". ") else {
-        return if desc.is_empty() { Vec::new() } else { vec![desc.to_string()] };
-    };
-    let first = format!("{first}.");
-    let measure = first.chars().count();
-    let mut lines = vec![first];
+    if desc.is_empty() {
+        return Vec::new();
+    }
+    if let Some((first, rest)) = desc.split_once(". ") {
+        let first = format!("{first}.");
+        let measure = first.chars().count();
+        if measure <= TAGLINE_MEASURE {
+            let mut lines = vec![first];
+            lines.extend(wrap_greedy(rest, measure));
+            return lines;
+        }
+    }
+    wrap_greedy(desc, TAGLINE_MEASURE)
+}
+
+/// Greedy word wrap to a character measure, the one wrapper both [`wrap_tagline`]
+/// regimes share. Words are never split, so a word longer than `measure` gets its
+/// own over-long line rather than being cut. Whitespace-only input yields nothing.
+/// Pure; unit-tested in `tagline_wrap_tests`.
+fn wrap_greedy(text: &str, measure: usize) -> Vec<String> {
+    let mut lines = Vec::new();
     let mut line = String::new();
-    for word in rest.split_whitespace() {
+    for word in text.split_whitespace() {
         if line.is_empty() {
             line = word.to_string();
         } else if line.chars().count() + 1 + word.chars().count() <= measure {
@@ -404,8 +452,11 @@ fn hero() -> Element<'static, Msg> {
             // The tagline comes from Cargo.toml rather than a literal, so the crate metadata
             // and the About page cannot drift (owner request). `Cargo.toml` is the single
             // source: change the wording there and this follows. The block wraps around
-            // where the first sentence ends (owner's call, DRAGON-578): wrap_tagline
-            // pre-breaks the lines, each rendered unwrapped and centered.
+            // where the first sentence ends (owner's call, DRAGON-578), or, when the
+            // description is a single sentence and that rule has no first sentence to
+            // measure against, to `TAGLINE_MEASURE` (DRAGON-706, which is what stopped a
+            // one-sentence description rendering as one long unwrapped line). Either way
+            // wrap_tagline pre-breaks the lines, each rendered unwrapped and centered.
             {
                 let lines = wrap_tagline(env!("CARGO_PKG_DESCRIPTION"));
                 let mut col = widget::column::with_capacity(lines.len());
@@ -551,37 +602,98 @@ fn donate_button(width: f32) -> Element<'static, Msg> {
     )
 }
 
-// The tagline wrap: the first sentence is line one and sets the measure; the rest of the
-// description wraps to it (DRAGON-578).
+// The tagline wrap, both regimes. Two-sentence descriptions: the first sentence is line one
+// and sets the measure, the rest wraps to it (DRAGON-578). One-sentence descriptions (and any
+// opening sentence wider than the cap): the whole text wraps to `TAGLINE_MEASURE`
+// (DRAGON-706).
+//
+// These tests pin the RULE and never the wording. `Cargo.toml`'s description is marketing copy
+// that changes whenever the feature list does, in either style, so a test that quoted its words
+// would be a tripwire on a file nobody expects to break a build. That is exactly how the
+// DRAGON-578 suite failed: it asserted the description opened with "Quickly capture".
 #[cfg(test)]
 mod tagline_wrap_tests {
-    use super::wrap_tagline;
+    use super::{TAGLINE_MEASURE, wrap_greedy, wrap_tagline};
+
+    /// The measure `desc` will actually be wrapped to, and the index of the first WRAPPED line
+    /// (1 under the DRAGON-578 rule, where line one is the opening sentence rather than a
+    /// wrapped line; 0 under the DRAGON-706 fallback). Mirrors `wrap_tagline`'s REGIME choice
+    /// without repeating its wrapping, so the assertions below hold for a description written
+    /// in either style.
+    fn effective_measure(desc: &str) -> (usize, usize) {
+        match desc.split_once(". ") {
+            // "The sentence plus its period fits the measure": the strict `<` carries the
+            // `+ 1` for the period `wrap_tagline` puts back on the first sentence
+            // (clippy::int_plus_one refuses the spelled-out `+ 1 <=`).
+            Some((first, _)) if first.chars().count() < TAGLINE_MEASURE => {
+                (first.chars().count() + 1, 1)
+            }
+            _ => (TAGLINE_MEASURE, 0),
+        }
+    }
+
+    /// Assert that `lines[from..]` is a greedy wrap to `measure`: no line is wider than the
+    /// measure unless it is a single unsplittable word, and no line could have taken the next
+    /// line's first word. `from` is 1 in the DRAGON-578 regime, where line one is the opening
+    /// sentence rather than a wrapped line, and 0 in the DRAGON-706 fallback.
+    fn assert_greedy(lines: &[String], measure: usize, from: usize) {
+        for (i, line) in lines.iter().enumerate().skip(from) {
+            let width = line.chars().count();
+            assert!(
+                width <= measure || line.split_whitespace().count() == 1,
+                "line {i} runs past the measure {measure} and is not one long word: {line}"
+            );
+            if let Some(next) = lines.get(i + 1).and_then(|l| l.split_whitespace().next()) {
+                assert!(
+                    width + 1 + next.chars().count() > measure,
+                    "line {i} left room for {next:?}, so the wrap is not greedy: {line}"
+                );
+            }
+        }
+    }
+
+    /// Words, in order, ignoring where the line breaks fell.
+    fn words(text: &str) -> Vec<&str> {
+        text.split_whitespace().collect()
+    }
 
     #[test]
-    fn the_first_sentence_is_line_one_and_nothing_runs_wider() {
-        let lines = wrap_tagline(env!("CARGO_PKG_DESCRIPTION"));
+    fn the_fallback_measure_sits_in_the_historical_band() {
+        // The About layout was built around opening sentences of 75 and 78 characters (see
+        // TAGLINE_MEASURE's doc). Moving the fallback outside that band changes the rendered
+        // width of the hero block, which is a design decision, not a refactor.
         assert!(
-            lines[0].starts_with("Quickly capture") && lines[0].ends_with('.'),
-            "line one is the whole opening sentence: {}",
-            lines[0]
+            (75..=78).contains(&TAGLINE_MEASURE),
+            "the fallback measure left the band the layout was designed around: {TAGLINE_MEASURE}"
         );
-        assert!(lines.len() > 2, "the remainder wraps into more than one line: {lines:?}");
-        let measure = lines[0].chars().count();
-        for line in &lines[1..] {
-            assert!(
-                line.chars().count() <= measure,
-                "wrapped line exceeds the first-sentence measure: {line}"
-            );
+    }
+
+    #[test]
+    fn the_real_description_wraps_to_its_measure() {
+        let desc = env!("CARGO_PKG_DESCRIPTION");
+        let lines = wrap_tagline(desc);
+        assert!(!lines.is_empty(), "the crate description is never empty");
+        let (measure, tail) = effective_measure(desc);
+        // Anything longer than its measure has to break into more than one line. That is the
+        // whole point of DRAGON-706: today's single-sentence description is well past the
+        // measure and used to come back as ONE line. The guard is not slack, it is the rule:
+        // a future description short enough to fit is legitimately one line.
+        if desc.chars().count() > measure && words(desc).len() > 1 {
+            assert!(lines.len() > 1, "a description past its measure wraps: {lines:?}");
         }
+        assert_greedy(&lines, measure, tail);
     }
 
     #[test]
     fn no_content_is_lost_or_reordered() {
-        assert_eq!(wrap_tagline(env!("CARGO_PKG_DESCRIPTION")).join(" "), env!("CARGO_PKG_DESCRIPTION"));
+        let desc = env!("CARGO_PKG_DESCRIPTION");
+        assert_eq!(words(&wrap_tagline(desc).join(" ")), words(desc));
     }
 
     #[test]
-    fn the_remainder_wraps_greedily_to_the_measure() {
+    fn a_two_sentence_description_keeps_the_dragon_578_rule() {
+        // Byte-identical to the pre-DRAGON-706 behavior: the first sentence is line one and
+        // the remainder wraps greedily to its width.
         assert_eq!(wrap_tagline("AAAA. bb cc dd"), vec!["AAAA.", "bb cc", "dd"]);
     }
 
@@ -594,7 +706,34 @@ mod tagline_wrap_tests {
     }
 
     #[test]
-    fn a_single_sentence_description_degrades_to_one_line() {
+    fn a_long_single_sentence_wraps_to_the_fallback_measure() {
+        // 40 four-character words, no sentence boundary at all: the DRAGON-578 rule has no
+        // first sentence to measure against, so the whole text takes the fallback.
+        let desc = vec!["aaaa"; 40].join(" ");
+        let lines = wrap_tagline(&desc);
+        assert!(lines.len() > 1, "a long single sentence must not stay on one line: {lines:?}");
+        assert_greedy(&lines, TAGLINE_MEASURE, 0);
+        assert_eq!(words(&lines.join(" ")), words(&desc));
+        // The same text wrapped by hand to the fallback, so the regime choice is pinned and
+        // not just the shape of whatever came back.
+        assert_eq!(lines, wrap_greedy(&desc, TAGLINE_MEASURE));
+    }
+
+    #[test]
+    fn an_opening_sentence_wider_than_the_cap_takes_the_fallback_too() {
+        // A first sentence this wide would put a line past the design width on its own, so it
+        // does not get to set the measure.
+        let first = vec!["bbbb"; 30].join(" ");
+        let desc = format!("{first}. tail words here");
+        assert!(first.chars().count() + 1 > TAGLINE_MEASURE, "the premise: the sentence is wide");
+        let lines = wrap_tagline(&desc);
+        assert_eq!(lines, wrap_greedy(&desc, TAGLINE_MEASURE));
+        assert_greedy(&lines, TAGLINE_MEASURE, 0);
+        assert_eq!(words(&lines.join(" ")), words(&desc));
+    }
+
+    #[test]
+    fn a_short_single_sentence_description_still_fits_one_line() {
         assert_eq!(wrap_tagline("Just one line"), vec!["Just one line"]);
         assert_eq!(wrap_tagline("Ends with a period."), vec!["Ends with a period."]);
     }
@@ -602,6 +741,7 @@ mod tagline_wrap_tests {
     #[test]
     fn an_empty_description_renders_nothing() {
         assert!(wrap_tagline("").is_empty());
+        assert!(wrap_greedy("   ", TAGLINE_MEASURE).is_empty());
     }
 }
 

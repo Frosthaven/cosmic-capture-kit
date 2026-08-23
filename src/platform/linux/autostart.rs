@@ -15,10 +15,11 @@
 //! ## Why the current exe, not a fixed path
 //!
 //! The user's PrintScreen shortcut already launches `target/release/cosmic-capture-kit`
-//! directly (nothing is installed on PATH). We write `Exec=<util::self_exe> resident`, the
+//! directly (nothing is installed on PATH). We write `Exec=<util::self_exe> tray`, the
 //! SAME binary the resident/daemon spawn uses, so the autostart entry launches exactly
 //! what the running app is — a dev build autostarts the dev build, an installed build the
-//! installed one. The bare `resident` argument is the token `main()` early-branches on.
+//! installed one. The bare `tray` argument is the command `main()` early-branches on
+//! (`resident` before DRAGON-695; see `LEGACY_RESIDENT_ARG` for the upgrade window).
 //!
 //! `util::self_exe`, NOT `current_exe` (DRAGON-510). This entry is read at the NEXT login,
 //! and inside an AppImage `current_exe()` names a FUSE mount that stops existing the moment
@@ -38,7 +39,7 @@
 //!    that would run it.
 //!
 //! Both are fixed here: the directory comes from `util::host_config_dir` and the command from
-//! [`autostart_exec`], which spells a Flatpak launch `flatpak run <app-id> resident`.
+//! [`autostart_exec`], which spells a Flatpak launch `flatpak run <app-id> tray`.
 //!
 //! 3. **The wrong mechanism.** Even correct on both counts, a direct write depends on the
 //!    sandbox being able to SEE `~/.config`, which only the lab manifest's (LAB-ONLY)
@@ -55,9 +56,9 @@
 //! and macOS and Windows, still take the synchronous file/registry path unchanged.
 //!
 //! **Two commands, pointing opposite ways.** [`HostExecLine`] is what WE write into a desktop
-//! file, and it must be runnable by the host (`flatpak run <app-id> resident`).
+//! file, and it must be runnable by the host (`flatpak run <app-id> tray`).
 //! [`SandboxArgv`] is what the PORTAL is given, and it must be the in-sandbox command
-//! (`cosmic-capture-kit resident`), because the portal adds the `flatpak run` wrapper itself.
+//! (`cosmic-capture-kit tray`), because the portal adds the `flatpak run` wrapper itself.
 //! They are separate types precisely so the two can never be swapped.
 
 #![cfg(target_os = "linux")]
@@ -70,9 +71,16 @@ use std::path::{Path, PathBuf};
 /// and a later toggle-off removes the exact file a toggle-on wrote).
 const DESKTOP_BASENAME: &str = "cosmic-capture-kit.desktop";
 
-/// The bare argument `main()` early-branches on to become the resident. Kept here next to
-/// the `Exec=` writer so the autostart command and the branch token can't drift.
-const RESIDENT_ARG: &str = "resident";
+/// The command word `main()` early-branches on to become the resident. Kept here next to the
+/// `Exec=` writer so the autostart command and the parser's word can't drift; pinned to
+/// `instance::TRAY_ARG` by a test below.
+const TRAY_ARG: &str = "tray";
+
+/// The word this module WROTE before DRAGON-695, still on disk in every entry an older build
+/// registered. It is never written again; it is only recognised, by [`entry_is_live_with`] and
+/// by [`needs_rewrite`], so an existing entry can be found and replaced rather than left to
+/// launch a build that no longer answers to it.
+const LEGACY_RESIDENT_ARG: &str = "resident";
 
 /// The autostart directory the SESSION actually reads: `~/.config/autostart` on the HOST.
 ///
@@ -132,7 +140,7 @@ struct HostExecLine(String);
 /// command. Handing it a host command line would produce `flatpak run … flatpak run …`.
 ///
 /// **It can only be built by [`sandbox_argv`], which takes no arguments and always appends
-/// [`RESIDENT_ARG`].** That is not tidiness, it is the guard on the worst failure mode this
+/// [`TRAY_ARG`].** That is not tidiness, it is the guard on the worst failure mode this
 /// module has: see `sandbox_argv`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SandboxArgv(Vec<String>);
@@ -149,9 +157,11 @@ struct SandboxArgv(Vec<String>);
 /// Exec=cosmic-capture-kit
 /// ```
 ///
-/// A bare launch with no [`RESIDENT_ARG`] does not become the tray daemon. It starts a
-/// CAPTURE. So an omitted commandline would fire a screenshot overlay at every login, on every
-/// machine with the setting on, which is far worse than the no-op bug this module was fixing.
+/// A bare launch with no [`TRAY_ARG`] does not reliably become the tray daemon: it reads the
+/// persisted `resident` setting, and with that setting off it opens the SETTINGS WINDOW at
+/// every login on every machine with autostart on. (Before DRAGON-695 it was worse still: a
+/// bare launch meant "capture NOW", so an omitted commandline fired a screenshot overlay at
+/// login. That is the failure this guard was built for, and the guard is unchanged.)
 ///
 /// The guard is structural. There is no parameter to forget, no `Option` to pass `None` for,
 /// and [`SandboxArgv`] has no other constructor, so a future edit cannot drop the argument and
@@ -161,7 +171,7 @@ struct SandboxArgv(Vec<String>);
 /// The binary NAME rather than a path: inside the sandbox `/app/bin` is on `PATH`, and the
 /// portal's wrapper resolves it there.
 fn sandbox_argv() -> SandboxArgv {
-    SandboxArgv(vec![BIN_NAME.to_string(), RESIDENT_ARG.to_string()])
+    SandboxArgv(vec![BIN_NAME.to_string(), TRAY_ARG.to_string()])
 }
 
 /// **Pure**, unit-tested: the `Exec=` line for the entry we write, given how this build was
@@ -169,10 +179,10 @@ fn sandbox_argv() -> SandboxArgv {
 ///
 /// Two spellings, because what the HOST SESSION can launch is not what this process can.
 ///
-/// * **Flatpak**: `flatpak run <app-id> resident`. The binary's own path inside the sandbox
+/// * **Flatpak**: `flatpak run <app-id> tray`. The binary's own path inside the sandbox
 ///   (`/app/bin/cosmic-capture-kit`) exists ONLY for processes already in that sandbox, so an
 ///   entry naming it is unrunnable by the session that reads it. Not hypothetical: the entry
-///   this replaces really did say `Exec=/app/bin/cosmic-capture-kit resident`. **Not reached in
+///   this replaces really did say `Exec=/app/bin/cosmic-capture-kit tray`. **Not reached in
 ///   production any more**, since [`autostart_mechanism`] sends a Flatpak to the portal and
 ///   `set` is only called on the file path. The arm stays so the function is total and so the
 ///   contrast with [`sandbox_argv`] is stated and TESTED in one place: these two are the
@@ -191,7 +201,7 @@ fn sandbox_argv() -> SandboxArgv {
 fn host_exec_line(kind: PackageKind, exe: Option<&Path>, app_id: &str) -> Option<HostExecLine> {
     match kind {
         PackageKind::Flatpak => Some(HostExecLine(format!(
-            "flatpak run {app_id} {RESIDENT_ARG}"
+            "flatpak run {app_id} {TRAY_ARG}"
         ))),
         // Named rather than wildcarded for the same reason as `autostart_mechanism`: a new
         // package kind must be a compile error here, not a silent default. macOS and Windows
@@ -200,7 +210,7 @@ fn host_exec_line(kind: PackageKind, exe: Option<&Path>, app_id: &str) -> Option
         | PackageKind::AppImage
         | PackageKind::MacOs
         | PackageKind::Windows => {
-            Some(HostExecLine(format!("{} {RESIDENT_ARG}", exe?.display())))
+            Some(HostExecLine(format!("{} {TRAY_ARG}", exe?.display())))
         }
     }
 }
@@ -381,10 +391,12 @@ fn entry_basenames(kind: PackageKind) -> Vec<String> {
 /// The rules, in order:
 ///
 /// * No `Exec=` line at all: not runnable, so `false`.
-/// * Our own writer always ends the line with the bare [`RESIDENT_ARG`], and a path may
-///   contain spaces, so the WHOLE command minus that token is tried as a path first.
+/// * An entry ending in [`LEGACY_RESIDENT_ARG`] was written before DRAGON-695 and is reported
+///   NOT live, so the self-healing repair rewrites it with the current word. See the body.
+/// * Our own writer always ends the line with the bare [`TRAY_ARG`], and a path may contain
+///   spaces, so the WHOLE command minus that word is tried as a path first.
 /// * Then the first whitespace-separated token, which is what a portal-written
-///   `Exec=/usr/bin/flatpak run … resident` needs.
+///   `Exec=/usr/bin/flatpak run … tray` needs.
 /// * A candidate that is not absolute is a `PATH` lookup (`flatpak run …`). The session's
 ///   `PATH` cannot be honestly reproduced from inside a sandbox, so that reads as LIVE.
 ///
@@ -398,8 +410,20 @@ fn entry_is_live_with(contents: &str, exists: impl Fn(&Path) -> bool) -> bool {
         return false;
     };
     let exec = exec.trim();
+    // DRAGON-695: an entry an OLDER build wrote ends in `resident`, and it is reported as NOT
+    // live so the existing self-healing path migrates it. That path is `Registration::Stale`
+    // plus `App::reconcile_login_item`, which answers a not-live entry the user still wants by
+    // calling `set`, which REWRITES the file with this build's spelling. Nothing new had to be
+    // built for the migration, and nothing deletes a file out of the user's home.
+    //
+    // The word has to be the final whitespace-separated token, not a suffix: an installation
+    // path could end in those letters, and calling a working entry dead would un-tick the
+    // toggle for a user who has no autostart problem at all.
+    if exec.split_whitespace().next_back() == Some(LEGACY_RESIDENT_ARG) {
+        return false;
+    }
     let whole = exec
-        .strip_suffix(RESIDENT_ARG)
+        .strip_suffix(TRAY_ARG)
         .map(str::trim_end)
         .unwrap_or(exec);
     let Some(first) = exec.split_whitespace().next() else {
@@ -471,7 +495,7 @@ pub fn is_enabled() -> bool {
 }
 
 /// Create (`on`) or remove (`off`) the autostart entry. On create, writes the `.desktop`
-/// file with `Exec=<util::self_exe> resident` (creating `~/.config/autostart` if needed); on
+/// file with `Exec=<util::self_exe> tray` (creating `~/.config/autostart` if needed); on
 /// remove, deletes it (a missing file is success — the desired state is "absent"). Returns
 /// an honest error string on an I/O failure so the settings UI can surface it. Mirrors
 /// `login_item::set`.
@@ -542,17 +566,17 @@ mod tests {
     }
 
     /// THE guard on the worst failure mode in this module. If the portal is ever handed a
-    /// command without the resident token, it falls back to our desktop file's bare
-    /// `Exec=cosmic-capture-kit`, and every login fires a CAPTURE overlay instead of starting
-    /// the tray daemon. `sandbox_argv` takes no arguments so this cannot be dropped by an
-    /// edit, and this test pins the contents in case someone rewrites it anyway.
+    /// command without the tray word, it falls back to our desktop file's bare
+    /// `Exec=cosmic-capture-kit`, and every login opens something the user did not ask for
+    /// instead of starting the tray daemon. `sandbox_argv` takes no arguments so this cannot
+    /// be dropped by an edit, and this test pins the contents in case someone rewrites it.
     #[test]
-    fn the_portal_argv_always_carries_the_resident_token() {
+    fn the_portal_argv_always_carries_the_tray_word() {
         let SandboxArgv(argv) = sandbox_argv();
-        assert_eq!(argv, vec![BIN_NAME.to_string(), RESIDENT_ARG.to_string()]);
+        assert_eq!(argv, vec![BIN_NAME.to_string(), TRAY_ARG.to_string()]);
         assert!(
-            argv.iter().any(|a| a == RESIDENT_ARG),
-            "without the resident token the portal autostarts a CAPTURE, not the daemon"
+            argv.iter().any(|a| a == TRAY_ARG),
+            "without the tray word the portal autostarts the settings window, not the daemon"
         );
         // The portal wraps this itself; handing it a host command line would produce a
         // nested `flatpak run … flatpak run …`.
@@ -583,7 +607,7 @@ mod tests {
         assert_eq!(
             got,
             Some(HostExecLine(
-                "flatpak run dev.thedragon.CosmicCaptureKit resident".to_string()
+                "flatpak run dev.thedragon.CosmicCaptureKit tray".to_string()
             ))
         );
         assert!(
@@ -598,7 +622,7 @@ mod tests {
         for kind in [PackageKind::Binary, PackageKind::AppImage] {
             assert_eq!(
                 host_exec_line(kind, Some(Path::new("/opt/cck/cosmic-capture-kit")), "ignored"),
-                Some(HostExecLine("/opt/cck/cosmic-capture-kit resident".to_string())),
+                Some(HostExecLine("/opt/cck/cosmic-capture-kit tray".to_string())),
                 "{kind:?} must launch the executable directly"
             );
         }
@@ -615,11 +639,11 @@ mod tests {
     }
 
     #[test]
-    fn desktop_contents_launches_the_exe_as_resident() {
-        let c = desktop_contents(&HostExecLine("/opt/cck/cosmic-capture-kit resident".to_string()));
-        // The Exec line runs the given binary with the bare resident token main() branches on.
+    fn desktop_contents_launches_the_exe_as_the_tray() {
+        let c = desktop_contents(&HostExecLine("/opt/cck/cosmic-capture-kit tray".to_string()));
+        // The Exec line runs the given binary with the bare tray command the parser reads.
         assert!(
-            c.contains("Exec=/opt/cck/cosmic-capture-kit resident\n"),
+            c.contains("Exec=/opt/cck/cosmic-capture-kit tray\n"),
             "Exec line missing or wrong: {c:?}"
         );
         // A valid desktop entry with the autostart-enabled key.
@@ -629,10 +653,28 @@ mod tests {
     }
 
     #[test]
-    fn resident_arg_matches_the_main_branch_token() {
-        // The Exec argument must be exactly the token main() checks for a bare resident
-        // launch; a drift here would autostart a GUI window instead of the resident.
-        assert_eq!(RESIDENT_ARG, "resident");
+    fn tray_arg_matches_the_command_the_parser_reads() {
+        // The Exec argument must be exactly the word `cli::parse` turns into `Plan::Tray`; a
+        // drift here would autostart a GUI window instead of the resident. Stated against
+        // `instance::TRAY_ARG` too, because this module keeps its own copy on purpose (it
+        // builds a command LINE, not an argv) and the two must not drift.
+        assert_eq!(TRAY_ARG, "tray");
+        assert_eq!(TRAY_ARG, crate::instance::TRAY_ARG);
+        assert_eq!(LEGACY_RESIDENT_ARG, crate::instance::LEGACY_RESIDENT_ARG);
+    }
+
+    /// DRAGON-695: an entry an older build wrote is reported NOT live, which is what routes it
+    /// into the existing stale-entry repair and gets it rewritten with the new word.
+    #[test]
+    fn a_pre_rename_entry_reads_as_stale_so_it_gets_rewritten() {
+        let legacy = "[Desktop Entry]\nExec=/opt/cck/cosmic-capture-kit resident\n";
+        assert!(!entry_is_live_with(legacy, |_| true));
+        let current = "[Desktop Entry]\nExec=/opt/cck/cosmic-capture-kit tray\n";
+        assert!(entry_is_live_with(current, |_| true));
+        // A path that merely ENDS in those letters is not the legacy word, so a working entry
+        // is never called dead over its install location.
+        let awkward = "[Desktop Entry]\nExec=/opt/resident/cosmic-capture-kit tray\n";
+        assert!(entry_is_live_with(awkward, |_| true));
     }
 
     #[test]
@@ -678,7 +720,7 @@ mod entry_liveness_tests {
     /// refuses at every login.
     #[test]
     fn an_exec_naming_a_missing_binary_is_not_live() {
-        let c = entry("/gone/CosmicCaptureKit-x86_64.AppImage resident");
+        let c = entry("/gone/CosmicCaptureKit-x86_64.AppImage tray");
         assert!(
             !entry_is_live_with(&c, |_| false),
             "a dead absolute Exec must read as not registered"
@@ -693,7 +735,7 @@ mod entry_liveness_tests {
     /// entry would read as dead forever and be rewritten on every reconcile.
     #[test]
     fn a_path_with_spaces_survives() {
-        let c = entry("/opt/my apps/cosmic-capture-kit resident");
+        let c = entry("/opt/my apps/cosmic-capture-kit tray");
         assert!(entry_is_live_with(&c, |p| p
             == Path::new("/opt/my apps/cosmic-capture-kit")));
     }
@@ -702,7 +744,7 @@ mod entry_liveness_tests {
     /// must never be called dead. Guessing here would disable a working entry.
     #[test]
     fn a_path_lookup_is_never_called_dead() {
-        let c = entry("flatpak run dev.thedragon.CosmicCaptureKit resident");
+        let c = entry("flatpak run dev.thedragon.CosmicCaptureKit tray");
         assert!(entry_is_live_with(&c, |_| false));
     }
 
@@ -710,7 +752,7 @@ mod entry_liveness_tests {
     /// not a path, so the first token has to be tried too.
     #[test]
     fn a_portal_written_entry_resolves_through_its_first_token() {
-        let c = entry("/usr/bin/flatpak run --command=cosmic-capture-kit dev.thedragon.CosmicCaptureKit resident");
+        let c = entry("/usr/bin/flatpak run --command=cosmic-capture-kit dev.thedragon.CosmicCaptureKit tray");
         assert!(
             entry_is_live_with(&c, |p| p == Path::new("/usr/bin/flatpak")),
             "the launcher exists, so the entry is live"

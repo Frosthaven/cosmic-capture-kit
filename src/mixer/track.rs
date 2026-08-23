@@ -27,6 +27,45 @@
 //! recovers long before its audio can reach this path at all; when that margin was
 //! absent (both constants 0.5s) a customer's 31s recording came back with 16.3% of the
 //! mic track replaced by bit-exact zeros and nothing anywhere said why.
+//!
+//! ## ...except inside the opening prime's own span, which we gave away on purpose
+//!
+//! DRAGON-743. There is exactly ONE place the recorder renders media time the sources
+//! have not delivered yet: DRAGON-554's opening prime, which renders media
+//! `[0, record::pump::OPENING_PRIME_FRAMES)` (4104 frames, 85.5ms) the instant ffmpeg
+//! exists, so ffmpeg 7.x's input-open never waits on the render horizon and the session
+//! does not open on ~1.5s of frozen video. `OPENING_PRIME_FRAMES`' own doc has always
+//! said what that costs: "what it gives up is the horizon's late-arrival protection for
+//! the primed span ONLY ... bounded by this constant, and the trade is deliberate".
+//!
+//! This module never learned about the trade, so it reported the recorder's own
+//! deliberate decision as destroyed audio, at `error`, on roughly two healthy sessions
+//! in five. A typical one: the prime puts the horizon at +86ms, the system source's
+//! first real chunk arrives covering -5ms to +20ms, it therefore ends 90ms behind the
+//! horizon and drops, and its 10 to 23ms of post-zero tail is reported as loss. That
+//! line has now been misdiagnosed three times, twice as a load artifact and once as a
+//! growing regression, which is what a warning that fires on healthy runs buys.
+//!
+//! So the drop still happens, is still counted, and is still logged with its numbers,
+//! but it is classified: [`late_drop_is_opening_prime`] separates it, the size goes to
+//! [`MixerStats::opening_late_frames`] instead of [`MixerStats::late_frames`], and the
+//! line drops to `debug`, beside the `opening prime rendered` line it is the consequence
+//! of. DRAGON-411's net is untouched: a drop anywhere else is the same `error` carrying
+//! the same seconds, and the two cases keep SEPARATE once-per-track latches so an
+//! opening drop can never swallow a real one later in the same session.
+//!
+//! Dead ends, so nobody re-runs them:
+//!
+//! - **Downgrading the line outright** would take the DRAGON-411 net with it. That error
+//!   is the only thing that would have named a customer's 16.3%-silent mic track.
+//! - **`!started` (this track has landed no real sample yet) is NOT the predicate**, and
+//!   it looks like it should be. It excludes a real instance of the opening case: when a
+//!   chunk straddling media 0 lands its post-zero tail BEFORE the prime renders, the
+//!   track has started, and the very next chunk still drops inside the primed span for
+//!   exactly the same reason.
+//! - **Reconciling the prime with the first capture** so nothing real is thrown away is
+//!   a different and much larger question: it changes what lands in the file. This
+//!   ticket only stops the log lying about it.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -48,8 +87,18 @@ pub(crate) struct MixerStats {
     /// 0) — the size of the loss, which the chunk count alone does not give (chunk
     /// sizes vary by source and by platform, and a drop may be part pre-session).
     /// Reported in seconds by `record::pump`'s session summary, and the thing that
-    /// decides whether a session is reported as healthy.
+    /// decides whether a session is reported as healthy. Audio dropped inside the
+    /// opening prime's own span is NOT here (see `opening_late_frames`).
     pub(crate) late_frames: u64,
+    /// Frames of in-recording audio dropped inside the DRAGON-554 opening prime's span
+    /// (see the module doc's second section): the same measurement as `late_frames`, on
+    /// the one span the recorder renders ahead of delivery ON PURPOSE. Split out
+    /// (DRAGON-743) for the same reason `pre_start_chunks` and `leading_gap_samples`
+    /// were: it is present on healthy sessions, so leaving it in `late_frames` put an
+    /// `error` on the drop AND on the session's one health line every time, which is a
+    /// warning everybody learns to scroll past. Bounded by the prime itself, at the head
+    /// of the file only, and still printed in the summary so it is never invisible.
+    pub(crate) opening_late_frames: u64,
     /// Chunks dropped because the clock was paused at their `audible_time` (pause =
     /// not recorded, by construction).
     pub(crate) discarded_paused_chunks: u64,
@@ -77,6 +126,27 @@ pub(crate) struct MixerStats {
     pub(crate) leading_gap_samples: u64,
 }
 
+/// Pure, unit-tested: does a late drop lie inside the DRAGON-554 opening prime's own
+/// span, the one place this recorder renders media time the sources have not delivered
+/// yet (DRAGON-743, see the module doc)?
+///
+/// `horizon` is the track's write horizon at the drop and `primed_through` the frame the
+/// prime rendered to ([`Track::mark_opening_prime`]; 0 when nothing primed, which is
+/// every consumer other than `record::pump`). A chunk is only dropped when it ends at or
+/// before `horizon`, so `horizon <= primed_through` BOUNDS the lost media positions to
+/// `[0, primed_through)`: the exact span the prime traded away, and never one frame more.
+/// That bound is what makes the reclassification safe rather than a blanket downgrade.
+///
+/// It is also self-limiting in time, with no clock reading and no session state: the
+/// render horizon only moves forward (`Track::drain_to` advances `base_frame`, and
+/// `truncate_to` refuses to go behind it), so this can only be true during the session's
+/// first `primed_through` frames of media, and is false for the whole rest of the run.
+/// With no prime it reduces to `horizon <= 0`, where a drop has no post-zero part at all
+/// and never reaches this question.
+fn late_drop_is_opening_prime(horizon: i64, primed_through: u64) -> bool {
+    horizon <= primed_through as i64
+}
+
 /// One track's accumulated, media-placed samples.
 pub(crate) struct Track {
     channels: u8,
@@ -94,6 +164,15 @@ pub(crate) struct Track {
     /// CONTROL thread, which must never be pinned by I/O — one detailed line per track
     /// plus the session summary's totals says everything without becoming the stall.
     late_logged: bool,
+    /// The same latch for the OPENING-PRIME drop (DRAGON-743), and separate from
+    /// `late_logged` on purpose: sharing one would let a session's expected opening drop
+    /// swallow the loud line for a real mid-session loss, which is DRAGON-411's whole
+    /// net. Each kind logs once per track; both keep counting after that.
+    opening_logged: bool,
+    /// How far DRAGON-554's opening prime rendered on this track, in frames (0 until
+    /// [`mark_opening_prime`](Self::mark_opening_prime), which only `record::pump`
+    /// calls). Read by [`late_drop_is_opening_prime`]; see the module doc.
+    primed_through: u64,
     /// Whether any REAL (non-silence) frame has landed yet — the split between
     /// `MixerStats::leading_gap_samples` and `MixerStats::gap_samples`. Before the
     /// first real sample, a hole is the source spinning up; after it, a hole is a
@@ -113,8 +192,23 @@ impl Track {
             base_frame: 0,
             stats: MixerStats::default(),
             late_logged: false,
+            opening_logged: false,
+            primed_through: 0,
             started: false,
         }
+    }
+
+    /// Record where the DRAGON-554 opening prime left the RENDER horizon, which is what
+    /// [`late_drop_is_opening_prime`] measures a later drop against. `record::pump` calls
+    /// this once, immediately after priming; a track that is never marked behaves exactly
+    /// as it did before DRAGON-743.
+    ///
+    /// It takes `base_frame`, the render horizon, and NOT `write_horizon`: the prime's
+    /// reach is what it rendered, and a track that already had samples placed further
+    /// ahead did not get them from the prime. Claiming those frames would extend the
+    /// downgrade past the span the prime actually bought.
+    pub(crate) fn mark_opening_prime(&mut self) {
+        self.primed_through = self.base_frame;
     }
 
     pub(crate) fn channels(&self) -> u8 {
@@ -127,7 +221,13 @@ impl Track {
 
     /// The position right after the last written frame (real or gap-filled) — what the
     /// NEXT pushed chunk is compared against for late/gap/overlap.
-    fn write_horizon(&self) -> u64 {
+    ///
+    /// It is also this track's DELIVERED-THROUGH position, and `record::pump` renders
+    /// against it (DRAGON-717). Sources stamp contiguously, so everything below this
+    /// frame has arrived (or has already been silence-filled and counted) and nothing
+    /// below it can still arrive: it is exactly how far the render horizon may advance
+    /// without any chance of destroying captured audio.
+    pub(crate) fn write_horizon(&self) -> u64 {
         self.base_frame + (self.samples.len() / self.channels as usize) as u64
     }
 
@@ -138,7 +238,9 @@ impl Track {
     ///   recording) and LOGGED — that is captured audio being destroyed, not
     ///   bookkeeping (see the module doc's DRAGON-411 section). A chunk lying wholly
     ///   before media 0 predates the session, so it loses nothing: counted
-    ///   `pre_start_chunks`, silently.
+    ///   `pre_start_chunks`, silently. A drop inside the opening prime's span is real
+    ///   audio but an expected one: counted `opening_late_frames` and logged at `debug`
+    ///   (DRAGON-743, the module doc's second section).
     /// - Starting before the horizon but extending past it: only the unrendered tail
     ///   (from the horizon onward) is written — NOT counted as `late_chunks` (some of
     ///   it landed) and no gap-fill (it's contiguous with what's already there).
@@ -199,11 +301,37 @@ impl Track {
             // put an `error` on every healthy recording and make the real signal
             // worthless.
             let lost = (start_frame + chunk_frames as i64).max(0) - start_frame.max(0);
-            self.stats.late_frames += lost as u64;
             if lost == 0 {
                 self.stats.pre_start_chunks += 1;
                 return;
             }
+            // The DRAGON-554 opening prime's own span: real audio, really dropped, but
+            // dropped by a decision this recorder took on purpose and bounded to the head
+            // of the file (DRAGON-743, module doc). It keeps its own counter, its own
+            // latch and its own level, so DRAGON-411's report below still means what it
+            // has always meant.
+            if late_drop_is_opening_prime(horizon, self.primed_through) {
+                self.stats.opening_late_frames += lost as u64;
+                if !self.opening_logged {
+                    self.opening_logged = true;
+                    log::debug!(
+                        "mixer[{}]: the opening prime already rendered past a chunk: {:.0}ms \
+                         of a {:.0}ms chunk for media {:.3}s arrived {:.0}ms behind the \
+                         horizon, which the prime had put at {:.0}ms before any source \
+                         delivered it (DRAGON-554's deliberate trade, bounded by the prime \
+                         and only at a session's head; further opening drops on this track \
+                         are counted, not logged)",
+                        self.label,
+                        lost as f64 * 1000.0 / SAMPLE_RATE as f64,
+                        chunk_frames as f64 * 1000.0 / SAMPLE_RATE as f64,
+                        media,
+                        (horizon - start_frame) as f64 * 1000.0 / SAMPLE_RATE as f64,
+                        self.primed_through as f64 * 1000.0 / SAMPLE_RATE as f64,
+                    );
+                }
+                return;
+            }
+            self.stats.late_frames += lost as u64;
             if !self.late_logged {
                 self.late_logged = true;
                 log::error!(
@@ -618,5 +746,199 @@ mod tests {
         track.drain_to(10);
         assert_eq!(track.drain_to(10), Vec::<f32>::new());
         assert_eq!(track.base_frame, 10);
+    }
+}
+
+/// DRAGON-743: the opening prime's span, and the DRAGON-411 net it must not weaken.
+/// Named apart from `tests` because it pins ONE decision, [`late_drop_is_opening_prime`],
+/// and the two facts that decision has to keep straight.
+#[cfg(test)]
+mod opening_prime_tests {
+    use super::*;
+
+    /// The prime's own length, from `record::pump::OPENING_PRIME_FRAMES`. Restated here
+    /// rather than imported: these tests are about what the mixer does with a mark of ANY
+    /// size, and the pump's constant is `pub(super)` to its own module for a reason.
+    const PRIMED: u64 = 4_104; // 85.5ms at 48kHz
+
+    fn base() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+    fn frames(n: f64) -> Duration {
+        Duration::from_secs_f64(n / SAMPLE_RATE as f64)
+    }
+    fn tap_at(audible: std::time::Instant, n: usize, value: f32) -> StreamTap {
+        StreamTap::new(vec![value; n], audible, audible)
+    }
+    /// A track already primed to [`PRIMED`], the way `record::pump` leaves one: the
+    /// opening render has run and the mark records its reach.
+    fn primed_track(channels: u8, label: &'static str) -> Track {
+        let mut track = Track::new(channels, label);
+        track.drain_to(PRIMED);
+        track.mark_opening_prime();
+        track
+    }
+
+    #[test]
+    fn a_mid_session_late_drop_is_still_a_loud_error() {
+        // THE test of this ticket: the DRAGON-411 shape, on a session that DID prime. A
+        // source falls behind mid-recording and its audio arrives for media positions
+        // ffmpeg already has. That is the customer's 31s recording with 16.3% of its mic
+        // track written as bit-exact zeros, and it must read exactly as it did before:
+        // `late_frames`, the loud line, and nothing in the opening's counters.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut track = primed_track(1, "mic");
+        track.push(tap_at(t0 + secs(1.0), 480, 1.0), &clock); // frames 48_000..48_480
+        track.drain_to(48_480); // a second of the session has been rendered and is gone
+        track.push(tap_at(t0 + secs(0.5), 480, 9.0), &clock); // arrives half a second late
+        assert_eq!(track.stats().late_frames, 480, "half a second late is real lost audio");
+        assert!(track.late_logged, "...and it logs the DRAGON-411 error");
+        assert_eq!(track.stats().opening_late_frames, 0, "nothing to do with the opening");
+        assert!(!track.opening_logged);
+    }
+
+    #[test]
+    fn the_two_latches_are_separate_so_an_opening_drop_cannot_swallow_a_real_one() {
+        // Why the opening case does not just reuse `late_logged`: the loud line is once
+        // per track, so sharing the latch would mean a session that opened normally could
+        // never report a genuine mid-session loss.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut track = primed_track(1, "mic");
+        track.push(tap_at(t0 - frames(240.0), 1_200, 1.0), &clock); // straddles media 0
+        assert!(track.opening_logged, "the opening drop logged, at debug");
+        assert!(!track.late_logged, "and it did NOT consume the loud line");
+        // Now the session runs on and a source really falls behind.
+        track.push(tap_at(t0 + secs(2.0), 480, 2.0), &clock);
+        track.drain_to(96_480);
+        track.push(tap_at(t0 + secs(1.0), 480, 9.0), &clock);
+        assert!(track.late_logged, "the real loss still gets the loud line");
+        assert_eq!(track.stats().late_frames, 480);
+        assert_eq!(track.stats().opening_late_frames, 960, "the opening's 20ms, unchanged");
+    }
+
+    #[test]
+    fn the_owners_opening_session_is_reproduced_and_is_no_longer_a_loss() {
+        // The exact session shape from the DRAGON-743 report, on the stereo system track:
+        // three 25ms chunks wholly before media 0, the opening prime, then the first real
+        // chunk straddling media 0 by 5ms. The owner's summary read
+        // `sys(late=4 lost=0.020s pre_start=3 lead_in=0.086s)`, with a `DISCARDING captured
+        // audio ... arrived 90ms behind the rendered horizon` error beside it.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut track = Track::new(2, "system");
+        for before in [0.080, 0.055, 0.030] {
+            track.push(tap_at(t0 - secs(before), 2_400, 1.0), &clock); // 1_200 frames = 25ms
+        }
+        assert_eq!(track.stats().pre_start_chunks, 3, "all three predate the file");
+        // The catch-up drain has placed everything captured; the prime renders the opening.
+        track.drain_to(PRIMED);
+        track.mark_opening_prime();
+        assert_eq!(track.stats().leading_gap_samples, PRIMED, "the owner's lead_in=0.086s");
+        // The source's first real chunk: media -5ms to +20ms, ending 90ms behind the
+        // horizon the prime just put at +85.5ms.
+        track.push(tap_at(t0 - frames(240.0), 2_400, 2.0), &clock);
+        assert_eq!(track.stats().late_chunks, 4, "the owner's late=4");
+        assert_eq!(track.stats().late_frames, 0, "and now lost=0.000s: nothing was destroyed");
+        assert_eq!(track.stats().opening_late_frames, 960, "the 20ms is the prime's own trade");
+        assert!(track.opening_logged, "still logged, with its numbers, at debug");
+        assert!(!track.late_logged, "but never as DISCARDING captured audio");
+    }
+
+    #[test]
+    fn a_track_that_already_started_still_reads_its_opening_drop_as_the_opening() {
+        // The dead end recorded in the module doc: `!started` looks like the predicate and
+        // is not. A chunk straddling media 0 that arrives BEFORE the prime lands its
+        // post-zero tail, so the track has started; the very next chunk then drops inside
+        // the primed span for exactly the same reason, and calling that a loss would put
+        // the error back on a healthy session.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut track = Track::new(1, "system");
+        track.push(tap_at(t0 - frames(240.0), 1_200, 1.0), &clock); // its last 20ms lands
+        assert!(track.started, "real audio is in the track");
+        assert_eq!(track.write_horizon(), 960);
+        track.drain_to(PRIMED);
+        track.mark_opening_prime();
+        // Contiguous with the last one (sources stamp contiguously): media 20ms to 45ms.
+        track.push(tap_at(t0 + frames(960.0), 1_200, 2.0), &clock);
+        assert_eq!(track.stats().opening_late_frames, 1_200);
+        assert_eq!(track.stats().late_frames, 0);
+        assert!(!track.late_logged, "a started track's opening drop is still the opening");
+    }
+
+    #[test]
+    fn an_unmarked_track_classifies_exactly_as_it_did_before() {
+        // Every mixer consumer other than `record::pump` never primes and never marks, so
+        // `primed_through` stays 0 and this whole ticket is inert for them.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut track = Track::new(2, "system");
+        track.drain_to(PRIMED); // rendered ahead, but nobody said it was a prime
+        track.push(tap_at(t0 - frames(240.0), 2_400, 2.0), &clock);
+        assert_eq!(track.stats().late_frames, 960, "unmarked: the historical accounting");
+        assert_eq!(track.stats().opening_late_frames, 0);
+        assert!(track.late_logged, "...and the historical error");
+    }
+
+    #[test]
+    fn the_downgrade_stops_at_the_last_primed_frame() {
+        // The band edge, through the real type: one frame past the prime's reach and the
+        // drop is an ordinary DRAGON-411 loss again.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        let mut inside = primed_track(1, "system");
+        inside.push(tap_at(t0, 1_000, 1.0), &clock);
+        assert_eq!(inside.stats().opening_late_frames, 1_000, "horizon == the primed frame");
+        assert_eq!(inside.stats().late_frames, 0);
+        let mut past = primed_track(1, "system");
+        past.drain_to(PRIMED + 1); // one render cycle has moved on
+        past.push(tap_at(t0, 1_000, 1.0), &clock);
+        assert_eq!(past.stats().opening_late_frames, 0, "one frame past: not the opening");
+        assert_eq!(past.stats().late_frames, 1_000);
+    }
+
+    #[test]
+    fn the_opening_downgrade_can_never_exceed_the_primed_span() {
+        // The bound that makes this safe rather than a blanket downgrade: a drop needs the
+        // chunk to END at or before the horizon, and the horizon is inside the prime, so
+        // the audio it can hide lies inside media [0, PRIMED) and nothing more. Walked
+        // with contiguous chunks of several sizes, each starting before media 0.
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        for chunk in [240usize, 1_200, 2_048, 4_800] {
+            let mut track = primed_track(1, "system");
+            let mut at = t0 - frames(chunk as f64 / 2.0);
+            for _ in 0..12 {
+                track.push(tap_at(at, chunk, 1.0), &clock);
+                at += frames(chunk as f64);
+            }
+            assert_eq!(track.stats().late_frames, 0, "chunk of {chunk} frames");
+            assert!(
+                track.stats().opening_late_frames < PRIMED,
+                "chunk of {chunk} frames: {} lost inside a {PRIMED}-frame prime",
+                track.stats().opening_late_frames
+            );
+        }
+    }
+
+    #[test]
+    fn late_drop_is_opening_prime_is_a_horizon_test_and_nothing_else() {
+        // The pure decision on its own. Nothing but the two numbers goes into it: no
+        // clock, no chunk, no session state, so it reads the same on every platform.
+        assert!(late_drop_is_opening_prime(0, PRIMED));
+        assert!(late_drop_is_opening_prime(PRIMED as i64 - 1, PRIMED));
+        assert!(late_drop_is_opening_prime(PRIMED as i64, PRIMED), "the prime's own reach");
+        assert!(!late_drop_is_opening_prime(PRIMED as i64 + 1, PRIMED));
+        assert!(!late_drop_is_opening_prime(48_000, PRIMED), "a second in: ordinary loss");
+        // No prime: the question never changes an answer for a consumer that never marks,
+        // and a drop at horizon 0 has no post-zero part to lose in the first place.
+        assert!(!late_drop_is_opening_prime(1, 0));
+        assert!(!late_drop_is_opening_prime(48_000, 0));
+        assert!(late_drop_is_opening_prime(0, 0), "unreachable: such a drop loses nothing");
     }
 }

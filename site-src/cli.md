@@ -1,11 +1,11 @@
 ---
-title: Command-line flags
+title: The command line
 ---
 
 <!--
 This page has no copy of its own on purpose.
 
-`CLI.md` in the repository root is the single source of truth for the flag
+`CLI.md` in the repository root is the single source of truth for the command
 list, and the include below pulls it in whole at build time. Edit that file,
 never this one. If the include ever breaks, the build fails loudly, because
 `pymdownx.snippets` runs with `check_paths: true`.

@@ -2,6 +2,7 @@
 
 mod capture;
 mod color_picker;
+mod ink;
 mod recording;
 mod detect;
 mod settings;
@@ -11,6 +12,7 @@ mod preview;
 
 pub use capture::CaptureMsg;
 pub use color_picker::ColorPickerMsg;
+pub use ink::InkMsg;
 pub use recording::RecordingMsg;
 pub use detect::DetectMsg;
 pub use settings::{BorderColorTarget, CloudSettingsMsg, SettingsMsg};

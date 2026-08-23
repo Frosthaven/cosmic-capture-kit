@@ -53,8 +53,8 @@
 //! capture lock was removed on purpose in DRAGON-351 and re-adding one is a design
 //! decision, not a bug fix.
 //!
-//! Armed on macOS only, and only for CAPTURE launches (`--settings`, `--permissions`
-//! and `--preview <file>` are windows the user asked for and keep their historical
+//! Armed on macOS only, and only for CAPTURE launches (`settings`, `permissions`
+//! and `editor <file>` are windows the user asked for and keep their historical
 //! unbounded life). Linux and Windows are byte-identical — the module is not even
 //! compiled there outside `cfg(test)`. Both have the same detached-child shape and
 //! could opt in later by calling [`arm`] from their own launch paths; nothing here is
@@ -424,9 +424,9 @@ mod tests {
 
     #[test]
     fn every_other_kind_of_work_presents_on_its_own() {
-        // None of these mints an overlay, and each is a legitimate whole session: an
-        // `--active-window` still, a countdown, an overlay-less `--active-monitor
-        // --video` recording, a preview handed off from another child, `--settings`.
+        // None of these mints an overlay, and each is a legitimate whole session: a
+        // `capture --active-window` still, a countdown, an overlay-less recording, a
+        // preview handed off from another child, `settings`.
         // Any one of them alone must disarm the guard, or the guard kills real work.
         let none = Surfaces::default();
         for (what, s) in [

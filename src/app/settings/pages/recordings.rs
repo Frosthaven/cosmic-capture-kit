@@ -42,6 +42,41 @@ impl crate::app::App {
             .reset_with(self.record_dir.clone(), d.record_dir.clone(), |a0| Msg::Settings(SettingsMsg::SetRecordDir(a0)))],
         });
 
+        // DRAGON-695: the two audio arms had NO settings row at all, only the recording
+        // toolbar's toggles and the tray's Audio Recording submenu, which meant the default a
+        // new recording starts from could not be set from the settings window. They are the
+        // page twin of the `sound <both|mic|system|none>` command, and they write exactly what
+        // it writes.
+        //
+        // Deliberately `SetRecordMicDefault` rather than the live `RecordingMsg::ToggleMic`:
+        // that one carries the meters, the push-to-talk rule and the tray refresh for a
+        // session in progress, and this row is about the next recording, not this one.
+        secs.push(SectionSpec {
+            title: "Audio",
+            items: vec![
+                Item::new(
+                    "Record the microphone",
+                    "New recordings start with the microphone armed.",
+                    toggle(self.record_mic, |a0| {
+                        Msg::Settings(SettingsMsg::SetRecordMicDefault(a0))
+                    }),
+                )
+                .reset_with(self.record_mic, d.record_mic, |a0| {
+                    Msg::Settings(SettingsMsg::SetRecordMicDefault(a0))
+                }),
+                Item::new(
+                    "Record system audio",
+                    "New recordings start with system audio armed.",
+                    toggle(self.record_system_audio, |a0| {
+                        Msg::Settings(SettingsMsg::SetRecordSystemAudioDefault(a0))
+                    }),
+                )
+                .reset_with(self.record_system_audio, d.record_system_audio, |a0| {
+                    Msg::Settings(SettingsMsg::SetRecordSystemAudioDefault(a0))
+                }),
+            ],
+        });
+
         secs.push(self.capture_section(
             self.dep(DepId::Recording).is_present(),
             MethodPicker {

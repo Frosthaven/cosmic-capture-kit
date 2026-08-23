@@ -169,6 +169,212 @@ const _: () = assert!(
      budget would fire first and the settle could never be observed"
 );
 
+// ── DRAGON-718: a pinned launch has to pick its target the way the setting says ──
+//
+// `record --monitor` wrote `record_backend = "portal"` off entirely: the recording ran on
+// native screencopy and nothing said so.
+//
+// The cause is not the timing race it looks like. A pinned launch writes `mode` and `kind`
+// straight into the struct at init (`application.rs`), so it never passes through
+// `CaptureMsg::SetMode` / `SetKind`, and THOSE ARE THE ONLY TWO PLACES that dispatch the
+// portal picker (`App::portal_for_mode`). Its other two call sites both sit inside
+// `overlay_fallback_active()`, the lab/flatpak path. So on a normal cosmic-comp session
+// there was no startup dispatch at all, `pw_held` stayed `None`, and `recording.rs`'s
+// `match self.pw_held.take()` fell to the screencopy worker every time. The failing term at
+// click time is `self.mode == Mode::Region` in `run_capture`, not `pipewire_available`.
+//
+// The probe DOES matter, but only for the seed's own instant: `pipewire_available` starts
+// false and is filled by an async ScreenCast probe, so a dispatch decided at output-mint
+// time would read "no portal" on a session that has one. Hence a HOLD rather than a guess:
+// the native pickers are not minted while a portal-backed pinned launch is waiting for the
+// probe to answer, and the answer routes it.
+//
+// The hold is BOUNDED (DRAGON-118), and the fallback is the old behaviour, so the worst
+// case of a probe that never answers is what shipped before this plus a short delay.
+//
+// ── DRAGON-732: the hold above was a WAIT, and the question is an OWNER ──
+//
+// As first shipped, the hold was an `Option<Instant>` that `resolve_portal_seed_hold`
+// CLEARED on every outcome, `on_output` read as "may I mint", and DRAGON-718's own doc
+// justified with "`on_output` can fire before the first message is drained". That covers
+// outputs arriving EARLY and nothing else. On the owner's box they arrive LATE, every
+// single time, so a `record --window` or `record --monitor` launch dispatched the portal
+// picker, logged "no native picker is minted", cleared the hold, and then minted a native
+// picker for every output that qualified afterwards. Two pickers on screen at once.
+//
+// The state below is three-valued for that reason: `Portal` is a decided answer, not the
+// absence of a wait, and it keeps `on_output` quiet for the life of the request. What
+// releases it is the request ANSWERING (`App::on_pipewire_cast_ready`), because a cancel
+// puts the session back into native region picking and a later hotplug must mint again.
+//
+// It also closes a second dispatch of the same shape on the lab/flatpak path, where
+// `on_output`'s fallback branch runs BEFORE the hold guard and kicks its own seed request:
+// whichever of the two fired first, the other fired too, so that path could raise two
+// portal dialogs. One latch now answers for both.
+
+/// The OUTER bound on the pinned-launch portal hold. The probe is one D-Bus round trip and
+/// normally answers in tens of milliseconds; this is the point where waiting for it costs
+/// the user more than picking natively does. On expiry the launch mints its own pickers,
+/// which is exactly what it did before DRAGON-718.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) const PORTAL_SEED_PROBE_BUDGET_MS: u64 = 1500;
+
+const _: () = assert!(
+    PORTAL_SEED_PROBE_BUDGET_MS > MENU_HOLD_BUDGET_MS,
+    "DRAGON-718: the portal-probe hold must outlast the tray-dropdown hold, or a menu \
+     launch would mint its pickers while the probe answer is still pending and the \
+     backend choice would be ignored exactly as it was before"
+);
+
+/// What a pinned monitor/window launch should do about picking its capture target.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaunchPick {
+    /// Dispatch the xdg-portal ScreenCast picker; mint no overlays.
+    Portal,
+    /// Mint our own per-output overlay pickers (the pre-DRAGON-718 behaviour).
+    Native,
+    /// This launch would use the portal but the probe has not answered yet: mint nothing
+    /// and decide when it does, or when the budget expires.
+    WaitForProbe,
+}
+
+/// **Pure**, unit-tested: is this launch mode one the PORTAL can pick for us?
+///
+/// Monitor and Window are; Region is not, and that is a design fact rather than a
+/// limitation. The portal picker replaces OUR picker, and region has no picker to replace:
+/// the user draws a box over the screen and the portal request happens at commit.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn portal_pickable_mode(mode: Mode) -> bool {
+    matches!(mode, Mode::Monitor | Mode::Window)
+}
+
+/// **Pure**, unit-tested: should this launch arm the DRAGON-718 portal hold?
+///
+/// Asked once, at init, before any message is drained, because `on_output` can fire before
+/// the first `update` call and minting the pickers is the irreversible step.
+///
+/// The backend choice is read from the persisted settings the same way
+/// `App::recording_uses_portal` / `screenshot_uses_portal` read it, INCLUDING the session
+/// clamp: a preference for native screencopy cannot apply on a compositor that does not
+/// offer it, so such a session is on the portal whatever the config says.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn portal_seed_hold_needed(
+    mode: Mode,
+    kind: Kind,
+    record_backend_is_portal: bool,
+    screenshot_backend_is_portal: bool,
+    native_capture: bool,
+) -> bool {
+    if !portal_pickable_mode(mode) {
+        return false;
+    }
+    let chosen = match kind {
+        Kind::Video => record_backend_is_portal,
+        Kind::Image | Kind::Scanner => screenshot_backend_is_portal,
+    };
+    chosen || !native_capture
+}
+
+/// **Pure**, unit-tested: how a pinned launch picks its target.
+///
+/// * `portal_pickable_mode` — the launch mode is Monitor or Window. Region is NEVER this:
+///   it draws its own selection overlay and makes its portal request at COMMIT
+///   (`run_capture`), which is the one portal path that already worked.
+/// * `uses_portal` — the session-clamped backend choice (`recording_uses_portal` /
+///   `screenshot_uses_portal`), which is a SETTING and does not depend on the probe.
+/// * `probe` — `None` until `CaptureMsg::PipewireProbed` lands, then whether the portal is
+///   reachable.
+/// * `since_launch_ms` — for the bound.
+///
+/// The two terms are deliberately separate. Clamping the choice against availability is
+/// what `mode_uses_portal()` does, and doing that here would answer `Native` for every
+/// launch whose probe simply had not landed yet, which IS the bug.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn launch_portal_pick(
+    portal_pickable_mode: bool,
+    uses_portal: bool,
+    probe: Option<bool>,
+    since_launch_ms: u64,
+) -> LaunchPick {
+    if !portal_pickable_mode || !uses_portal {
+        return LaunchPick::Native;
+    }
+    match probe {
+        Some(true) => LaunchPick::Portal,
+        Some(false) => LaunchPick::Native,
+        None if since_launch_ms < PORTAL_SEED_PROBE_BUDGET_MS => LaunchPick::WaitForProbe,
+        None => LaunchPick::Native,
+    }
+}
+
+/// Who picks THIS launch's capture target, for the whole life of the launch.
+///
+/// DRAGON-732: this replaced a bare `Option<Instant>` hold, and the difference between
+/// the two is the whole bug. That field answered "am I still waiting for the probe", and
+/// `on_output` read it as "may I mint this output's native picker". Those are the same
+/// question only until the probe answers. A launch that resolves to [`LaunchPick::Portal`]
+/// cleared the hold, and every output that qualified AFTER that instant then minted a
+/// native picker beside the portal's own dialog, so the user got two pickers.
+///
+/// The race went that way EVERY TIME on the owner's box, on both `record --window` and
+/// `record --monitor`: the probe is one D-Bus round trip and landed in the first `update`
+/// drain (143 to 713ms after launch), while the outputs only qualified 150 to 280ms later,
+/// once cosmic-comp had sent their logical geometry. So the guard that was written for
+/// "`on_output` can fire before the first message is drained" covered the direction that
+/// does not happen here and missed the one that does.
+///
+/// Three states, so the answer SURVIVES the decision instead of being consumed by it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PortalSeed {
+    /// A portal-backed pinned launch is waiting for the ScreenCast probe. Mint nothing
+    /// yet; the answer, or [`PORTAL_SEED_PROBE_BUDGET_MS`], routes it.
+    Holding(std::time::Instant),
+    /// The portal's own picker IS this launch's picker. Mint nothing until that request
+    /// answers: a native picker beside the portal dialog is two pickers.
+    Portal,
+    /// Our per-output overlays pick, which is every other launch on every platform.
+    Native,
+}
+
+impl PortalSeed {
+    /// **Pure**, unit-tested: may `on_output` mint this output's native picker overlay?
+    ///
+    /// Only `Native`. `Holding` is DRAGON-718's wait and `Portal` is DRAGON-732's fix:
+    /// minting is the irreversible step, because those surfaces ARE the native picker, so
+    /// both "not decided" and "the portal owns it" mean "not ours to mint".
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn mints_native_pickers(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    /// **Pure**, unit-tested: the instant this launch armed its hold, while it is still
+    /// holding. `None` once the pick is decided, which is what keeps
+    /// `App::resolve_portal_seed_hold` idempotent across its two callers.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn holding_since(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Holding(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// **Pure**, unit-tested: the seed state a resolved [`LaunchPick`] leaves behind.
+///
+/// Total, and it exists because this mapping IS the invariant: exactly one picker per
+/// launch. `Portal` must never land on a state that mints natively, which is exactly what
+/// a cleared `Option` did.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn seed_after_pick(pick: LaunchPick, armed: std::time::Instant) -> PortalSeed {
+    match pick {
+        LaunchPick::WaitForProbe => PortalSeed::Holding(armed),
+        LaunchPick::Portal => PortalSeed::Portal,
+        LaunchPick::Native => PortalSeed::Native,
+    }
+}
+
 /// **Pure**, unit-tested: whether this launch holds its frozen-flats grab for the tray
 /// dropdown. Only a menu-launched child has a dropdown on screen, and only a launch that
 /// actually grabs flats has anything to protect, so a PrintScreen or hotkey launch pays
@@ -219,7 +425,7 @@ pub(super) fn menu_hold_release(since_focus_ms: Option<u64>, since_launch_ms: u6
 ///
 /// `None` for every launch that is not a picker, and for a picker with no delay configured,
 /// which keeps the historical "opens immediately" behaviour exactly. `delay_secs` is
-/// [`App::configured_delay_secs`]'s answer, so a CLI `--countdown` applies to the picker for
+/// [`App::configured_delay_secs`]'s answer, so a CLI `--timer` applies to the picker for
 /// the same reason it applies to a capture.
 ///
 /// Clamped into the `u8` the ticker is, exactly as `proceed_capture` clamps it, so an
@@ -250,6 +456,15 @@ pub(super) fn picker_flats_held(want_flats: bool, color_picker: bool, delay_secs
 /// `App::outputs.len()`, which is empty at `init` on every platform and fills a beat later.
 pub(super) fn picker_countdown_arms(pending: bool, outputs: usize) -> bool {
     pending && outputs > 0
+}
+
+/// **Pure**, unit-tested (DRAGON-698): whether an immediate capture
+/// (`--active-window` / `--active-monitor`) DEFERS its target resolution behind the
+/// countdown. Any configured delay defers — the delay exists so the user can rearrange
+/// the screen, and the active window / cursor monitor are part of the screen — and a
+/// zero delay resolves at launch, byte-identical to the pre-DRAGON-698 behavior.
+fn immediate_resolution_waits_for_countdown(delay_secs: u64) -> bool {
+    delay_secs > 0
 }
 
 impl App {
@@ -317,7 +532,14 @@ impl App {
     /// resolving the target's screen rect NOW and driving it straight through the normal
     /// capture pipeline ([`Self::run_capture`]), minting NO overlay. Returns `None` when the
     /// target can't be resolved (no frontmost window, no display under the cursor), so the
-    /// caller can fall back to the picker overlay. The pipeline mode was already pinned to
+    /// caller can fall back to the picker overlay.
+    ///
+    /// DRAGON-698: "NOW" holds only for a ZERO-delay launch. With a countdown configured
+    /// (a CLI `--timer` or the persisted default) the target resolution itself is what the
+    /// delay postpones: this parks the intent (`pending_immediate`), runs the countdown,
+    /// and the fire tick resolves the target live ([`Self::fire_deferred_immediate`]), so
+    /// the user can focus a different window or move to a different monitor before the
+    /// timer runs out. The pipeline mode was already pinned to
     /// Window / Monitor in `init` so the right worker (window-focus grab vs monitor grab)
     /// runs. Never called on Linux (its capture keys are COSMIC custom shortcuts).
     ///
@@ -356,6 +578,100 @@ impl App {
                 return Some(self.fail_session());
             }
         }
+        // DRAGON-698: a configured countdown DEFERS the target resolution. The delay
+        // exists so the user can rearrange the screen, and "which window is active" /
+        // "which monitor holds the cursor" are part of the screen: resolving them at
+        // second zero and firing N seconds later against that stale answer made the
+        // countdown useless for re-aiming. Park the INTENT and run the countdown; the
+        // fire tick resolves the target then (`fire_deferred_immediate`). A zero-delay
+        // launch takes the resolve-now path below, byte-identical to before.
+        if immediate_resolution_waits_for_countdown(self.configured_delay_secs()) {
+            return Some(self.enter_immediate_countdown(imm));
+        }
+        let sel = self.resolve_immediate_target(imm, false)?;
+        Some(self.run_capture(sel))
+    }
+
+    /// DRAGON-698: arm the countdown for an immediate capture whose target resolution is
+    /// deferred to the fire tick.
+    ///
+    /// [`Self::enter_picker_countdown`]'s sibling rather than a branch inside
+    /// [`Self::enter_countdown`], for the same reason that one is: `enter_countdown` takes
+    /// the `Selection` a capture has already committed to and arms a video warm-spawn
+    /// against it, and a deferred immediate capture has neither (immediate targets are
+    /// screenshot-only, and the selection is exactly what is being deferred). What all
+    /// three countdowns share is [`Self::arm_countdown`] and everything downstream: the
+    /// digits, the tray session, the tick, and the cancel routes.
+    ///
+    /// `recreate_active_overlays` is a no-op here in practice — an immediate launch mints
+    /// no overlays — and is kept for symmetry with the other two arms, so a future surface
+    /// this session does own is made click-through like theirs.
+    fn enter_immediate_countdown(&mut self, imm: ImmediateCapture) -> Task<cosmic::Action<Msg>> {
+        // The same u8 clamp `proceed_capture` applies; CLI and persisted values are ≤99.
+        let secs = self.configured_delay_secs().min(u8::MAX as u64) as u8;
+        log::debug!(
+            "immediate capture ({imm:?}): deferring target resolution behind the {secs}s \
+             countdown"
+        );
+        self.pending_immediate = Some(imm);
+        self.arm_countdown(secs);
+        self.recreate_active_overlays()
+    }
+
+    /// DRAGON-698: the countdown of a deferred immediate capture has fired, so resolve the
+    /// target NOW and commit. Live resolution is the whole point: whatever the user focused
+    /// or moved the cursor to during the delay is what this reads.
+    ///
+    /// `capture_live` is raised exactly as [`Self::run_capture`] raises it for every
+    /// delayed commit (the delay existed to change the screen, so the grab must read the
+    /// live screen, not the launch-time frozen scene). The commit skips `proceed_capture`
+    /// deliberately: the countdown has already run, and re-entering it would loop.
+    ///
+    /// A target that cannot be resolved at fire time falls back to the picker overlays,
+    /// the same degradation the launch-time resolve has always had, just later:
+    /// `capture_live` comes back down so the picker session behaves like the launch-time
+    /// fallback (frozen scene, and a later commit re-applies the configured delay through
+    /// `proceed_capture` as usual).
+    pub(in crate::app) fn fire_deferred_immediate(&mut self) -> Task<cosmic::Action<Msg>> {
+        let Some(imm) = self.pending_immediate.take() else {
+            // Unreachable from the tick (the arm is guarded), and a real loss if it ever
+            // happens: end honestly rather than idle.
+            return self.teardown();
+        };
+        self.capture_live = true;
+        match self.resolve_immediate_target(imm, true) {
+            Some(sel) => self.begin(sel),
+            None => {
+                log::warn!(
+                    "immediate capture ({imm:?}) could not resolve a target when its \
+                     countdown fired; falling back to the picker overlay"
+                );
+                self.capture_live = false;
+                #[cfg(target_os = "linux")]
+                {
+                    self.mint_startup_pickers()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.seed_overlays_mac()
+                }
+            }
+        }
+    }
+
+    /// Resolve an immediate capture's target into the `Selection` a picker commit would
+    /// have produced. `None` when no target can be resolved (no frontmost window, no
+    /// display under the cursor), so the caller can fall back to the picker overlay.
+    ///
+    /// `prefer_live` is the DRAGON-698 term: a fire-time resolve (countdown just ran)
+    /// prefers the LIVE answer over the daemon's hotkey-press handoff, because the delay
+    /// existed precisely so the user could re-aim. A launch-time resolve passes `false`
+    /// and keeps the DRAGON-295 handoff-first order that closes the boot-latency race.
+    fn resolve_immediate_target(
+        &mut self,
+        imm: ImmediateCapture,
+        prefer_live: bool,
+    ) -> Option<Selection> {
         // Linux: an overlay-less immediate capture mints NO picker overlay, so — unlike the
         // interactive path — nothing fills `capture_pointer_output` from an overlay's
         // pointer-enter. Learn the cursor's output DIRECTLY from the momentary transparent
@@ -365,6 +681,15 @@ impl App {
         // re-home) follows the cursor exactly as mac/Windows do with their real global cursor
         // position. Resolved once per session. `None` (probe unavailable / no enter) degrades
         // to the primary-output / single-window fallbacks below.
+        //
+        // DRAGON-698: a fire-time resolve drops any cached answer first. The cache is
+        // empty in every deferred flow today (nothing probes during the countdown), so
+        // this is belt-and-braces; it states the contract that a deferred resolve reads
+        // the cursor at FIRE time, never at launch.
+        #[cfg(target_os = "linux")]
+        if prefer_live {
+            self.capture_pointer_output = None;
+        }
         #[cfg(target_os = "linux")]
         if self.capture_pointer_output.is_none() {
             self.capture_pointer_output = crate::platform::compositor::pointer_output();
@@ -385,12 +710,13 @@ impl App {
                 // which resolved nothing and fell back to the window PICKER. A direct
                 // `--active-window` CLI launch with no handoff resolves live.
                 #[cfg(target_os = "macos")]
-                let win = crate::platform::mac::active_window::immediate_active_window();
+                let win =
+                    crate::platform::mac::active_window::immediate_active_window(prefer_live);
                 // Windows: the foreground window (GetForegroundWindow + its DWM frame + a
                 // stable HWND id) as a `Toplevel`, the analogue of mac's `active_window`, with
                 // the same daemon-handoff preference.
                 #[cfg(windows)]
-                let win = crate::platform::windows::immediate_active_window();
+                let win = crate::platform::windows::immediate_active_window(prefer_live);
                 // Linux (COSMIC): normally the cctk toplevel carrying the compositor's
                 // `Activated` state (no daemon handoff needed — a COSMIC custom shortcut
                 // launches the capture app directly). But when NOTHING is `Activated` — the
@@ -441,7 +767,7 @@ impl App {
                 }
             }
         };
-        Some(self.run_capture(sel))
+        Some(sel)
     }
 
     /// The [`OutputDesc`](crate::platform::backend::OutputDesc) the CURSOR sits
@@ -553,18 +879,18 @@ impl App {
         let secs = self.configured_delay_secs();
         if self.kind != Kind::Scanner && secs > 0 {
             // The countdown ticker is a u8; clamp the arbitrary CLI value so a huge
-            // `--countdown` can't wrap (255s is already far past any sane delay).
+            // `--timer` can't wrap (255s is already far past any sane delay).
             self.enter_countdown(sel, secs.min(u8::MAX as u64) as u8)
         } else {
             self.begin(sel)
         }
     }
 
-    /// The configured pre-capture delay in seconds: an exact `--countdown` CLI value
-    /// when set (may not match any UI preset), otherwise the selected `delay_idx`
-    /// preset. This is the setting, not the live countdown remaining.
+    /// The configured pre-capture delay in seconds: an exact `--timer` value when this
+    /// launch carried one, otherwise the persisted default. This is the setting, not the
+    /// live countdown remaining.
     pub(super) fn configured_delay_secs(&self) -> u64 {
-        self.countdown_override.unwrap_or(DELAYS[self.delay_idx].1)
+        self.countdown_override.unwrap_or(self.countdown_secs.value)
     }
 
     /// Commit a capture: start a video recording when the kind is Video (region,
@@ -934,7 +1260,7 @@ impl App {
         {
             self.win_preview_preopen = mac_preopen;
         }
-        // DRAGON-428: `--no-editor` suppresses this pre-open too. `neutral_spinner` and
+        // DRAGON-428: `--skip-editor` suppresses this pre-open too. `neutral_spinner` and
         // `mac_preopen` already carry the term inside their own decisions; this third one is
         // computed inline, so it takes the term here. All three exist only to cover the gap
         // until the editor appears, and this launch opens none.
@@ -3173,7 +3499,7 @@ pub(super) fn keep_countdown_anchor(
 // `delay_idx` back to "No delay" and the next launch read "Countdown Timer: 00". The
 // owner reversed that rule. The timer is now remembered across captures and changes
 // only when the user picks a value (an overlay delay chip, a tray radio row, or a CLI
-// `--countdown`, which rides `countdown_override` and was never persisted anyway), so
+// `--timer`, which rides `countdown_override` and was never persisted anyway), so
 // the whole consumption decision and its tests are gone rather than gated.
 
 /// Pure, unit-tested (`lab/flatpak`): does the fallback overlay show the seed-frozen
@@ -3287,7 +3613,7 @@ fn window_pick_neutral_spinner_decision(
 ) -> bool {
     // DRAGON-353 removed the old `preview_enabled` term with the "Open in preview editor"
     // SETTING. DRAGON-428 reintroduces the same shape for a different reason: not a
-    // persisted preference, but a per-launch `--no-editor`. The spinner exists ONLY to
+    // persisted preference, but a per-launch `--skip-editor`. The spinner exists ONLY to
     // cover the grab until the editor appears, so a launch that will never open one must
     // not mint it — otherwise the user sees a spinner overlay flash and vanish for a
     // capture that was always going straight to the clipboard.
@@ -3306,7 +3632,7 @@ fn window_pick_neutral_spinner_decision(
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn window_pick_preopen_decision(immediate: bool, is_window_pick: bool, wants_editor: bool) -> bool {
     // DRAGON-353 removed the old `preview_enabled` term with the "Open in preview editor"
-    // SETTING; DRAGON-428 reintroduces the same shape for the per-launch `--no-editor`.
+    // SETTING; DRAGON-428 reintroduces the same shape for the per-launch `--skip-editor`.
     // The pre-open exists only to cover the focus-then-grab until the editor appears, so a
     // launch that opens no editor must not pre-open a surface it will never fill.
     immediate && is_window_pick && wants_editor
@@ -4014,6 +4340,23 @@ mod immediate_target_tests {
     }
 }
 
+// DRAGON-698: the pure "does an immediate launch defer its target resolution?" rule.
+#[cfg(test)]
+mod immediate_defer_tests {
+    use super::immediate_resolution_waits_for_countdown;
+
+    #[test]
+    fn zero_delay_resolves_at_launch_and_any_delay_defers() {
+        // Zero delay is the pre-DRAGON-698 world: resolve at launch, byte-identical.
+        assert!(!immediate_resolution_waits_for_countdown(0));
+        // Any configured delay parks the resolution behind the countdown; 99 is the
+        // grammar's ceiling, and the persisted default is clamped to it too.
+        for secs in [1, 2, 5, 99] {
+            assert!(immediate_resolution_waits_for_countdown(secs), "{secs}s must defer");
+        }
+    }
+}
+
 // DRAGON-304: the pure output resolver the picker-free immediate capture uses when
 // `self.outputs` is empty (no overlays minted). Non-Linux only (mirrors the immediate path).
 #[cfg(all(test, not(target_os = "linux")))]
@@ -4124,7 +4467,7 @@ mod neutral_spinner_tests {
         assert!(!decide(true, false, false, true)); // region/monitor
     }
 
-    /// DRAGON-428: a `--no-editor` launch opens no editor, so there is nothing for the
+    /// DRAGON-428: a `--skip-editor` launch opens no editor, so there is nothing for the
     /// spinner to cover. Minting it anyway would flash an overlay on screen and tear it
     /// down again for a capture that went straight to the clipboard.
     #[test]
@@ -5051,6 +5394,258 @@ mod menu_flats_hold_tests {
     }
 }
 
+/// DRAGON-718: a pinned `record --monitor` launch honoured the toolbar's backend choice and
+/// ignored the SETTING, silently, because the only code that dispatches the portal picker
+/// lives in message handlers a pinned launch never runs.
+#[cfg(test)]
+mod launch_portal_pick_tests {
+    use super::*;
+
+    /// THE bug, as a test. A portal-backed monitor launch whose probe has landed true must
+    /// pick through the portal. Before this it minted native pickers and recorded on
+    /// screencopy while the metadata claimed "pipewire".
+    #[test]
+    fn a_portal_backed_monitor_launch_picks_through_the_portal() {
+        assert_eq!(launch_portal_pick(true, true, Some(true), 0), LaunchPick::Portal);
+    }
+
+    /// The probe has not answered yet, which at launch is the NORMAL state: hold rather
+    /// than guess. Guessing is what produced the bug, since `pipewire_available` starts
+    /// false and reads as "no portal on this machine".
+    #[test]
+    fn a_pending_probe_holds_instead_of_guessing() {
+        assert_eq!(launch_portal_pick(true, true, None, 0), LaunchPick::WaitForProbe);
+        assert_eq!(
+            launch_portal_pick(true, true, None, PORTAL_SEED_PROBE_BUDGET_MS - 1),
+            LaunchPick::WaitForProbe
+        );
+    }
+
+    /// The hold is bounded and its expiry is the OLD behaviour, so a probe that never
+    /// answers costs a short delay and nothing else (DRAGON-118).
+    #[test]
+    fn the_hold_expires_into_the_native_picker() {
+        assert_eq!(
+            launch_portal_pick(true, true, None, PORTAL_SEED_PROBE_BUDGET_MS),
+            LaunchPick::Native
+        );
+        assert_eq!(launch_portal_pick(true, true, None, 60_000), LaunchPick::Native);
+    }
+
+    /// A session whose portal is genuinely unreachable picks natively at once. No hold, no
+    /// delay: the answer is known.
+    #[test]
+    fn an_unreachable_portal_picks_natively_at_once() {
+        assert_eq!(launch_portal_pick(true, true, Some(false), 0), LaunchPick::Native);
+    }
+
+    /// The setting decides, and it decides BEFORE the probe is consulted. A native-backend
+    /// launch must never hold, or every screencopy launch would pay the budget for nothing.
+    #[test]
+    fn a_native_backend_launch_never_waits_on_the_portal_probe() {
+        for probe in [None, Some(true), Some(false)] {
+            assert_eq!(
+                launch_portal_pick(true, false, probe, 0),
+                LaunchPick::Native,
+                "probe {probe:?}"
+            );
+        }
+    }
+
+    /// Region is not a portal-pickable mode and must stay exactly as it was: it draws its
+    /// own overlay and makes its portal request at COMMIT, which is the one portal path
+    /// that already worked. Holding its pickers would break region capture outright.
+    #[test]
+    fn region_is_never_held_or_redirected() {
+        for probe in [None, Some(true), Some(false)] {
+            assert_eq!(
+                launch_portal_pick(false, true, probe, 0),
+                LaunchPick::Native,
+                "probe {probe:?}"
+            );
+        }
+    }
+
+    /// The bound is finite and named, the DRAGON-118 rule applied to the launch path. Its
+    /// relation to the tray-dropdown hold is the compile-time assert beside the constant.
+    #[test]
+    fn the_probe_hold_is_bounded() {
+        assert_eq!(PORTAL_SEED_PROBE_BUDGET_MS, 1500);
+    }
+
+    /// Only a monitor or window launch can be picked FOR us by the portal. Region draws its
+    /// own box and asks at commit.
+    #[test]
+    fn only_monitor_and_window_are_portal_pickable() {
+        assert!(portal_pickable_mode(Mode::Monitor));
+        assert!(portal_pickable_mode(Mode::Window));
+        assert!(!portal_pickable_mode(Mode::Region));
+    }
+
+    /// The arming rule reads the VIDEO choice for a video launch and the SCREENSHOT choice
+    /// for a still one. They are separate settings and a session can genuinely record
+    /// through the portal while screenshotting natively.
+    #[test]
+    fn the_arming_rule_reads_the_matching_setting() {
+        // Video launch: the record choice decides, the screenshot choice is ignored.
+        assert!(portal_seed_hold_needed(Mode::Monitor, Kind::Video, true, false, true));
+        assert!(!portal_seed_hold_needed(Mode::Monitor, Kind::Video, false, true, true));
+        // Still launch: the other way round.
+        assert!(portal_seed_hold_needed(Mode::Monitor, Kind::Image, false, true, true));
+        assert!(!portal_seed_hold_needed(Mode::Monitor, Kind::Image, true, false, true));
+        // The scanner is a still kind and follows the screenshot choice with it.
+        assert!(portal_seed_hold_needed(Mode::Monitor, Kind::Scanner, false, true, true));
+    }
+
+    /// The SESSION CLAMP: a compositor with no native screencopy is on the portal whatever
+    /// the config says, so such a launch holds even with both choices set to native. This
+    /// is the same clamp `recording_uses_portal` applies, and missing it here would leave
+    /// those sessions minting pickers for a backend they cannot use.
+    #[test]
+    fn a_session_without_native_capture_always_holds() {
+        assert!(portal_seed_hold_needed(Mode::Monitor, Kind::Video, false, false, false));
+        assert!(portal_seed_hold_needed(Mode::Window, Kind::Image, false, false, false));
+    }
+
+    /// Region never arms the hold, whatever the settings say. Its pickers are its selection
+    /// overlay, and holding them would leave the user with a blank screen.
+    #[test]
+    fn a_region_launch_never_arms_the_hold() {
+        assert!(!portal_seed_hold_needed(Mode::Region, Kind::Video, true, true, true));
+        assert!(!portal_seed_hold_needed(Mode::Region, Kind::Video, true, true, false));
+    }
+
+    /// The ordinary native launch, which is most launches: no hold, so it pays nothing and
+    /// behaves exactly as it did before DRAGON-718.
+    #[test]
+    fn a_native_launch_arms_nothing() {
+        assert!(!portal_seed_hold_needed(Mode::Monitor, Kind::Video, false, false, true));
+        assert!(!portal_seed_hold_needed(Mode::Window, Kind::Video, false, false, true));
+    }
+}
+
+/// DRAGON-732: the launch showed BOTH pickers, ours and the portal's, on every
+/// `record --window` and `record --monitor` on the owner's desktop. DRAGON-718 got the
+/// DECISION right and the STATE wrong: it stored a wait, `on_output` read it as
+/// permission to mint, and resolving to the portal cleared the wait. These pin the
+/// state, because the decision was never the broken half.
+#[cfg(test)]
+mod portal_seed_tests {
+    use super::*;
+
+    /// THE bug, as a test, and the whole reason this type has three states. A launch the
+    /// portal picks for must mint no native picker, and it must keep answering that AFTER
+    /// the probe has landed, which is exactly when the outputs qualify. The pre-fix state
+    /// was an `Option<Instant>` cleared on this outcome, so this read as "may mint" from
+    /// the instant the portal picker was dispatched.
+    #[test]
+    fn a_portal_picked_launch_never_mints_a_native_picker() {
+        let armed = std::time::Instant::now();
+        let seed = seed_after_pick(LaunchPick::Portal, armed);
+        assert_eq!(seed, PortalSeed::Portal);
+        assert!(
+            !seed.mints_native_pickers(),
+            "a launch whose target the portal is picking must mint nothing of its own; \
+             minting is irreversible and two pickers is what the user sees"
+        );
+    }
+
+    /// The direction DRAGON-718 was written for, unchanged: while the probe has not
+    /// answered, nothing is minted either. The two states differ in what happens NEXT, not
+    /// in what `on_output` may do.
+    #[test]
+    fn a_holding_launch_mints_nothing_either() {
+        let armed = std::time::Instant::now();
+        let seed = seed_after_pick(LaunchPick::WaitForProbe, armed);
+        assert_eq!(seed, PortalSeed::Holding(armed));
+        assert!(!seed.mints_native_pickers());
+    }
+
+    /// The ordinary launch, which is most launches: our own pickers own the choice and
+    /// `on_output` mints exactly as it did before DRAGON-718.
+    #[test]
+    fn a_natively_picked_launch_mints_its_pickers() {
+        let seed = seed_after_pick(LaunchPick::Native, std::time::Instant::now());
+        assert_eq!(seed, PortalSeed::Native);
+        assert!(seed.mints_native_pickers());
+    }
+
+    /// `Native` is the ONLY state that mints. Written as a sweep over every state rather
+    /// than as three separate asserts, so a fourth state added later cannot quietly
+    /// inherit permission to mint.
+    #[test]
+    fn only_native_mints() {
+        let armed = std::time::Instant::now();
+        for seed in [PortalSeed::Holding(armed), PortalSeed::Portal, PortalSeed::Native] {
+            assert_eq!(
+                seed.mints_native_pickers(),
+                seed == PortalSeed::Native,
+                "{seed:?}"
+            );
+        }
+    }
+
+    /// `holding_since` is what keeps `App::resolve_portal_seed_hold` idempotent across its
+    /// two callers (the probe answer and the bounded deadline): a decided seed answers
+    /// `None`, so whichever of the two arrives second does nothing at all.
+    #[test]
+    fn only_a_holding_seed_carries_an_armed_instant() {
+        let armed = std::time::Instant::now();
+        assert_eq!(PortalSeed::Holding(armed).holding_since(), Some(armed));
+        assert_eq!(PortalSeed::Portal.holding_since(), None);
+        assert_eq!(PortalSeed::Native.holding_since(), None);
+    }
+
+    /// The mapping is TOTAL and it preserves the armed instant across a re-resolve, so a
+    /// deadline that fires while the probe is still out measures the budget from the
+    /// launch and not from the poll that observed it.
+    #[test]
+    fn re_resolving_a_held_launch_keeps_its_original_arming_instant() {
+        let armed = std::time::Instant::now();
+        let once = seed_after_pick(LaunchPick::WaitForProbe, armed);
+        let twice = seed_after_pick(LaunchPick::WaitForProbe, once.holding_since().unwrap());
+        assert_eq!(once, twice);
+        assert_eq!(twice.holding_since(), Some(armed));
+    }
+
+    /// The two decisions compose the way the app wires them: `launch_portal_pick` answers,
+    /// `seed_after_pick` stores, and the stored answer decides whether `on_output` mints.
+    /// The portal-backed monitor launch with a landed probe is the owner's exact case and
+    /// it must end at "mints nothing".
+    #[test]
+    fn the_owners_launch_composes_to_minting_nothing() {
+        let armed = std::time::Instant::now();
+        for pickable in [Mode::Monitor, Mode::Window] {
+            let pick = launch_portal_pick(portal_pickable_mode(pickable), true, Some(true), 0);
+            assert_eq!(pick, LaunchPick::Portal, "{pickable:?}");
+            assert!(
+                !seed_after_pick(pick, armed).mints_native_pickers(),
+                "{pickable:?}: the portal dialog and our picker were both on screen"
+            );
+        }
+    }
+
+    /// Every path that does NOT reach the portal must still mint, or the launch would sit
+    /// on a blank screen with no way to pick anything. This is the failure mode a naive
+    /// "never mint while a portal launch is pending" guard would produce, so it is pinned
+    /// beside the fix.
+    #[test]
+    fn every_non_portal_outcome_still_mints() {
+        let armed = std::time::Instant::now();
+        // The probe said no, the probe never answered, the mode is not portal-pickable,
+        // and the backend choice is native: four different roads to the same duty.
+        for pick in [
+            launch_portal_pick(true, true, Some(false), 0),
+            launch_portal_pick(true, true, None, PORTAL_SEED_PROBE_BUDGET_MS),
+            launch_portal_pick(false, true, Some(true), 0),
+            launch_portal_pick(true, false, Some(true), 0),
+        ] {
+            assert_eq!(pick, LaunchPick::Native);
+            assert!(seed_after_pick(pick, armed).mints_native_pickers());
+        }
+    }
+}
+
 #[cfg(test)]
 mod picker_countdown_tests {
     use super::*;
@@ -5081,7 +5676,7 @@ mod picker_countdown_tests {
         }
     }
 
-    /// A CLI `--countdown` is an arbitrary `u64`, so the clamp is the same one
+    /// A CLI `--timer` is an arbitrary `u64`, so the clamp is the same one
     /// `proceed_capture` applies and for the same reason: the ticker is a `u8`, and a bare
     /// `as u8` would turn 256 into a countdown of zero, i.e. a picker that opened instantly
     /// for a user who had asked it to wait.

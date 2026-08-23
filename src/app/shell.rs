@@ -103,6 +103,182 @@ pub(super) fn overlay_surface_with(
     })
 }
 
+/// The LIVE RECORDING INK surface (DRAGON-691), Linux form: one layer surface on the output
+/// being recorded, carrying the ink the user draws while the recording runs.
+///
+/// Three things make it different from the capture overlay above, and each is load-bearing:
+///
+/// * **`Layer::Top`, not `Layer::Overlay`.** Within one layer the compositor stacks by
+///   creation order, and this surface is minted mid-session, so on the Overlay layer it would
+///   land ON TOP of the capture overlays and the ink would cover the recording toolbar. Top
+///   sits above every ordinary window (so the ink is over the desktop being recorded) and
+///   below Overlay (so the toolbar stays visible and clickable above it), which is exactly
+///   the z-order the feature wants, by construction and with no re-minting of anything else.
+/// * **`input_zone` is the output MINUS the toolbar** while a tool is armed, and EMPTY
+///   otherwise. `crate::ink::rect_subtract` cuts the hole; a layer-shell input region is a
+///   list of rectangles with no subtraction operator, which is why that helper exists.
+/// * **Keyboard interactivity follows the TOOL, and only ON DEMAND.** A display-only surface
+///   (leftover marker ink, no tool selected) takes none at all, so it can never pull focus out
+///   of the application being recorded. A surface armed with a drawing tool takes `OnDemand`,
+///   which means focus on click and nothing before it, because ESCAPE has to reach the app
+///   while the user is drawing: it is what puts the tool selector back on Pointer
+///   (`WindowChromeMsg::Close`). Without it a user who clicked the ink surface last would be
+///   holding the screen with no key that gives it back. Never `Exclusive`, which holds the
+///   keyboard hostage from every window for as long as the surface is mapped (DRAGON-109).
+///
+/// It is deliberately NOT registered with `platform::exclude_window_from_capture`: the whole
+/// point is that this surface IS in the video while the controls beside it are not. Linux has
+/// no exclusion arm at all (DRAGON-690), so there is nothing to decline there; the rule
+/// matters on macOS and Windows and is stated here so all three read alike.
+#[cfg(target_os = "linux")]
+pub(super) fn ink_surface(
+    output: super::OutputHandle,
+    id: window::Id,
+    input_zone: Option<Vec<cosmic::iced::Rectangle>>,
+    armed: bool,
+) -> Task<cosmic::Action<Msg>> {
+    // Same guard as the capture overlay: with no layer shell there is no surface to mint, and
+    // the caller's own availability gate (`ink::tools_available`) already refuses the portal
+    // fallback, so reaching here without the global would be a bug rather than a session.
+    if !crate::platform::layer_overlay_available() {
+        log::warn!("ink: no wlr-layer-shell, so no drawing surface can be created");
+        return Task::none();
+    }
+    get_layer_surface(SctkLayerSurfaceSettings {
+        id,
+        layer: wlr_layer::Layer::Top,
+        keyboard_interactivity: if armed {
+            wlr_layer::KeyboardInteractivity::OnDemand
+        } else {
+            wlr_layer::KeyboardInteractivity::None
+        },
+        input_zone,
+        anchor: wlr_layer::Anchor::all(),
+        output: IcedOutput::Output(output),
+        namespace: "cosmic-capture-kit-ink".into(),
+        margin: IcedMargin::default(),
+        size: Some((None, None)),
+        exclusive_zone: -1,
+        size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
+    })
+}
+
+/// The SILVER / BRONZE armed annotation window (DRAGON-693), Linux form: one ordinary
+/// fullscreen transparent toplevel, minted MID-RECORDING on a session with no layer shell.
+///
+/// It is [`overlay_fallback_window`]'s twin and deliberately so. That one is the capture
+/// overlay's bridge for the same sessions, and every reason its settings are what they are
+/// applies here unchanged: `fullscreen: true` rides the CREATION (the toplevel's first
+/// configure is already fullscreen, with no windowed first frame and no same-batch command
+/// racing the surface), `Borderless(None)` lets the compositor pick the monitor and the
+/// letterbox bridge absorbs a mismatch, and the app id matches our installed `.desktop` so a
+/// WM rule recognises the surface.
+///
+/// Two things differ, and neither is a setting:
+///
+/// * **It is minted while a recording runs**, which the fallback path otherwise never does
+///   (`recreate_active_overlays` tears every surface down at recording start). That is the
+///   deliberate exception DRAGON-693 adds: the user has asked to draw, and on this path a
+///   focused toplevel is the only surface a client can have.
+/// * **It is IN the recording, by design.** The capture overlay's teardown exists partly so
+///   the selection UI is not baked into the video; this window's whole purpose is to be baked
+///   into the video, which is how Silver carries its ink with no bake pass at all.
+///
+/// It never opts out of capture: there is no exclusion arm on Linux to decline.
+#[cfg(target_os = "linux")]
+pub(super) fn ink_armed_window(
+    logical_size: (u32, u32),
+) -> (window::Id, Task<cosmic::Action<Msg>>) {
+    let (w, h) = (logical_size.0.max(1) as f32, logical_size.1.max(1) as f32);
+    let (id, task) = window::open(window::Settings {
+        size: cosmic::iced::Size::new(w, h),
+        fullscreen: true,
+        resizable: false,
+        decorations: false,
+        transparent: true,
+        exit_on_close_request: false,
+        platform_specific: cosmic::iced::window::settings::PlatformSpecific {
+            application_id: "dev.thedragon.CosmicCaptureKit".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    // Nothing native to finish after open, exactly like the fallback capture overlay: a Wayland
+    // toplevel needs no placement call and the compositor focuses a fresh fullscreen window
+    // itself, which is what makes Escape reach the app without a click first.
+    let open = task.map(|_| cosmic::Action::App(Msg::WindowChrome(super::WindowChromeMsg::Ignore)));
+    (id, open)
+}
+
+/// The LIVE RECORDING INK surface's title (DRAGON-691), THE single source of truth for it on
+/// macOS and Windows, where the native placement, the click-through flip and the window search
+/// all match by exact title. Distinct from every other title this app sets, so nothing can
+/// cross-resolve: the capture overlays are titled with their DISPLAY NAME, and the preview
+/// surfaces carry their own two constants above.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(super) const INK_WINDOW_TITLE: &str = "CCK Ink Surface";
+
+/// The LIVE RECORDING INK surface (DRAGON-691), macOS/Windows form: a transparent,
+/// always-on-top, borderless window covering the recorded display.
+///
+/// Modelled on [`overlay_window`], with the two differences that matter for a window minted
+/// in the MIDDLE of a recording:
+///
+/// * **`visible: false` on BOTH platforms.** winit's create-time `makeKeyAndOrderFront:`
+///   would activate this process, which mid-recording means taking focus away from the very
+///   application the user is recording and bouncing our icon in the Dock or taskbar. The
+///   native follow-up (`App::configure_ink_surface`) orders it on screen WITHOUT keying it,
+///   the same DRAGON-216 move the pre-opened preview overlay makes. macOS's capture overlays
+///   can open visible because they are minted at launch, when activating is what the user
+///   asked for; this one cannot.
+/// * **It never opts out of capture.** [`crate::platform::exclude_window_from_capture`] is
+///   what keeps the toolbar out of the video (DRAGON-690), and this surface must be the
+///   opposite: IN it. That seam is per-window precisely so these two windows can differ, so
+///   the correct implementation here is to not call it, and this comment is the reason a
+///   future edit should not "consistently" add it.
+///
+/// The mac `decorations: true` is the same borderless-`is_zoomed` crash dodge the capture
+/// overlay documents; the titlebar is stripped natively after open.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn ink_window(
+    logical_pos: (i32, i32),
+    logical_size: (u32, u32),
+) -> (window::Id, Task<cosmic::Action<Msg>>) {
+    #[cfg(windows)]
+    let (seed_pos, seed_size) =
+        crate::platform::windows::overlay_seed_rect(logical_pos, logical_size);
+    #[cfg(not(windows))]
+    let (seed_pos, seed_size) = (logical_pos, logical_size);
+    let (w, h) = (seed_size.0.max(1) as f32, seed_size.1.max(1) as f32);
+    let (id, task) = window::open(window::Settings {
+        size: cosmic::iced::Size::new(w, h),
+        position: window::Position::Specific(cosmic::iced::Point::new(
+            seed_pos.0 as f32,
+            seed_pos.1 as f32,
+        )),
+        resizable: true,
+        #[cfg(target_os = "macos")]
+        decorations: true,
+        #[cfg(not(target_os = "macos"))]
+        decorations: false,
+        transparent: true,
+        exit_on_close_request: false,
+        level: window::Level::AlwaysOnTop,
+        // Never keyed at creation: see the doc above. The native follow-up shows it.
+        visible: false,
+        #[cfg(target_os = "macos")]
+        platform_specific: cosmic::iced::window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        ..Default::default()
+    });
+    let open =
+        task.map(|id| cosmic::Action::App(Msg::Ink(super::InkMsg::SurfaceOpened(id, 0))));
+    (id, open)
+}
+
 /// `lab/flatpak` (Linux): the PORTAL-FROZEN fallback capture overlay: ONE ordinary
 /// fullscreen xdg toplevel for the whole session, minted only when
 /// [`crate::platform::layer_overlay_available`] is false (sandboxed, or a compositor
@@ -536,7 +712,7 @@ pub(super) fn preview_window(
 /// A fullscreen overlay for the post-capture preview. Exclusive keyboard so its
 /// hotkeys (Save / Copy / Cancel) work immediately without a click first; full
 /// input so the action buttons are clickable. `output`: the capture's monitor,
-/// or the compositor's active one (`--preview`, which has no capture anchor).
+/// or the compositor's active one (`editor`, which has no capture anchor).
 #[cfg(target_os = "linux")]
 pub(super) fn preview_surface(output: IcedOutput, id: window::Id) -> Task<cosmic::Action<Msg>> {
     preview_surface_with(output, id, wlr_layer::KeyboardInteractivity::Exclusive)

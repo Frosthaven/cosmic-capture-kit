@@ -34,7 +34,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 
 /// Metadata line handed to finalize (no `codec=auto`, so it passes through untouched
-/// — these tests measure audio timing, not the `--inspect` annotation).
+/// — these tests measure audio timing, not the `debug inspect` annotation).
 const META: &str = "cck-av-sync-test | recorder=fixture";
 /// Tolerance for the alignment assertion (output-vs-fixture). Priming and frame
 /// quantisation cancel in the difference; measured drift is <2 ms, so ±40 ms is

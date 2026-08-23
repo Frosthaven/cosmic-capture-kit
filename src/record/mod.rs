@@ -29,7 +29,10 @@
 //!   in a stop tail can hang the recorder (and the preview spinner) forever.
 //! - `owned::run_video_stop_tail` is the SINGLE stop-tail
 //!   implementation the RGBA workers share (DRAGON-161): the covering ticks are
-//!   bounded/non-blocking, the reap is bounded, and the salvage-vs-fail decision is the
+//!   non-blocking and bounded (DRAGON-711 — a FULL pipe is retried until
+//!   `owned::COVERING_WRITE_BUDGET`, since those writes are what makes the video reach
+//!   the audio's media end; only a dead pipe or an expired deadline stops them), the
+//!   reap is bounded, and the salvage-vs-fail decision is the
 //!   pure, unit-tested `owned::salvage_decision`. A worker becomes a thin capture
 //!   adapter feeding this shared core, rather than re-deriving the media-clock teardown.
 //!
@@ -37,6 +40,10 @@
 //! connection that feeds frames to the media-clock loop, and — reusing `record::owned`
 //! and `record::pump` verbatim — the shared stop tail. It does NOT reimplement the
 //! media clock, the FIFO/audio pre-flight, the watchdog, or the salvage logic.
+
+// Only `bench_record` prints, and that is Linux-only (DRAGON-709).
+#[cfg(target_os = "linux")]
+use crate::errln;
 
 #[cfg(target_os = "linux")]
 use cosmic_client_toolkit::screencopy::{CaptureOptions, CaptureSource, ScreencopySessionData};
@@ -59,10 +66,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod finalize;
+// DRAGON-728: what the finalize pass is doing, so a long pass stops looking like a hang. The
+// pass publishes; the app's existing recording poll reads. Portable and pure apart from one
+// mutex, so every platform's suite covers the rule.
+pub(crate) mod finalize_progress;
+// DRAGON-691 amendment 2: compositing live annotation ink into a WINDOW recording, which is
+// the one capture mode whose file cannot contain the on-screen overlay. Portable and pure
+// apart from the rasterizer, so every platform's suite covers the mapping and the replay even
+// though only macOS and Windows ever run the bake.
+pub(crate) mod ink_bake;
+// DRAGON-724: the same ink, composited onto the CAPTURED FRAME instead, which is what every
+// other capture mode already gets from the compositor. The size gate, the raster and the blend
+// are portable and unit-tested everywhere, so the Linux gate proves the rule macOS and Windows
+// record through; `ink_bake` above stays as the fallback for a frame too big to paint per tick.
+pub(crate) mod ink_live;
 /// DRAGON-432: the bounded ring that keeps an ffmpeg child's last stderr lines, plus the
 /// parser that picks the one line worth showing a user. Portable and pure — no spawning
 /// here, so every platform's suite covers it.
 pub(crate) mod ffmpeg_log;
+/// DRAGON-713: the ONE bounded capture-to-encoder frame queue, with the ONE eviction rule
+/// (drop the OLDEST, coalesce same-tick arrivals) every raw-frame worker shares. Portable and
+/// pure apart from one mutex and a doorbell channel, so every platform's suite proves the rule
+/// macOS and Windows record through.
+pub(crate) mod frame_queue;
 // The Wayland screencopy + portal PipeWire capture workers are the Linux capture
 // paths; macOS records via ScreenCaptureKit (DRAGON-94 phase 3). pump/finalize/
 // sync_probe are pure ffmpeg/audio and stay portable. `owned` holds the portable
@@ -140,13 +166,29 @@ mod zc_fallback_live_tests;
 /// module's forced-failure env failed the other module's real pre-flight mid-test,
 /// and that pre-flight inflated the first module's counter delta. Both modules'
 /// `test_lock()` now delegate here.
-#[cfg(all(test, target_os = "linux"))]
+// DRAGON-691 amendment 2 widened this from Linux-only to every test build: the ink-bake E2E
+// tests run real ffmpeg on macOS and Windows too, and they must not overlap each other or the
+// A/V sync tests any more than the Linux modules may.
+#[cfg(test)]
 pub(crate) fn recording_globals_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 #[cfg(test)]
 mod av_sync_tests;
+// DRAGON-712: the owned STOP TAIL, end to end, through the real `encode::command` argv and
+// real audio FIFOs. UNIX rather than Linux-only on purpose: the wedge it pins shipped
+// because `media_clock_e2e_tests` is Linux-gated and macOS therefore had no behavioural
+// cover on the recording muxer at all. Skips loudly without ffmpeg; needs no pulse server,
+// no compositor and no display, so a container can run it.
+#[cfg(all(test, unix))]
+mod stop_tail_e2e_tests;
+// DRAGON-691 amendment 2: the window-mode ink bake, proven against DECODED PIXELS rather than
+// against the file's shape (CLAUDE.md's DRAGON-417 rule). Every host, because the bake's model
+// and its ffmpeg wiring are portable even though only macOS and Windows ever run it; skips
+// loudly without ffmpeg.
+#[cfg(test)]
+mod ink_bake_e2e_tests;
 // The owned media-clock E2E tests exercise the Linux pipewire owned-audio path
 // (and real ffmpeg); macOS records via SCK (DRAGON-94 phase 3), so gate to Linux.
 #[cfg(all(test, target_os = "linux"))]
@@ -173,14 +215,14 @@ pub use zero_copy::cuda_import_test;
 pub fn bench_record(secs: u64, fps: u32, backend: &str) {
     use std::time::{Duration, Instant};
     let Some((conn, mut queue, mut data)) = connect(false) else {
-        eprintln!("bench: connect failed");
+        errln!("bench: connect failed");
         return;
     };
     let Some((output, name, _, (ow, oh))) = outputs(&data)
         .into_iter()
         .max_by_key(|(_, _, _, (w, h))| (*w as i64) * (*h as i64))
     else {
-        eprintln!("bench: no output");
+        errln!("bench: no output");
         return;
     };
     let src = CaptureSource::Output(output);
@@ -201,28 +243,28 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
         }
     }
     let Some(formats) = data.formats.clone() else {
-        eprintln!("bench: no capture formats reported");
+        errln!("bench: no capture formats reported");
         return;
     };
     let (cw, ch) = formats.buffer_size;
     let Some((format, swizzle, force_opaque)) = pick_format(&formats.shm_formats) else {
-        eprintln!("bench: no usable shm format offered by the compositor");
+        errln!("bench: no usable shm format offered by the compositor");
         return;
     };
     let stride = cw * 4;
     let Ok(mut pool) = SlotPool::new((stride * ch) as usize, &data.shm) else {
-        eprintln!("bench: shm pool allocation failed");
+        errln!("bench: shm pool allocation failed");
         return;
     };
     let Ok((buffer, _)) = pool.create_buffer(cw as i32, ch as i32, stride as i32, format) else {
-        eprintln!("bench: shm buffer allocation failed");
+        errln!("bench: shm buffer allocation failed");
         return;
     };
     let even = |v: u32| v - (v % 2);
     let (ew, eh) = (even(cw), even(ch));
     let temp = std::path::Path::new("/tmp/cck-bench-record.mkv");
     let Some(plan) = crate::encode::EncodePlan::for_backend(backend, ew, eh, &crate::encode::Presets::default()) else {
-        eprintln!("bench: encoder backend '{backend}' not available on this system");
+        errln!("bench: encoder backend '{backend}' not available on this system");
         return;
     };
     let nv12 = plan.nv12;
@@ -237,7 +279,7 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
     let mic_fifo_path = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.bench-mic.pcm"));
     let sys_fifo_path = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.bench-sys.pcm"));
     if !bench_mkfifo(&mic_fifo_path) || !bench_mkfifo(&sys_fifo_path) {
-        eprintln!("bench: could not create the inert audio FIFOs");
+        errln!("bench: could not create the inert audio FIFOs");
         let _ = std::fs::remove_file(&mic_fifo_path);
         let _ = std::fs::remove_file(&sys_fifo_path);
         return;
@@ -248,7 +290,7 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
     let Ok(mut child) = crate::encode::spawn_ffmpeg_media_clock(
         ew, eh, ew, eh, fps, &plan, 50_000, temp, &mic_fifo_path, &sys_fifo_path,
     ) else {
-        eprintln!("bench: ffmpeg spawn failed");
+        errln!("bench: ffmpeg spawn failed");
         audio_stop.store(true, Ordering::Relaxed);
         let _ = mic_writer.join();
         let _ = sys_writer.join();
@@ -257,7 +299,7 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
         return;
     };
     let Some(stdin) = child.stdin.take() else {
-        eprintln!("bench: ffmpeg stdin unavailable");
+        errln!("bench: ffmpeg stdin unavailable");
         let _ = child.kill();
         audio_stop.store(true, Ordering::Relaxed);
         let _ = mic_writer.join();
@@ -286,7 +328,7 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
             }
         }
     });
-    eprintln!(
+    errln!(
         "bench: recording {name} {ow}x{oh} (enc {ew}x{eh}, {backend}, {}) @ {fps}fps for {secs}s…",
         if nv12 { "NV12" } else { "RGBA" }
     );
@@ -330,17 +372,17 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
     match child.wait() {
         Ok(s) if s.success() => ffmpeg_log::discard(pid),
         Ok(s) => {
-            eprintln!("bench: ffmpeg exited with {s}");
+            errln!("bench: ffmpeg exited with {s}");
             ffmpeg_log::report(pid, &format!("bench muxer exited with {s}"));
         }
         Err(e) => {
-            eprintln!("bench: could not reap ffmpeg: {e}");
+            errln!("bench: could not reap ffmpeg: {e}");
             ffmpeg_log::report(pid, "bench muxer could not be reaped");
         }
     }
     let _ = std::fs::remove_file(&mic_fifo_path);
     let _ = std::fs::remove_file(&sys_fifo_path);
-    eprintln!(
+    errln!(
         "bench: captured {captured} frames in {elapsed:.2}s => {:.1} fps fed to encoder",
         captured as f64 / elapsed,
     );
@@ -449,6 +491,21 @@ pub struct RecordHandle {
     /// app's bring-up log line (`App::adopt_warm_start`), which reports the span from here to
     /// media 0: the pre-flight, the ffmpeg spawn, the opening ticks and any countdown hold.
     pub warm_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// MEDIA 0: the wall instant the worker anchored the session's media clock, which is
+    /// where the delivered file begins. `None` until the worker gets there.
+    ///
+    /// DRAGON-725: the slot exists because the app was reading media 0 off
+    /// [`Self::settled_at`], and the two are not the same instant. Filled at every
+    /// `owned::media_zero(...)` call site, on every worker and every platform, in the same
+    /// breath as the clock itself, so nothing can be off by a step: whatever this says is
+    /// what `MediaClock::new` was handed.
+    ///
+    /// THIS is the elapsed readout's anchor and the clock every live ink stroke is stamped
+    /// against, because both are counting the FILE. `settled_at` is a later, separate
+    /// question ("may the chip offer STOP yet"), and reading media 0 off it made every
+    /// baked ink mark lead the cursor that drew it by the whole opening phase, 500ms on the
+    /// owner's take, and made the readout at stop undercount the file by the same amount.
+    pub media_zero_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// The wall instant the worker's OPENING PHASE ended: the first moment the whole
     /// pipeline is genuinely up and level with the media clock, with capture confirmed, the
     /// audio pre-flight done, ffmpeg spawned, the pump running and the opening's media debt
@@ -462,13 +519,116 @@ pub struct RecordHandle {
     /// capture cannot keep pace with a loop that is racing the clock. A UI that says "live"
     /// at `warm_at` is therefore pointing straight at the span still being papered over.
     ///
-    /// This one IS media 0 (DRAGON-672): the worker takes it immediately after
-    /// `owned::media_zero`, so the file's own timeline begins here. Everything the UI says
-    /// about the recording therefore reads THIS instant — the LIVE DECLARATION (the record
-    /// chip's STOP face, the tray's "Recording" state) and, since DRAGON-673, the elapsed
-    /// readout's anchor as well. Filled by every worker on every platform; see
-    /// `owned::mark_settled` for each call site.
+    /// THIS IS NOT MEDIA 0, and it never reliably was (DRAGON-725). It is the LIVE
+    /// DECLARATION and only that: the record chip's STOP face and the tray's "Recording"
+    /// state. Media 0 is [`Self::media_zero_at`], which is strictly earlier, and anything
+    /// counting the FILE (the elapsed readout, the ink clock) must read that one.
+    ///
+    /// This doc used to say "this one IS media 0", on the reasoning that the worker takes
+    /// it immediately after `owned::media_zero` and so lands a few milliseconds later. The
+    /// opening phase sits between the two, and its length is not ours to choose: it ends
+    /// when a video write returns inside one tick period, and ffmpeg paces the video pipe
+    /// against the audio timestamps it has already received, so the span is set by another
+    /// process's muxer scheduler. Measured span, media 0 to here, `debug test mac-rec-bench
+    /// largest 5 videotoolbox 30 1245`, n=8 per build: 328ms median before the v0.34.0
+    /// batch and 480ms after it. See `owned::mark_settled` for the whole argument, for the
+    /// levers that were tried and made it WORSE, and for each call site.
     pub settled_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// DRAGON-691 amendment 2: the live annotation ink to composite into a WINDOW recording,
+    /// filled by the app just before it asks the recording to stop.
+    ///
+    /// The same contract as `events` beside it, and for the same reason: the UI is where the
+    /// user's actions happen and the worker is where the file is finished, so the UI records
+    /// what happened and the worker bakes it in at the end. `None` means "nothing to
+    /// composite", which is every recording that is not an inked window one, and finalize
+    /// then builds exactly the command it always did.
+    ///
+    /// Read ONCE, at finalize, after the stop tail. Nothing in the record path waits on it.
+    ///
+    /// DRAGON-724: on a session the live composite took (`ink_live::live_ink_affordable`), the
+    /// worker DROPS whatever is here, because the ink is already in the frames. The app fills it
+    /// either way and does not have to know which path ran: that is deliberate, and it is what
+    /// makes the fallback need no coordination at all.
+    pub ink: Arc<Mutex<Option<crate::record::ink_bake::InkBake>>>,
+    /// DRAGON-724: the live annotation scene, republished by the app whenever it changes, so the
+    /// capture worker can paint it onto each frame on its way to the encoder.
+    ///
+    /// The OPPOSITE contract to `ink` above, and they are siblings on purpose. That one is
+    /// written once at the end and read once at finalize; this one is written all through the
+    /// session and read per tick. A worker that paints from this leaves the finalize pass
+    /// stream-copying its video, which is the whole point of the ticket.
+    ///
+    /// Empty on every recording that is not an inked WINDOW recording whose capture reads the
+    /// window's own buffer, and nothing in the record path waits on it. Which recordings those
+    /// are is a question about the BACKEND and not about the platform (DRAGON-736): the Linux
+    /// PORTAL workers are fed this too, while the Linux NATIVE screencopy worker is not, and
+    /// both are reachable in the same build.
+    pub live_ink: crate::record::ink_live::LiveInk,
+    /// DRAGON-693, the BRONZE tier: a one-shot request for the freshest captured frame, so the
+    /// armed annotation window can show what the recording is actually seeing.
+    ///
+    /// Deliberately request-driven rather than a slot the worker keeps fresh. A 4K frame is
+    /// 33MB, and copying one into a mutex on every tick would cost a live recording real
+    /// bandwidth to serve a window that exists for a few seconds of a session, if at all. The
+    /// app raises the flag when it arms a tool and the worker answers ONCE.
+    pub peek: FramePeek,
+}
+
+/// A one-shot request for the freshest captured frame (DRAGON-693).
+///
+/// The Bronze tier's whole need from the record path: a no-layer-shell WINDOW cast streams the
+/// recorded window's own pixels to us and nothing else knows where that window is, so the
+/// armed overlay draws on the last frame the recording saw. Nothing in the record path waits
+/// on this and no bound is involved: a worker that never answers costs the annotation its
+/// backdrop and costs the recording nothing at all.
+#[derive(Clone)]
+pub struct FramePeek {
+    /// Raised by the app, lowered by the worker when it serves one.
+    want: Arc<AtomicBool>,
+    /// The served frame. Drained by the app.
+    frame: Arc<Mutex<Option<PeekedFrame>>>,
+}
+
+/// One served frame: `(width, height, tightly-packed RGBA)`.
+pub type PeekedFrame = (u32, u32, Vec<u8>);
+
+impl FramePeek {
+    fn new() -> Self {
+        Self { want: Arc::new(AtomicBool::new(false)), frame: Arc::new(Mutex::new(None)) }
+    }
+
+    /// Ask the worker for one frame. Idempotent: a second ask before the first is served
+    /// changes nothing.
+    pub fn request(&self) {
+        self.want.store(true, Ordering::Relaxed);
+    }
+
+    /// Take the served frame, if one has arrived. Non-blocking and poison-tolerant, the house
+    /// drain idiom.
+    pub fn take(&self) -> Option<PeekedFrame> {
+        self.frame.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Worker side: is a frame wanted? Clears the request, so exactly one frame is copied per
+    /// ask however often this is called.
+    ///
+    /// Its ONE caller is the Linux PipeWire worker, which is the only capture path a Bronze
+    /// session can run on, so it is honestly dead everywhere else.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn wanted(&self) -> bool {
+        self.want.swap(false, Ordering::Relaxed)
+    }
+
+    /// Worker side: publish one frame. Overwrites anything undrained, which is right: the app
+    /// wants the freshest, and a stale one it never picked up is of no use to it.
+    ///
+    /// Dead off Linux for the same reason [`FramePeek::wanted`] is.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn serve(&self, w: u32, h: u32, rgba: &[u8]) {
+        if let Ok(mut g) = self.frame.lock() {
+            *g = Some((w, h, rgba.to_vec()));
+        }
+    }
 }
 
 /// Guarantees a recording's `done` slot is filled even if the worker thread unwinds
@@ -538,6 +698,139 @@ pub(crate) fn wait_or_kill(
             let status = child.wait();
             ffmpeg_log::report(pid, "killed after outliving its stop budget");
             return status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// What one poll of [`wait_or_kill_progressing`] concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapStep {
+    /// The output grew. Adopt this as the new high-water mark and restart the stall clock.
+    Progressed(u64),
+    /// No growth yet, and the stall budget still has room.
+    Waiting,
+    /// The output has not grown for the whole stall budget. This one is wedged.
+    Stalled,
+}
+
+/// **Pure**, unit-tested (DRAGON-716): one poll of the progress-aware reap
+/// [`wait_or_kill_progressing`] runs.
+///
+/// `mark` is the largest output size seen so far, `reading` what the probe just returned,
+/// and `since_growth` how long it has been since the mark last moved.
+///
+/// Three edges are deliberate and are pinned by the tests below:
+///
+/// * **Growth beats a spent budget.** An output that grows on the very poll where the
+///   budget runs out is progressing, not stalled, so the growth arm is checked FIRST.
+/// * **Equal is not growth** (`>`, not `>=`). A file that stops changing size is exactly
+///   the symptom being watched for, so a repeated reading must not refresh the clock.
+/// * **A SHRINKING reading is not growth either.** `-movflags +faststart` rewrites the
+///   file at the end to move the moov atom, and nothing promises the size climbs
+///   monotonically while it does. Treating a dip as progress would hand a wedged process
+///   a free extension; treating it as a stall would kill an honest one, which is why the
+///   budget is generous rather than the comparison being clever.
+pub(crate) fn reap_step(
+    mark: u64,
+    reading: u64,
+    since_growth: std::time::Duration,
+    stall: std::time::Duration,
+) -> ReapStep {
+    if reading > mark {
+        return ReapStep::Progressed(reading);
+    }
+    if since_growth < stall { ReapStep::Waiting } else { ReapStep::Stalled }
+}
+
+/// [`wait_or_kill`]'s sibling for a pass whose HONEST duration scales with the work
+/// (DRAGON-716): reap `child`, killing it only once `probe` has reported no growth for
+/// `stall`.
+///
+/// # Why a second reaper exists
+///
+/// [`wait_or_kill`] bounds a pass whose remaining work is roughly CONSTANT: a muxer
+/// flushing the backlog it already holds. Its budget is a wall-clock cap, and for that
+/// shape the cap IS the wedge detector.
+///
+/// The ink finalize is not that shape. It re-encodes the whole recording in software
+/// (`finalize::finalize_ink_args`: a filtered stream cannot be stream-copied), so its
+/// duration scales with recording length times frame area. A constant cap over that is not
+/// a wedge detector at all, it is a LENGTH LIMIT, and it was one: measured at
+/// 22.1s for a 2 minute 1080p recording on a quiet 16-core desktop, so a ~2.7 minute take
+/// crossed the old 30s cap there, and a laptop, a Retina-sized window or any load crossed
+/// it far sooner. Past the cap `wait_or_kill` SIGKILLed the encode and the non-success
+/// status became an `Err`, so the recording was LOST after the user had already watched a
+/// spinner for the full budget.
+///
+/// # Why this is still bounded
+///
+/// DRAGON-118's rule is that nothing in the record path waits unboundedly, and this keeps
+/// it, by asking a different question with the SAME number: "has the output stopped
+/// growing for `stall`?" rather than "has `stall` elapsed?". A wedged ffmpeg writes
+/// nothing and still dies in one budget. An honest encode that keeps writing now finishes.
+/// This is the question `MuxerWatchdog` and [`muxer_alive`] already ask of the live muxer,
+/// so it is the house pattern rather than a new mechanism.
+///
+/// The total duration is therefore bounded by the WORK rather than by a clock, exactly as
+/// `progress::SESSION_STALL_SECS` is. A process that dribbles one byte just inside every
+/// budget would run on, and that is accepted for the same reason it is accepted there:
+/// the alternative kills honest work, and nothing has ever been seen to do it.
+///
+/// `probe` is injected rather than taking a path, so the decision above is testable
+/// without a filesystem and this loop carries the only syscall.
+///
+/// **`probe` must be MONOTONIC for the life of one child**, and that is the caller's job, not
+/// this loop's. The high-water mark exists so a momentary dip cannot hand a wedged process a
+/// free extension, which means a LEGITIMATE reset reads as a stall: a second attempt writing
+/// to a path the first attempt left partial would sit under the dead attempt's mark for most
+/// of its run and be killed for it. `finalize::run_ink_pass` therefore deletes its output
+/// before every attempt. A caller that cannot make that guarantee wants a different bound.
+pub(crate) fn wait_or_kill_progressing(
+    child: &mut std::process::Child,
+    stall: std::time::Duration,
+    mut probe: impl FnMut() -> u64,
+) -> std::io::Result<std::process::ExitStatus> {
+    let pid = child.id();
+    let mut mark = probe();
+    let mut last_growth = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                // Same reporting contract as `wait_or_kill`: a healthy exit drops the
+                // stderr ring silently, anything else writes its tail to the debug log.
+                if s.success() {
+                    ffmpeg_log::discard(pid);
+                } else {
+                    ffmpeg_log::report(pid, &format!("exited with {s}"));
+                }
+                return Ok(s);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                ffmpeg_log::report(pid, "could not be reaped");
+                return Err(e);
+            }
+        }
+        match reap_step(mark, probe(), last_growth.elapsed(), stall) {
+            ReapStep::Progressed(n) => {
+                mark = n;
+                last_growth = std::time::Instant::now();
+            }
+            ReapStep::Waiting => {}
+            ReapStep::Stalled => {
+                log::warn!(
+                    "ffmpeg wrote nothing to its output for {stall:?} while being reaped; \
+                     killing it as wedged (DRAGON-716)"
+                );
+                let _ = child.kill();
+                // Report AFTER the reap, for `wait_or_kill`'s reason: `kill` is
+                // asynchronous, and reporting first races the stderr drain and prints a
+                // ring missing exactly the lines that explain the kill.
+                let status = child.wait();
+                ffmpeg_log::report(pid, "killed after its output stopped growing");
+                return status;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -706,6 +999,11 @@ fn median_offset_ms(mut samples: Vec<i64>) -> Option<i32> {
 /// Temp file the recording is captured to (video + both audio channels, ungated)
 /// before the finalize pass produces `out_path`. Deterministic so the UI can read
 /// its growing size for the live readout.
+///
+/// The finalize pass DELETES this once it has delivered, and only then (DRAGON-748,
+/// `finalize::finalize_with_ink`); a finalize that failed leaves it for the DRAGON-118 salvage
+/// and for `recover`. Nothing else needs to clean up after a healthy recording, which is why
+/// the three `debug test` rec benches used to leak one of these per run.
 pub fn recording_temp_path(out_path: &std::path::Path) -> PathBuf {
     let stem = recording_stem(out_path);
     out_path.with_file_name(format!(".{stem}.recording.mkv"))
@@ -731,7 +1029,11 @@ struct RecordShared {
     measured_offset_ms: Arc<Mutex<Option<i32>>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     warm_at: Arc<Mutex<Option<std::time::Instant>>>,
+    media_zero_at: Arc<Mutex<Option<std::time::Instant>>>,
     settled_at: Arc<Mutex<Option<std::time::Instant>>>,
+    ink: Arc<Mutex<Option<crate::record::ink_bake::InkBake>>>,
+    live_ink: crate::record::ink_live::LiveInk,
+    peek: FramePeek,
 }
 
 impl RecordShared {
@@ -744,7 +1046,11 @@ impl RecordShared {
             measured_offset_ms: Arc::new(Mutex::new(None)),
             dims: Arc::new(Mutex::new(None)),
             warm_at: Arc::new(Mutex::new(None)),
+            media_zero_at: Arc::new(Mutex::new(None)),
             settled_at: Arc::new(Mutex::new(None)),
+            ink: Arc::new(Mutex::new(None)),
+            live_ink: crate::record::ink_live::LiveInk::new(),
+            peek: FramePeek::new(),
         }
     }
 
@@ -758,7 +1064,11 @@ impl RecordShared {
             measured_offset_ms: self.measured_offset_ms.clone(),
             dims: self.dims.clone(),
             warm_at: self.warm_at.clone(),
+            media_zero_at: self.media_zero_at.clone(),
             settled_at: self.settled_at.clone(),
+            ink: self.ink.clone(),
+            live_ink: self.live_ink.clone(),
+            peek: self.peek.clone(),
         }
     }
 
@@ -772,7 +1082,11 @@ impl RecordShared {
             measured_offset_ms: self.measured_offset_ms,
             dims: self.dims,
             warm_at: self.warm_at,
+            media_zero_at: self.media_zero_at,
             settled_at: self.settled_at,
+            ink: self.ink,
+            live_ink: self.live_ink,
+            peek: self.peek,
         }
     }
 }
@@ -847,6 +1161,118 @@ pub(crate) fn resolve_session_plan(
         crate::state::note_encoder_auto_hint(&id);
     }
     plan
+}
+
+/// Rewrite a recording's metadata line so its `encoder=` and `preset=` fields name the tier
+/// the session ACTUALLY resolved to, plus that tier's speed preset. Pure, unit-tested.
+///
+/// The sibling of `finalize::annotate_codec`, which does the same thing for `codec=auto`,
+/// and for the same reason: the app builds the line at spawn time, and some of what the line
+/// claims is not decided until the worker has resolved its plan.
+///
+/// **Windows only, and that is the point** (DRAGON-754). Everywhere else the app resolves the
+/// encoder itself, cheaply: Linux reads `/dev/nvidia0` and `/dev/dri`, macOS reads the ffmpeg
+/// encoder list. Windows has no device node to sniff, so its honest gate is a real
+/// probe-ENCODE per tier, and `encode::device::available_encoders` runs one for every tier
+/// there is. That walk was happening on the UI thread, inside the record control's own click
+/// handler, purely to name the encoder in this line: measured on the owner's box at 1.1 to
+/// 1.3s warm and about 2.35s cold, which is the freeze the user reported. So the Windows app
+/// writes the REQUEST here (`auto`, or the tier the user picked, both free) and the WGC worker
+/// overwrites it with the tier it resolved, on its own thread, from the probe the recording
+/// was going to pay for anyway.
+///
+/// Writing the request and stopping there was the other option and it is the worse one: this
+/// field is read back by `debug inspect`, and DRAGON-718 already paid for a metadata field
+/// that reported an intention rather than an event. A missed annotation degrades to the
+/// request rather than to nothing, which is why the app writes that rather than a placeholder.
+///
+/// The rewrite is TOTAL and order-independent: it replaces whatever those two fields hold,
+/// leaves every other field byte-identical, and is a no-op on a line that carries neither.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn annotate_session_encoder(
+    metadata: &str,
+    encoder: &str,
+    presets: &crate::encode::Presets,
+) -> String {
+    let preset = crate::encode::session_preset_label(encoder, presets);
+    metadata
+        .split(" | ")
+        .map(|field| match field.split_once('=') {
+            Some(("encoder", _)) => format!("encoder={encoder}"),
+            Some(("preset", _)) => format!("preset={preset}"),
+            _ => field.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// DRAGON-754: the metadata rewrite that lets a Windows recording start without walking the
+/// encoder probe ladder on the UI thread.
+#[cfg(test)]
+mod annotate_session_encoder_tests {
+    use super::annotate_session_encoder;
+    use crate::encode::Presets;
+
+    fn presets() -> Presets {
+        Presets {
+            nvenc: "p5".to_string(),
+            x264: "veryfast".to_string(),
+            vaapi_cl: 3,
+            codec: "auto".to_string(),
+        }
+    }
+
+    const LINE: &str = "Cosmic Capture Kit | type=video | source=cosmic | mode=monitor | \
+                        encoder=auto | preset=- | codec=auto | zero_copy=off | \
+                        max_res=original | fps=30 | bitrate=8000k | audio=mic";
+
+    #[test]
+    fn the_resolved_tier_replaces_the_request_in_both_fields() {
+        let out = annotate_session_encoder(LINE, "nvenc", &presets());
+        assert!(out.contains("| encoder=nvenc |"), "{out}");
+        assert!(out.contains("| preset=p5 |"), "{out}");
+        assert!(!out.contains("encoder=auto"), "{out}");
+    }
+
+    /// The Windows tiers with no preset namespace of their own keep the dash, so a
+    /// `requested=mf` session reads exactly as it did when the app resolved the field.
+    #[test]
+    fn a_preset_less_tier_keeps_the_dash() {
+        let out = annotate_session_encoder(LINE, "mf", &presets());
+        assert!(out.contains("| encoder=mf |"), "{out}");
+        assert!(out.contains("| preset=- |"), "{out}");
+    }
+
+    /// A concrete request that the ladder had to abandon: the file must say what RAN, which
+    /// is the whole reason the worker gets to write this field.
+    #[test]
+    fn a_fallback_to_software_is_recorded_as_software() {
+        let asked = LINE.replace("encoder=auto", "encoder=qsv");
+        let out = annotate_session_encoder(&asked, "software", &presets());
+        assert!(out.contains("| encoder=software |"), "{out}");
+        assert!(out.contains("| preset=veryfast |"), "{out}");
+    }
+
+    #[test]
+    fn every_other_field_survives_byte_identical() {
+        let out = annotate_session_encoder(LINE, "nvenc", &presets());
+        for field in LINE.split(" | ") {
+            if field.starts_with("encoder=") || field.starts_with("preset=") {
+                continue;
+            }
+            assert!(out.contains(field), "lost {field} from {out}");
+        }
+        // Same field count, so nothing was merged or dropped.
+        assert_eq!(out.split(" | ").count(), LINE.split(" | ").count());
+    }
+
+    #[test]
+    fn a_line_with_neither_field_is_returned_unchanged() {
+        let plain = "Cosmic Capture Kit | type=video | fps=30";
+        assert_eq!(annotate_session_encoder(plain, "nvenc", &presets()), plain);
+        assert_eq!(annotate_session_encoder("", "nvenc", &presets()), "");
+    }
 }
 
 /// The macOS SCK capture target for a recording (DRAGON-130). On macOS every record
@@ -971,7 +1397,9 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         // `measured_offset_ms` is intentionally not passed to `record_sck`: the SCK
         // worker feeds ffmpeg synchronously on its own thread with no delivery
         // channel to measure lag on (same reasoning as the Linux screencopy path).
-        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+        let RecordShared {
+            stop, paused, done, events, dims, warm_at, media_zero_at, settled_at, ink, live_ink, ..
+        } =
             shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
@@ -979,7 +1407,7 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
                 auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
-                &warm_at, &settled_at, &metadata, mac_target,
+                &warm_at, &media_zero_at, &settled_at, &ink, &live_ink, &metadata, mac_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -1020,7 +1448,9 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         // `measured_offset_ms` is intentionally not passed to `record_wgc`: the worker feeds
         // ffmpeg synchronously on its own thread with no delivery channel to measure lag on
         // (same reasoning as the Linux screencopy / mac SCK paths).
-        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+        let RecordShared {
+            stop, paused, done, events, dims, warm_at, media_zero_at, settled_at, ink, live_ink, ..
+        } =
             shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
@@ -1028,7 +1458,7 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
                 auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
-                &warm_at, &settled_at, &metadata, win_target,
+                &warm_at, &media_zero_at, &settled_at, &ink, &live_ink, &metadata, win_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -1052,7 +1482,9 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         // `measured_offset_ms` is intentionally not passed to `record_screencopy`: the
         // owned screencopy loop grabs and writes synchronously with no delivery channel,
         // so it has no lag figure to measure (see `record_screencopy_owned`'s doc).
-        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+        let RecordShared {
+            stop, paused, done, events, dims, warm_at, media_zero_at, settled_at, ..
+        } =
             shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
@@ -1060,7 +1492,7 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
                 auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
-                &warm_at, &settled_at, &metadata, zero_copy,
+                &warm_at, &media_zero_at, &settled_at, &metadata, zero_copy,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -1144,13 +1576,22 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
     #[cfg(not(feature = "zero-copy"))]
     let _ = zero_copy;
     {
+        // DRAGON-736: `ink` and `live_ink` reach the PORTAL workers now, and only them. A
+        // portal WINDOW cast delivers the toplevel's own buffer, so our ink surface is not in
+        // it and has to be composited in exactly as it is on macOS and Windows. The NATIVE
+        // screencopy destructuring above deliberately still takes neither: that path crops the
+        // SCREEN, so the compositor has already put the ink in the frame.
         let RecordShared {
-            stop, paused, done, events, measured_offset_ms: measured, dims, warm_at, settled_at,
+            stop, paused, done, events, measured_offset_ms: measured, dims, warm_at,
+            media_zero_at, settled_at, ink, live_ink, peek, ..
         } = shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let paused_cpu = paused.clone();
+            let ink_cpu = ink.clone();
+            let live_ink_cpu = live_ink.clone();
             let warm_cpu = warm_at.clone();
+            let media_zero_cpu = media_zero_at.clone();
             let settled_cpu = settled_at.clone();
             // The countdown gate is shared, not consumed: a zero-copy attempt that declines
             // hands the whole recording to the CPU path, which must hold for the same
@@ -1162,7 +1603,8 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
                     fd, node_id, crop, fps.max(1), &preferred_encoder, encoder_hint.as_deref(),
                     &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
                     auto_device_compensation, max_res, start_gate_cpu, &out_path, stop, paused_cpu, &events,
-                    &measured, &dims, &warm_cpu, &settled_cpu, &metadata,
+                    &measured, &dims, &warm_cpu, &media_zero_cpu, &settled_cpu, &ink_cpu,
+                    &live_ink_cpu, &metadata, &peek,
                 )
             };
             #[cfg(feature = "zero-copy")]
@@ -1171,7 +1613,7 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
                     fd, node_id, fps.max(1), &presets.codec, max_res, start_gate, mic,
                     system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation,
                     &out_path, stop.clone(), paused.clone(), &events, dims.clone(), &warm_at,
-                    &settled_at, &metadata,
+                    &media_zero_at, &settled_at, &ink, &metadata,
                 ) {
                     // The session ran (or failed on its own terms): its result IS the
                     // recording's result. Never retried — see `ZcOutcome`.
@@ -1297,6 +1739,45 @@ mod tests {
         );
     }
 
+    // DRAGON-716: the same two questions, asked of the PROGRESS-aware reaper. The probe is
+    // injected here rather than pointed at a file, which is the whole reason
+    // `wait_or_kill_progressing` takes a closure: the loop becomes deterministic and fast
+    // instead of waiting on a real encoder.
+
+    /// THE regression. This child outlives the budget many times over, and must survive,
+    /// because it is still writing. Under the constant cap this replaces it was SIGKILLed
+    /// and the recording was lost.
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child; see the group note above
+    #[test]
+    fn wait_or_kill_progressing_rides_out_a_child_that_keeps_writing() {
+        let mut child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        let mut grown = 0u64;
+        let status = wait_or_kill_progressing(&mut child, Duration::from_millis(100), || {
+            grown += 4096;
+            grown
+        })
+        .unwrap();
+        assert!(
+            status.success(),
+            "a child that is still writing must be reaped cleanly, not killed at a clock"
+        );
+    }
+
+    /// And the wedge still dies in one budget, so DRAGON-118 holds: no growth, no mercy.
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child; see the group note above
+    #[test]
+    fn wait_or_kill_progressing_kills_a_child_that_stops_writing() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let start = Instant::now();
+        let status =
+            wait_or_kill_progressing(&mut child, Duration::from_millis(200), || 4096).unwrap();
+        assert!(!status.success(), "a killed child must not report success");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a stalled pass must still be bounded, not ride out the child"
+        );
+    }
+
     #[test]
     fn muxer_alive_needs_the_file_to_outgrow_the_header() {
         let dir = std::env::temp_dir();
@@ -1399,4 +1880,89 @@ mod tests {
         );
     }
 
+}
+
+/// The progress-aware reap's one decision (DRAGON-716).
+///
+/// The rule these pin: a pass whose honest duration scales with the recording is bounded
+/// by having STOPPED WRITING, never by a wall clock, because a wall clock over that shape
+/// is a length limit that destroys long recordings.
+#[cfg(test)]
+mod reap_step_tests {
+    use super::{ReapStep, reap_step};
+    use std::time::Duration;
+
+    const STALL: Duration = Duration::from_secs(30);
+
+    /// The ordinary case the old constant budget got wrong: a long encode that keeps
+    /// writing is progressing however long it has been running in total.
+    #[test]
+    fn a_growing_output_keeps_the_pass_alive_forever() {
+        // Well past any wall-clock budget, and still not stalled, because it GREW.
+        assert_eq!(
+            reap_step(1_000, 2_000, Duration::from_secs(600), STALL),
+            ReapStep::Progressed(2_000)
+        );
+    }
+
+    /// Growth is checked FIRST, so an output that moves on the very poll where the budget
+    /// runs out is progressing rather than killed by a one-poll race.
+    #[test]
+    fn growth_beats_a_budget_that_has_just_run_out() {
+        assert_eq!(reap_step(1_000, 1_001, STALL, STALL), ReapStep::Progressed(1_001));
+        assert_eq!(
+            reap_step(1_000, 1_001, STALL + Duration::from_secs(5), STALL),
+            ReapStep::Progressed(1_001)
+        );
+    }
+
+    /// A repeated reading is the symptom being watched for, so it must NOT refresh the
+    /// clock. `>` and not `>=`.
+    #[test]
+    fn an_unchanged_size_is_not_progress() {
+        assert_eq!(reap_step(1_000, 1_000, Duration::ZERO, STALL), ReapStep::Waiting);
+        assert_eq!(reap_step(1_000, 1_000, STALL, STALL), ReapStep::Stalled);
+    }
+
+    /// `-movflags +faststart` rewrites the file to move the moov atom, and nothing
+    /// promises the size climbs monotonically while it does. A dip must not be read as
+    /// progress and hand a wedged process a free extension.
+    ///
+    /// This is also the reason `finalize::run_ink_pass` DELETES its output before every
+    /// attempt. A retry whose ffmpeg truncates a partial file back to zero would sit under
+    /// the dead attempt's high-water mark for most of its run and be killed for it, so the
+    /// software fallback would be destroyed by the very bound meant to protect it. The
+    /// contract is on the caller, and this test is why.
+    #[test]
+    fn a_shrinking_output_is_not_progress() {
+        assert_eq!(reap_step(9_000, 4_000, Duration::ZERO, STALL), ReapStep::Waiting);
+        assert_eq!(reap_step(9_000, 4_000, STALL, STALL), ReapStep::Stalled);
+        // The retry shape specifically: a fresh child starting from zero under a stale mark.
+        assert_eq!(reap_step(50_000_000, 0, STALL, STALL), ReapStep::Stalled);
+        assert_eq!(reap_step(50_000_000, 5_000_000, STALL, STALL), ReapStep::Stalled);
+    }
+
+    /// The budget edge, in the same direction `owned::keep_waiting_for_pipe` uses: strictly
+    /// inside the budget waits, and reaching it stalls.
+    #[test]
+    fn the_budget_edge_is_exclusive() {
+        assert_eq!(reap_step(0, 0, STALL - Duration::from_millis(1), STALL), ReapStep::Waiting);
+        assert_eq!(reap_step(0, 0, STALL, STALL), ReapStep::Stalled);
+    }
+
+    /// A wedge still dies in ONE budget, which is what keeps DRAGON-118 true: an output
+    /// that never grows at all reaches `Stalled` on nothing but the clock.
+    #[test]
+    fn an_output_that_never_grows_still_gets_killed() {
+        assert_eq!(reap_step(0, 0, Duration::from_secs(29), STALL), ReapStep::Waiting);
+        assert_eq!(reap_step(0, 0, Duration::from_secs(31), STALL), ReapStep::Stalled);
+    }
+
+    /// The first probe of a file that does not exist yet reads zero, and a muxer that then
+    /// writes its header is progressing. Pinned because the reaper seeds its high-water
+    /// mark from exactly that reading.
+    #[test]
+    fn a_first_byte_after_an_absent_file_is_progress() {
+        assert_eq!(reap_step(0, 1_041, Duration::from_secs(1), STALL), ReapStep::Progressed(1_041));
+    }
 }

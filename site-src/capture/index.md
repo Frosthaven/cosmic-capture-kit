@@ -83,6 +83,8 @@ region". You can press straight through it to start a region on that screen.
 - [Screenshots](screenshots.md): the delay, and the options that change how a
   screenshot looks.
 - [Recording](recording.md): starting, pausing, muting and stopping.
+- [Live annotation](live-annotation.md): drawing on the screen while a
+  recording runs.
 - [The scanner](scanner.md): QR codes, barcodes and text.
 - [The colour picker](color-picker.md): reading a colour off the screen.
 - [Keyboard shortcuts](keyboard.md): every key the overlay listens for.

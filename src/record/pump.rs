@@ -114,7 +114,21 @@ const TRACK_MIC: usize = 0;
 /// Track index for the stereo system audio (see the module doc).
 const TRACK_SYS: usize = 1;
 
-/// How far behind "now" the mixer's render horizon stays. It buys two things:
+/// Channel count of the mic track, and of the system track. Named because the writer's
+/// lockstep slice is a per-track BYTE count derived from them (see
+/// [`lockstep_slice_bytes`]), so a slice and the track it is written to can never drift
+/// apart the way two separate literals could.
+const MIC_CHANNELS: u8 = 1;
+/// See [`MIC_CHANNELS`].
+const SYS_CHANNELS: u8 = 2;
+
+/// How far behind "now" the mixer's render horizon may FALL. Since DRAGON-717 this is a
+/// floor and not the target: a cycle renders everything the sources have actually
+/// delivered ([`render_target`]) and only falls back to this position when a source has
+/// stopped delivering. Read that function first — it says why the fixed holdback could
+/// not stay, and it is where the audio's arrival time meets the video's. Everything below
+/// still holds, because this is still the maximum a source may fall behind before its
+/// audio starts being destroyed. It buys two things:
 ///
 /// 1. **The control budget.** Control events (pause, resume, per-channel mute) must be
 ///    PUSHED before the horizon reaches their media position, so this is the budget for
@@ -181,6 +195,54 @@ const _: () = assert!(
      enough to be saved, and its real audio is discarded as `late_chunks`"
 );
 
+/// Where one render cycle renders TO, given what the sources have actually delivered
+/// (`delivered`, `mixer::Mixer::delivered_through`), the [`RENDER_LAG_SECS`] holdback
+/// position (`floor`) and the session's current media position (`now`). All three are
+/// media seconds. **Pure**, and unit-tested below.
+///
+/// `RENDER_LAG_SECS` used to BE this answer: every cycle rendered to `now - 1.5s` and no
+/// further. That is a holdback the audio needs (a source may deliver up to that late) but
+/// it is NOT one the FILE can afford, because it also decides when ffmpeg SEES the audio,
+/// and ffmpeg feeds both streams through one muxer.
+///
+/// **The bug it fixes (DRAGON-717).** ffmpeg will not consume the video input more than
+/// ~0.25s ahead of the audio timestamps it has received: its scheduler holds the muxed
+/// streams in near lockstep so buffering stays bounded, which is the same gate DRAGON-712
+/// measured from the other side ("the muxer stops taking packets once the audio it has
+/// been given runs past the video it has RECEIVED"). With the audio arriving a fixed 1.5s
+/// behind wall time, the video pipe was throttled to ~1.25s behind wall for the whole
+/// session, and the capture loop then wrote its `due_video_ticks` catch-up copies of the
+/// FRESHEST frame into media positions that had elapsed during the stall. So the picture
+/// at media m was the picture from m + up to 1.5s: the file's video ran AHEAD of its own
+/// sound. Measured on the replay harness at 1.5s of holdback: content lateness max 1.461s,
+/// mean 0.687s. `-shortest` used to hide it (its 10s output sync queue absorbed the whole
+/// skew) and DRAGON-710 removed that flag because the same queue was losing recordings.
+/// Three `record::media_clock_e2e_tests` content assertions caught it.
+///
+/// **Why rendering to `delivered` is safe, and is strictly SAFER than the holdback.**
+/// Sources stamp CONTIGUOUSLY (`audio::capture::StreamAnchor`: anchor once, then count
+/// samples; holes deliver zeros), so a media position below every track's write horizon
+/// cannot still be filled by anything: rendering it destroys nothing. And because the
+/// horizon is per track and we take the MIN, a source that falls behind HOLDS the render
+/// back at its own position instead of being overrun by wall time, which is the DRAGON-411
+/// discard this constant exists to prevent. Rendering only what has arrived makes that
+/// discard impossible while any source is merely late rather than stopped.
+///
+/// **So `floor` is what `RENDER_LAG_SECS` still buys**: a source that has STOPPED
+/// delivering must not hold the whole session's audio (and now the video pipe with it),
+/// so once wall time is 1.5s past a position the render goes ahead without it and the gap
+/// is silence-filled and counted, exactly as before. The floor is a lower bound on the
+/// target, never a cap.
+///
+/// **And `now` is the cap**, because a source's contiguous stamps legitimately run AHEAD
+/// of wall time (a burst from a drained pipe). Rendering past the current media position
+/// would commit ground a pause landing an instant later must be able to take back
+/// (`Mixer::truncate_to`, DRAGON-411), so the cap is what keeps the pause exact.
+#[allow(clippy::manual_clamp)] // `floor` wins over `now` on purpose; clamp would panic instead
+fn render_target(delivered: f64, floor: f64, now: f64) -> f64 {
+    delivered.min(now).max(floor)
+}
+
 /// How many bytes ffmpeg 7.x reads from EACH f32le FIFO input before it will finish
 /// opening that input and move on to the next (DRAGON-554, measured against the Flatpak
 /// runtime's ffmpeg 7.1.3): EXACTLY 16384. 16320 bytes leave it blocked; 16384 open it.
@@ -210,10 +272,17 @@ pub(super) const FFMPEG7_INPUT_OPEN_BYTES: usize = 16384;
 /// audio plus each source's own lead-in silence — just early enough for ffmpeg's
 /// input-open to eat them. What it gives up is the horizon's late-arrival protection
 /// for the primed span ONLY: audio whose placement lands inside media [0, ~85ms) but
-/// arrives after this render (a negative sync offset, or a large latched device latency
-/// shifting a chunk earlier) is clipped and counted/logged like any late arrival.
-/// Bounded by this constant, and the trade is deliberate: without it, EVERY ffmpeg-7.x
-/// session (the Flatpak runtime) opens with ~[`RENDER_LAG_SECS`] of frozen video.
+/// arrives after this render (a negative sync offset, a large latched device latency
+/// shifting a chunk earlier, or simply the source's first real chunk straddling media 0)
+/// is clipped, counted and logged. Bounded by this constant, and the trade is deliberate:
+/// without it, EVERY ffmpeg-7.x session (the Flatpak runtime) opens with
+/// ~[`RENDER_LAG_SECS`] of frozen video.
+///
+/// It is counted and logged as ITSELF since DRAGON-743, not as a DRAGON-411 loss:
+/// `Mixer::mark_opening_prime` (called at the prime, below) is what tells the mixer this
+/// span exists, and `mixer::track`'s module doc carries the rest. Before that, this
+/// paragraph's own deliberate trade was reported to the log as destroyed audio, at
+/// `error`, on roughly two healthy sessions in five, and was misdiagnosed three times.
 pub(super) const OPENING_PRIME_FRAMES: u64 = (FFMPEG7_INPUT_OPEN_BYTES as u64 / 4) + 8;
 
 const _: () = assert!(
@@ -357,8 +426,8 @@ pub(crate) struct PumpOut {
     pub(crate) sys_stats: MixerStats,
     /// The session's final media length (seconds) — what the owned session's video
     /// loop must feed AT LEAST this many `1/fps` ticks to cover (see
-    /// [`VideoTicker::ticks_to_cover`]) so `-shortest` trims video down to audio's
-    /// end instead of truncating audio.
+    /// [`VideoTicker::ticks_to_cover`]) so the video stream cannot end short of the
+    /// audio's.
     pub(crate) final_media: f64,
 }
 
@@ -486,18 +555,114 @@ fn offset_instant(base: Instant, ms: f64) -> Instant {
     }
 }
 
-/// Interleaved `samples` → little-endian bytes, written to `w`. `false` (write
-/// failed — ffmpeg gone) is distinguished from "nothing to write" (empty slice,
-/// always `true`) so a quiet cycle never counts as a failure.
-fn write_pcm(w: &mut dyn Write, samples: &[f32]) -> bool {
-    if samples.is_empty() {
-        return true;
-    }
+/// Interleaved `samples` → little-endian bytes. The byte form is what both FIFO writers
+/// take, because [`write_pcm_pair`] slices its output and a slice boundary is a byte
+/// offset, not a sample index.
+fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
     let mut buf = vec![0u8; samples.len() * 4];
     for (i, s) in samples.iter().enumerate() {
         buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
     }
-    w.write_all(&buf).is_ok()
+    buf
+}
+
+/// How far, in MEDIA MILLISECONDS, the writer may let ONE audio FIFO run ahead of the
+/// other (DRAGON-721).
+///
+/// The writer owns both FIFOs and fills them from the same render, so either one being
+/// "ahead" is purely an artefact of the ORDER it writes them in. That order is not free:
+/// written naively it deadlocks the whole session.
+///
+/// **The deadlock.** ffmpeg will not drain one audio input while the other has no data at
+/// the same media position, the same lockstep gate DRAGON-712 measured from the muxer's
+/// side and DRAGON-717 measured on the video pipe. So a writer parked inside ONE oversized
+/// blocking write to the mic FIFO can never reach the sys FIFO; ffmpeg starves on sys, and
+/// because it starves it stops draining mic, so the mic pipe the writer is parked on never
+/// empties. Neither side can move. The session cannot even stop, because the FIFOs never
+/// reach EOF: ffmpeg outlives [`super::owned::STOP_TAIL_REAP`], is killed, and the take is
+/// salvaged with a fraction of a second of sound in it.
+///
+/// Measured on the zero-copy NVENC screencopy path, 7 runs out of 7, byte-identical: 28.0s
+/// of video with the mic stream ending at 0.384s and the system stream at 0.043s. The
+/// difference, 0.341s of mono f32le at 48kHz, is EXACTLY one 64 KiB pipe buffer, which is
+/// the writer parked mid-write with the pipe full.
+///
+/// **What made it reachable.** The writes were always ordered mic-then-sys, but before
+/// DRAGON-717 no single write was ever big enough to fill a pipe: the render horizon was a
+/// fixed 1.5s behind wall time, and `MediaClock::media_at` CLAMPS a pre-start instant to 0,
+/// so for the session's first 1.5s the render emitted nothing at all beyond the DRAGON-554
+/// opening prime (85ms, 16 KiB). DRAGON-717 made the render follow DELIVERY, which is
+/// correct and stays, but it also means the render is producing at full rate during the
+/// DRAGON-629 sys-FIFO rendezvous, so the deferred mic backlog that flushes when that
+/// rendezvous completes is now the whole rendezvous span instead of one prime.
+///
+/// **So the writer round-robins in slices of this much media time** ([`write_pcm_pair`]),
+/// which bounds the divergence to one slice however large a single render is. Nothing is
+/// dropped and nothing is reordered WITHIN a stream; only the interleaving between two
+/// independent FIFOs changes.
+const FIFO_LOCKSTEP_MS: u64 = 20;
+
+// The bound is only worth anything while it stays far inside ffmpeg's OWN interleaving
+// tolerance, because that tolerance is exactly what makes ffmpeg keep draining the leading
+// input while the other is still a slice behind. 8x is the same kind of headroom
+// DRAGON-411 keeps between the render horizon and the re-anchor threshold.
+const _: () = assert!(
+    FIFO_LOCKSTEP_MS * 1_000 * 8 <= crate::encode::INTERLEAVE_DELTA_US,
+    "the writer's FIFO lockstep slice must stay far inside -max_interleave_delta, or ffmpeg \
+     stops draining the leading audio input, the writer parks on a full pipe, and the \
+     session deadlocks with almost no sound in the file (DRAGON-721)"
+);
+
+/// How many BYTES of one track's f32le PCM carry [`FIFO_LOCKSTEP_MS`] of media time at
+/// `channels` channels. **Pure**, and unit-tested below.
+///
+/// Per track rather than one shared byte count, because the two tracks have different byte
+/// rates: the mic is mono and the system track is stereo, so equal BYTE slices would drift
+/// them apart in TIME, and time is the only unit the deadlock above is measured in. Rounded
+/// UP to a whole frame, so a slice boundary can never land inside a sample, and floored at
+/// one frame so a degenerate input can never produce a zero-length slice (which would spin).
+fn lockstep_slice_bytes(channels: u8) -> usize {
+    let frames = (crate::mixer::SAMPLE_RATE as u64 * FIFO_LOCKSTEP_MS).div_ceil(1_000).max(1);
+    frames as usize * channels.max(1) as usize * 4
+}
+
+/// Write one render's two PCM buffers to their FIFOs in ROUND-ROBIN slices, so neither is
+/// ever fed more than [`FIFO_LOCKSTEP_MS`] of media time ahead of the other. Read that
+/// constant first: it is the deadlock this exists to prevent. `false` means a write failed
+/// (ffmpeg gone); an empty pair is nothing to write and always `true`, so a quiet cycle
+/// never counts as a failure.
+///
+/// The writes stay BLOCKING, like every other pump write and for the reason DRAGON-712
+/// gives: they ARE the audio backpressure, abandoning one would drop samples, and sample
+/// count IS media time, so a dropped sample slides everything after it permanently.
+/// Bounding the DIVERGENCE is what makes blocking safe here, because ffmpeg only ever
+/// refuses to drain an input whose sibling is far behind.
+fn write_pcm_pair(
+    mic: &mut dyn Write,
+    mic_pcm: &[u8],
+    sys: &mut dyn Write,
+    sys_pcm: &[u8],
+) -> bool {
+    let (mic_slice, sys_slice) =
+        (lockstep_slice_bytes(MIC_CHANNELS), lockstep_slice_bytes(SYS_CHANNELS));
+    let (mut m, mut s) = (0usize, 0usize);
+    while m < mic_pcm.len() || s < sys_pcm.len() {
+        if m < mic_pcm.len() {
+            let end = (m + mic_slice).min(mic_pcm.len());
+            if mic.write_all(&mic_pcm[m..end]).is_err() {
+                return false;
+            }
+            m = end;
+        }
+        if s < sys_pcm.len() {
+            let end = (s + sys_slice).min(sys_pcm.len());
+            if sys.write_all(&sys_pcm[s..end]).is_err() {
+                return false;
+            }
+            s = end;
+        }
+    }
+    true
 }
 
 /// Open a FIFO's write end for the pump's own output: a bounded, non-blocking retry
@@ -614,6 +779,29 @@ fn abandon_captures(
     let _ = monitor.stop(); // bounded ≤2s (DRAGON-118); no Drop of its own
 }
 
+/// How far PAST the next tick boundary [`VideoTicker::until_next_tick`] sizes a wait
+/// (DRAGON-751).
+///
+/// It exists because the two sides of that calculation have different resolutions: the media
+/// position is `f64` seconds and a `Duration` is whole nanoseconds, so a wait sized exactly to
+/// the boundary can land a fraction of a nanosecond SHORT. The loop then wakes with nothing
+/// due, sizes the next wait at zero, wakes again immediately, and spins at full CPU instead of
+/// parking. One microsecond dwarfs that error by six orders of magnitude, and it is 0.003% of
+/// a frame period at 30fps, so it costs the pacing nothing anyone could measure.
+///
+/// Pinned by `waiting_the_returned_duration_always_wakes_with_a_tick_due`, which FAILED
+/// without it.
+const TICK_WAIT_SLACK: Duration = Duration::from_micros(1);
+
+/// The slack must stay far inside one frame period at the highest rate anyone records at,
+/// or it stops being a rounding guard and starts being a pacing change.
+const _: () = assert!(
+    TICK_WAIT_SLACK.as_nanos() * 100 < 1_000_000_000 / 240,
+    "TICK_WAIT_SLACK is meant to be invisible against a frame period; a hundred of these no \
+     longer fit inside one frame at 240fps, so it would be delaying every tick-bounded \
+     wakeup rather than just clearing a rounding error (DRAGON-751)"
+);
+
 /// The video-thread half of the pump (see the module doc's threading section): a
 /// cheap, `Arc<Mutex<MediaClock>>`-backed tick counter the owned session's frame
 /// loop queries to know how many copies of its newest frame to feed ffmpeg.
@@ -642,16 +830,109 @@ impl VideoTicker {
         self.advance_to((media * self.fps as f64).floor() as u64)
     }
 
+    /// How long from `now` until [`due_video_ticks`](Self::due_video_ticks) would owe at
+    /// least ONE tick, or `None` when waiting alone can never make one due.
+    ///
+    /// Pure and unit-tested. `None` means the clock is PAUSED (media is frozen, so no
+    /// amount of wall time owes a tick), or the degenerate `fps` of zero, or a poisoned
+    /// clock. Every one of those tells a caller "your own ceiling is the answer".
+    ///
+    /// The next tick falls due at media `(next_tick + 1) / fps`, because
+    /// `due_video_ticks` hands back `floor(media * fps) - next_tick` and, for an integer
+    /// `n`, `floor(x) >= n` exactly when `x >= n`. Media runs 1:1 with wall time while the
+    /// clock is running, so that media distance IS the wall wait.
+    ///
+    /// It never returns a wait that wakes with nothing due: at or past the deadline it
+    /// returns zero, and a wait it does hand back lands PAST the boundary by
+    /// [`TICK_WAIT_SLACK`]. That is what keeps [`Self::capture_wait`] from spinning, and it
+    /// is not theoretical: `waiting_the_returned_duration_always_wakes_with_a_tick_due`
+    /// failed at 30, 50, 60 and 120fps on the first cut of this function, which sized the
+    /// wait exactly to the boundary.
+    pub(crate) fn until_next_tick(&self, now: Instant) -> Option<Duration> {
+        if self.fps == 0 {
+            // Unreachable in production: `spawn` floors the session's fps at 1. Answered
+            // honestly anyway, since a zero here owes no tick ever.
+            return None;
+        }
+        // A poisoned clock falls back to the caller's ceiling rather than to `due_video_ticks`'s
+        // "media 0.0", which would read as a tick permanently overdue and spin the loop.
+        let Ok(clock) = self.clock.lock() else { return None };
+        if clock.is_paused_at(now) {
+            return None;
+        }
+        let target = (self.next_tick as f64 + 1.0) / self.fps as f64;
+        let remaining = target - clock.media_at(now);
+        if remaining <= 0.0 {
+            return Some(Duration::ZERO); // already owed; the caller must not wait for it
+        }
+        Some(Duration::try_from_secs_f64(remaining).unwrap_or(Duration::ZERO) + TICK_WAIT_SLACK)
+    }
+
+    /// The wait a CHANGE-DRIVEN capture loop should give its frame channel: at most
+    /// `ceiling`, and no longer than the next media tick when `tick_bounded` (DRAGON-751).
+    ///
+    /// Pure and unit-tested. This is the WHOLE decision, so the workers that call it carry
+    /// one line each and cannot drift apart. Two of the three cannot even be compiled on the
+    /// same host as the third, which is exactly why the rule lives here, where every host
+    /// proves it.
+    ///
+    /// WHY it exists: Windows WGC and macOS SCK deliver frames on CHANGE, so a recording of
+    /// a window that is not repainting delivers nothing at all and the loop parked for the
+    /// whole `ceiling`. It then paid every owed tick back to back off ONE captured frame and
+    /// ONE read of the live ink scene, so a magic marker stroke fading over a second reached
+    /// the file as about five alpha steps held six frames each, and the owner reported the
+    /// strokes vanishing "in chunks". The painter re-reads the published scene once per
+    /// tick, so waking once per tick is what makes the fade smooth. It also removes a small
+    /// skew that rode along: a burst stamped ticks spanning the whole park with ink read at
+    /// the END of it, so those frames carried ink slightly ahead of their own media position.
+    ///
+    /// `tick_bounded` is what the callers answer with `ink_live::LiveInkPainter::has_content`,
+    /// and the `false` arm returns the `ceiling` UNCHANGED, so a recording with nothing
+    /// published keeps the pacing it has always had. Read that method's doc before changing
+    /// what feeds this: the obvious-looking `active()` is true of every ordinary recording and
+    /// would tighten them all for no benefit. Pacing is all this touches either way: the media
+    /// clock already handed a burst back correctly (`due_video_ticks`), so frame counts and
+    /// durations never read wrong, which is why nothing automated noticed.
+    pub(crate) fn capture_wait(
+        &self,
+        now: Instant,
+        ceiling: Duration,
+        tick_bounded: bool,
+    ) -> Duration {
+        if !tick_bounded {
+            return ceiling;
+        }
+        self.until_next_tick(now).map_or(ceiling, |d| d.min(ceiling))
+    }
+
     /// Ticks still needed so the video's total frame count covers AT LEAST
     /// `media_secs` (rounds UP, unlike [`due_video_ticks`](Self::due_video_ticks)) —
     /// the media-clock mirror of the legacy last-frame-rewrite: called with the
     /// pump's `PumpOut::final_media` AFTER the pump's own final render, this
-    /// guarantees the video stream's total length is at least the audio's, so
-    /// `-shortest` (which ends the mux at the SHORTER stream) trims video down to
-    /// audio's exact length instead of truncating audio (see `record::pipewire`'s
-    /// owned-path stop tail for where the historical comment on this lived).
+    /// guarantees the video stream's total length is at least the audio's, so no audio
+    /// can be stranded past the end of the video (see `record::pipewire`'s owned-path
+    /// stop tail for where the historical comment on this lived).
+    ///
+    /// This used to hand the last word to `-shortest`, which trimmed the video back down
+    /// to the audio's exact length. Neither recording muxer carries that flag any more
+    /// (DRAGON-457 on the zero-copy path, DRAGON-710 on this one), so what remains is at
+    /// most a tick or two of video past the last audio sample. That is the side the
+    /// invariant was always willing to pay: the rule is video ends AT OR AFTER audio, and
+    /// it is this function, not ffmpeg, that guarantees it.
     pub(crate) fn ticks_to_cover(&mut self, media_secs: f64) -> u32 {
         self.advance_to((media_secs * self.fps as f64).ceil() as u64)
+    }
+
+    /// How many video frames this session has emitted in total (DRAGON-691 amendment 2).
+    ///
+    /// The video's length in frames, once the stop tail's covering ticks are in, which is what
+    /// bounds the ink bake: an overlay that is still being fed after the video has ended would
+    /// keep an ffmpeg alive with nothing to composite onto.
+    // Its two callers are the macOS SCK and Windows WGC record workers, so it is honestly
+    // dead on Linux, whose workers report their tick counts from their own loops.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn ticks_emitted(&self) -> u64 {
+        self.next_tick
     }
 }
 
@@ -923,35 +1204,38 @@ fn writer_loop(
                     }
                 }
             };
-            // Blocking mode is back (the guard dropped with the scope above), so the
-            // deferred mic bytes go out FIRST, ahead of anything the main loop writes.
-            if opened.is_some() && !failed && !mic_backlog.is_empty() {
-                if mic_fifo.write_all(&mic_backlog).is_err() {
-                    failed = true;
-                    log::warn!(
-                        "media-clock pump: FIFO write failed (ffmpeg gone); \
-                         stopping the session"
-                    );
-                    stop.store(true, Ordering::Relaxed);
-                } else {
-                    log::debug!(
-                        "media-clock pump: flushed {} deferred mic bytes after the system \
-                         FIFO rendezvous (DRAGON-629)",
-                        mic_backlog.len()
-                    );
-                }
-            }
             match opened {
                 Some(mut f) => {
-                    // Flush everything rendered while the open was pending, in
-                    // order, so the stream's sample count stays the media time.
-                    if !failed && !write_pcm(&mut f, &buffered) {
+                    // Blocking mode is back (the guard dropped with the scope above), so
+                    // both deferred buffers go out now, ahead of anything the main loop
+                    // writes, in order, so each stream's sample count stays its media time.
+                    //
+                    // TOGETHER, through the round-robin (DRAGON-721), never mic-then-sys.
+                    // This flush is the single largest write the pump ever makes, and it is
+                    // the one that deadlocked: the whole rendezvous span of mic went into a
+                    // pipe ffmpeg had stopped draining precisely because this sys buffer had
+                    // not been written yet. See [`FIFO_LOCKSTEP_MS`].
+                    let sys_backlog = pcm_bytes(&buffered);
+                    let deferred = !mic_backlog.is_empty() || !sys_backlog.is_empty();
+                    if !failed
+                        && deferred
+                        && !write_pcm_pair(&mut *mic_fifo, &mic_backlog, &mut f, &sys_backlog)
+                    {
                         failed = true;
                         log::warn!(
                             "media-clock pump: FIFO write failed (ffmpeg gone); \
                              stopping the session"
                         );
                         stop.store(true, Ordering::Relaxed);
+                    }
+                    if !failed && deferred {
+                        log::debug!(
+                            "media-clock pump: flushed {} deferred mic bytes and {} deferred \
+                             system bytes after the system FIFO rendezvous, interleaved in \
+                             {FIFO_LOCKSTEP_MS}ms slices (DRAGON-629, DRAGON-721)",
+                            mic_backlog.len(),
+                            sys_backlog.len()
+                        );
                     }
                     Box::new(f)
                 }
@@ -979,7 +1263,13 @@ fn writer_loop(
         if failed {
             continue;
         }
-        if !write_pcm(&mut *mic_fifo, &step.mic) || !write_pcm(&mut *sys_fifo, &step.sys) {
+        // Round-robin, never mic-then-sys (DRAGON-721): one render's step is normally a
+        // few tens of milliseconds, but it is not bounded: the first cycle after the
+        // DRAGON-554 opening prime can carry the whole bring-up span now that the render
+        // follows delivery (DRAGON-717), and one step larger than a pipe buffer is all the
+        // deadlock in [`FIFO_LOCKSTEP_MS`] needs.
+        let (mic_pcm, sys_pcm) = (pcm_bytes(&step.mic), pcm_bytes(&step.sys));
+        if !write_pcm_pair(&mut *mic_fifo, &mic_pcm, &mut *sys_fifo, &sys_pcm) {
             failed = true;
             log::warn!("media-clock pump: FIFO write failed (ffmpeg gone); stopping the session");
             stop.store(true, Ordering::Relaxed);
@@ -1037,8 +1327,8 @@ impl MediaClockPump {
         writer_tx: std::sync::mpsc::Sender<PcmStep>,
     ) -> Self {
         let mixer = Mixer::with_clock(MixMode::Final, clock.clone(), &[
-            TrackSpec { channels: 1, initial_gain: 1.0, label: "mic" }, // TRACK_MIC
-            TrackSpec { channels: 2, initial_gain: 1.0, label: "system" }, // TRACK_SYS
+            TrackSpec { channels: MIC_CHANNELS, initial_gain: 1.0, label: "mic" }, // TRACK_MIC
+            TrackSpec { channels: SYS_CHANNELS, initial_gain: 1.0, label: "system" }, // TRACK_SYS
         ]);
         Self {
             mixer,
@@ -1140,6 +1430,12 @@ impl MediaClockPump {
     /// `Mixer::render`) when `until_media` doesn't advance the horizon. The send
     /// never blocks (unbounded channel) — see the module doc's threading section;
     /// a hung-up writer (session already failing) just discards.
+    /// Mark the render just issued as DRAGON-554's opening prime (DRAGON-743): see
+    /// `Mixer::mark_opening_prime`. Called once, from `spawn`, straight after the prime.
+    fn mark_opening_prime(&mut self) {
+        self.mixer.mark_opening_prime();
+    }
+
     fn render_to(&mut self, until_media: f64) {
         let out = self.mixer.render(until_media);
         self.automation.extend(out.automation);
@@ -1152,13 +1448,19 @@ impl MediaClockPump {
         let _ = self.writer_tx.send(PcmStep { mic, sys });
     }
 
-    /// One render cycle at wall time `now`: render up to `media_at(now - LAG) +
-    /// EPSILON` (see [`RENDER_LAG_SECS`] and the module doc's "why the epsilon").
+    /// One render cycle at wall time `now`: render up to what every source has actually
+    /// delivered, bounded below by `media_at(now - LAG)` and above by `media_at(now)`,
+    /// all nudged by EPSILON (see [`render_target`], [`RENDER_LAG_SECS`] and the module
+    /// doc's "why the epsilon").
     fn render_cycle(&mut self, now: Instant) {
+        let delivered = self.mixer.delivered_through();
         let target = self
             .clock
             .lock()
-            .map(|c| c.media_at(now - Duration::from_secs_f64(RENDER_LAG_SECS)) + RENDER_EPSILON_SECS)
+            .map(|c| {
+                let floor = c.media_at(now - Duration::from_secs_f64(RENDER_LAG_SECS));
+                render_target(delivered, floor, c.media_at(now)) + RENDER_EPSILON_SECS
+            })
             .unwrap_or(0.0);
         self.render_to(target);
     }
@@ -1234,6 +1536,13 @@ fn frames_to_secs(frames: u64) -> f64 {
 ///   before media 0; signed placement keeps whatever tail of them belongs in the file and
 ///   drops the rest. Nothing is missing from the recording. Only [`MixerStats::late_frames`]
 ///   — the part of a drop at media >= 0 — is audio the user actually lost.
+/// - [`MixerStats::opening_late_frames`] is the third counter in that family, and it is
+///   read the same way (DRAGON-743): a drop inside DRAGON-554's opening prime is real
+///   audio, but it is the prime's own documented trade, it is bounded by
+///   [`OPENING_PRIME_FRAMES`] (85.5ms at the head of the file), and it lands on roughly
+///   two healthy sessions in five. Classifying it `Lost` put this line at `error` on
+///   healthy recordings, so it does not raise the level. It still PRINTS, as `opening=`,
+///   which is what lets a reader reconcile `late=4` with `lost=0.000s`.
 /// - `gap_samples` USED to be non-zero on every session too — 54-136ms on both tracks
 ///   across all seven E2E sessions — because it lumped the source's LEAD-IN (silence
 ///   before its first sample, which is not a defect: nothing is missing, the source had
@@ -1255,24 +1564,30 @@ fn audio_health(mic: &MixerStats, sys: &MixerStats) -> AudioHealth {
 /// (DRAGON-411/419): discarded audio is an `error` — it is unrecoverable data loss from
 /// the user's recording — written silence is a `warn`, and a clean session stays the
 /// historical `info`. `paused_drop` never raises the level on its own (a paused pipeline
-/// captures nothing, by design).
+/// captures nothing, by design). Neither does `opening` (DRAGON-743): it is the opening
+/// prime's own trade, see [`audio_health`].
 ///
-/// Raw counts stay in the line even when they do not raise the level: `late=2 lost=0.000s
-/// pre_start=2` reads as "two chunks dropped, none of it yours", which is exactly what a
-/// reader needs to not chase it.
+/// Raw counts stay in the line even when they do not raise the level: `late=4 lost=0.000s
+/// opening=0.020s pre_start=3` reads as "four chunks dropped, three predate the file and
+/// the fourth cost 20ms of its head to the prime", which is exactly what a reader needs
+/// to not chase it.
 fn log_audio_health(final_media: f64, mic: &MixerStats, sys: &MixerStats) {
     let line = format!(
         "media-clock pump finished: media={final_media:.3}s \
-         mic(late={} lost={:.3}s paused_drop={} pre_start={} gap={:.3}s lead_in={:.3}s) \
-         sys(late={} lost={:.3}s paused_drop={} pre_start={} gap={:.3}s lead_in={:.3}s)",
+         mic(late={} lost={:.3}s opening={:.3}s paused_drop={} pre_start={} gap={:.3}s \
+         lead_in={:.3}s) \
+         sys(late={} lost={:.3}s opening={:.3}s paused_drop={} pre_start={} gap={:.3}s \
+         lead_in={:.3}s)",
         mic.late_chunks,
         frames_to_secs(mic.late_frames),
+        frames_to_secs(mic.opening_late_frames),
         mic.discarded_paused_chunks,
         mic.pre_start_chunks,
         frames_to_secs(mic.gap_samples),
         frames_to_secs(mic.leading_gap_samples),
         sys.late_chunks,
         frames_to_secs(sys.late_frames),
+        frames_to_secs(sys.opening_late_frames),
         sys.discarded_paused_chunks,
         sys.pre_start_chunks,
         frames_to_secs(sys.gap_samples),
@@ -1419,6 +1734,11 @@ fn run(
     // far, so this emits the same opening bytes the horizon would have emitted at
     // wall 1.5s. See OPENING_PRIME_FRAMES' doc for the bounded late-arrival trade.
     pump.render_to(OPENING_PRIME_FRAMES as f64 / crate::mixer::SAMPLE_RATE as f64);
+    // ...and tell the mixer that THAT render was the prime, so the late-arrival trade
+    // this constant's doc describes reads as the deliberate decision it is instead of as
+    // destroyed audio (DRAGON-743). It has to be here, right after the render: the mark
+    // is the prime's own reach, measured, not a constant copied into the mixer.
+    pump.mark_opening_prime();
     log::debug!(
         "media-clock pump: opening prime rendered ({OPENING_PRIME_FRAMES} frames per track) \
          so the muxer's input-open never waits on the render horizon (DRAGON-554)"
@@ -1774,6 +2094,194 @@ mod tests {
         );
     }
 
+    // ── render_target: what one cycle renders to (DRAGON-717) ────────────────────
+    //
+    // The three inputs are the three questions the horizon has to answer at once: how
+    // far has the audio actually arrived, how long may a stopped source hold everything
+    // back, and how far has the session itself got.
+
+    #[test]
+    fn a_healthy_session_renders_everything_its_sources_delivered() {
+        // Delivered 4.95s, wall at 5.0s, floor 3.5s: the audio reaches ffmpeg ~50ms
+        // behind wall instead of 1.5s behind, which is what keeps the muxer from
+        // throttling the video pipe.
+        assert_eq!(render_target(4.95, 3.5, 5.0), 4.95);
+    }
+
+    #[test]
+    fn a_stopped_source_is_left_behind_at_the_floor_not_before_it() {
+        // Nothing has arrived since 1.0s and wall is now 5.0s: the floor (5.0 - 1.5)
+        // carries the session on, silence-filling the stalled track exactly as the fixed
+        // holdback always did. Never renders less than the floor.
+        assert_eq!(render_target(1.0, 3.5, 5.0), 3.5);
+    }
+
+    #[test]
+    fn a_source_stamping_ahead_of_wall_time_is_capped_at_now() {
+        // A drained pipe delivers a burst whose contiguous stamps run past wall time.
+        // Rendering it would commit media positions a pause landing this instant must
+        // still be able to take back (`Mixer::truncate_to`).
+        assert_eq!(render_target(5.4, 3.5, 5.0), 5.0);
+    }
+
+    #[test]
+    fn the_floor_wins_even_when_it_is_past_now() {
+        // Degenerate, but it must not panic or invert: `f64::clamp` panics when min >
+        // max, which is why this is a min/max pair and not a clamp.
+        assert_eq!(render_target(0.0, 2.0, 1.0), 2.0);
+    }
+
+    #[test]
+    fn the_opening_renders_nothing_before_anything_has_been_delivered() {
+        // Wall 0.2s into the session and nothing delivered yet. The floor is 0.0 here
+        // because `MediaClock::media_at` CLAMPS a pre-start instant to media 0, so for
+        // the session's first `RENDER_LAG_SECS` the floor simply is 0. The target stays
+        // at 0 rather than committing (and silence-filling) ground the sources are about
+        // to fill. Covering the opening is the DRAGON-554 prime's job, and it renders
+        // explicitly rather than through a cycle.
+        assert_eq!(render_target(0.0, 0.0, 0.2), 0.0);
+    }
+
+    // ── the writer's FIFO lockstep (DRAGON-721) ──────────────────────────────────
+    //
+    // What these pin is one sentence: the writer may never hand one audio FIFO more than
+    // `FIFO_LOCKSTEP_MS` of media time more than the other, because ffmpeg stops draining
+    // an input whose sibling is far behind and the writer then parks on a full pipe with
+    // no way to feed the sibling. See `FIFO_LOCKSTEP_MS` for the measured failure.
+
+    #[test]
+    fn a_lockstep_slice_is_the_same_media_time_on_both_tracks() {
+        // Mono and stereo have different BYTE rates, so the slices must differ in bytes to
+        // be equal in time: 20ms is 960 frames, 3840 bytes mono and 7680 stereo.
+        assert_eq!(lockstep_slice_bytes(MIC_CHANNELS), 3840);
+        assert_eq!(lockstep_slice_bytes(SYS_CHANNELS), 7680);
+        let secs = |b: usize, ch: u8| b as f64 / 4.0 / ch as f64 / crate::mixer::SAMPLE_RATE as f64;
+        assert!(
+            (secs(lockstep_slice_bytes(MIC_CHANNELS), MIC_CHANNELS)
+                - secs(lockstep_slice_bytes(SYS_CHANNELS), SYS_CHANNELS))
+            .abs()
+                < 1e-9,
+            "equal BYTE slices would drift the two FIFOs apart in TIME, which is the only \
+             unit the deadlock is measured in"
+        );
+    }
+
+    #[test]
+    fn a_lockstep_slice_is_always_a_whole_frame_and_never_empty() {
+        // A slice boundary landing inside a sample would corrupt the stream; a zero-length
+        // slice would spin the round-robin forever.
+        for ch in [1u8, 2, 4] {
+            let b = lockstep_slice_bytes(ch);
+            assert!(b > 0, "channels={ch}");
+            assert_eq!(b % (ch as usize * 4), 0, "channels={ch}");
+        }
+        assert!(lockstep_slice_bytes(0) > 0, "a degenerate channel count must not spin");
+    }
+
+    /// A `Write` that records the ORDER and size of what it is given, tagged by track, into
+    /// one shared log, which is the only thing these tests are about.
+    struct TapSink(std::sync::Arc<std::sync::Mutex<Vec<(char, usize)>>>, char);
+    impl Write for TapSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push((self.1, buf.len()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_big_render_is_interleaved_and_neither_fifo_runs_a_slice_ahead() {
+        // One second of each track in a single step: what the DRAGON-629 rendezvous flush
+        // became once DRAGON-717 let the render follow delivery. Before this, the mic went
+        // out as ONE 192000-byte blocking write with the system FIFO untouched behind it.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mic = TapSink(log.clone(), 'm');
+        let mut sys = TapSink(log.clone(), 's');
+        let mic_pcm = vec![0u8; 48_000 * 4];
+        let sys_pcm = vec![0u8; 48_000 * 2 * 4];
+        assert!(write_pcm_pair(&mut mic, &mic_pcm, &mut sys, &sys_pcm));
+
+        let (mut m, mut s, mut worst) = (0i64, 0i64, 0.0f64);
+        for (who, n) in log.lock().unwrap().iter() {
+            if *who == 'm' {
+                m += *n as i64;
+            } else {
+                s += *n as i64;
+            }
+            let secs = |b: i64, ch: i64| b as f64 / 4.0 / ch as f64 / 48_000.0;
+            worst = worst.max((secs(m, 1) - secs(s, 2)).abs());
+        }
+        assert_eq!(m as usize, mic_pcm.len(), "every mic byte must still be written");
+        assert_eq!(s as usize, sys_pcm.len(), "every system byte must still be written");
+        assert!(
+            worst <= FIFO_LOCKSTEP_MS as f64 / 1000.0 + 1e-9,
+            "the two FIFOs diverged by {worst:.4}s, past the {FIFO_LOCKSTEP_MS}ms bound"
+        );
+        assert!(
+            log.lock().unwrap().len() > 2,
+            "a whole second per track must not go out as one write per FIFO"
+        );
+    }
+
+    #[test]
+    fn a_short_render_still_goes_out_in_one_write_each() {
+        // The steady case must not pay for the bound: a normal cycle is well under one
+        // slice, so it stays exactly one write per FIFO, as it always was.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mic = TapSink(log.clone(), 'm');
+        let mut sys = TapSink(log.clone(), 's');
+        assert!(write_pcm_pair(&mut mic, &vec![0u8; 480 * 4], &mut sys, &vec![0u8; 480 * 2 * 4]));
+        assert_eq!(*log.lock().unwrap(), vec![('m', 1920), ('s', 3840)]);
+    }
+
+    #[test]
+    fn an_empty_pair_writes_nothing_and_is_not_a_failure() {
+        // A quiet cycle (or a track that is off) must never read as "ffmpeg gone".
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mic = TapSink(log.clone(), 'm');
+        let mut sys = TapSink(log.clone(), 's');
+        assert!(write_pcm_pair(&mut mic, &[], &mut sys, &[]));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_side_being_empty_still_drains_the_other() {
+        // Nothing about the round-robin may stall on the track that has no bytes.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mic = TapSink(log.clone(), 'm');
+        let mut sys = TapSink(log.clone(), 's');
+        assert!(write_pcm_pair(&mut mic, &vec![0u8; 20_000], &mut sys, &[]));
+        let total: usize = log.lock().unwrap().iter().map(|(_, n)| n).sum();
+        assert_eq!(total, 20_000);
+        assert!(log.lock().unwrap().iter().all(|(w, _)| *w == 'm'));
+    }
+
+    /// A `Write` that fails once its budget of successful calls runs out: a dead ffmpeg.
+    struct DyingSink(u32);
+    impl Write for DyingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.0 -= 1;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_dead_pipe_stops_the_pair_and_reports_it() {
+        // The caller trips `stop` on `false`; the round-robin must not swallow the failure
+        // or loop on it.
+        let mut mic = DyingSink(1);
+        let mut sys = DyingSink(u32::MAX);
+        assert!(!write_pcm_pair(&mut mic, &vec![0u8; 200_000], &mut sys, &vec![0u8; 200_000]));
+    }
+
     #[test]
     fn audio_health_reads_loss_padding_and_a_clean_session_apart() {
         let clean = MixerStats::default();
@@ -1804,6 +2312,23 @@ mod tests {
         let lost = MixerStats { late_chunks: 1, late_frames: 480, ..MixerStats::default() };
         assert_eq!(audio_health(&lost, &clean), AudioHealth::Lost);
         assert_eq!(audio_health(&big_gap, &lost), AudioHealth::Lost);
+        // And the third counter in that family (DRAGON-743): a drop inside DRAGON-554's
+        // opening prime is real audio, but the prime is a decision this recorder took on
+        // purpose, bounded to OPENING_PRIME_FRAMES at the head of the file. It lands on
+        // roughly two healthy sessions in five, so it must not escalate the line either.
+        // The owner's reported session, exactly: `late=4 lost=0.000s opening=0.020s
+        // pre_start=3`.
+        let opening = MixerStats {
+            late_chunks: 4,
+            pre_start_chunks: 3,
+            opening_late_frames: 960,
+            leading_gap_samples: 4_104,
+            ..MixerStats::default()
+        };
+        assert_eq!(audio_health(&clean, &opening), AudioHealth::Clean, "the prime's own trade");
+        // ...and it never masks a real loss on the same track.
+        let both = MixerStats { late_frames: 480, ..opening };
+        assert_eq!(audio_health(&clean, &both), AudioHealth::Lost);
     }
 
     #[test]
@@ -2592,5 +3117,163 @@ mod pending_rendezvous_tests {
         assert!(untouched.contains("duck(off)"), "{untouched}");
         assert!(untouched.contains("sys_in=-60.0dBFS"), "{untouched}");
         assert!(untouched.contains("sys_out=-60.0dBFS"), "{untouched}");
+    }
+}
+
+/// DRAGON-751: the wait a change-driven capture loop gives its frame channel.
+///
+/// Its own module because it is its own decision, and because the two workers that most
+/// need it (macOS SCK, Windows WGC) are each invisible to the other's compiler. These
+/// tests run on every host.
+#[cfg(test)]
+mod capture_wait_tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    fn base() -> Instant {
+        Instant::now()
+    }
+    fn secs(s: f64) -> StdDuration {
+        StdDuration::from_secs_f64(s)
+    }
+
+    /// 200ms, the ceiling every change-driven loop passes in, spelled once here.
+    const CEILING: StdDuration = StdDuration::from_millis(200);
+
+    fn ticker_at(t0: Instant, fps: u32) -> VideoTicker {
+        VideoTicker { clock: Arc::new(Mutex::new(MediaClock::new(t0))), fps, next_tick: 0 }
+    }
+
+    #[test]
+    fn a_freshly_paid_tick_leaves_about_one_frame_period_to_wait() {
+        let t0 = base();
+        let mut ticker = ticker_at(t0, 30);
+        // Pay the ticks owed at 100ms (3 of them at 30fps), which is what the loop does
+        // right before it goes back to waiting.
+        assert_eq!(ticker.due_video_ticks(t0 + secs(0.1)), 3);
+        // Tick 4 falls due at media 4/30 = 133.3ms, so 33.3ms from here, plus the rounding
+        // slack that keeps the wakeup on the far side of the boundary.
+        let left = ticker.until_next_tick(t0 + secs(0.1)).expect("running clock");
+        let over = left.as_secs_f64() - 1.0 / 30.0;
+        assert!(
+            (0.0..=2.0 * TICK_WAIT_SLACK.as_secs_f64()).contains(&over),
+            "one frame period plus the slack and no more, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn at_or_past_the_deadline_the_wait_is_zero() {
+        let t0 = base();
+        // 25fps, so tick 1 falls due at media 40ms EXACTLY, a whole number of nanoseconds.
+        // 30fps would not do here: its 33.3ms period is not a whole nanosecond count, so the
+        // test could not name the boundary instant without landing a fraction short of it.
+        let ticker = ticker_at(t0, 25);
+        // Nothing paid yet. Exactly at the boundary, and well past it, both owe a tick
+        // already and must not ask the caller to wait for one.
+        assert_eq!(
+            ticker.until_next_tick(t0 + StdDuration::from_millis(40)),
+            Some(StdDuration::ZERO)
+        );
+        assert_eq!(ticker.until_next_tick(t0 + secs(5.0)), Some(StdDuration::ZERO));
+    }
+
+    /// The anti-spin property, and the one that makes the fix safe: sleeping for exactly
+    /// what [`VideoTicker::until_next_tick`] returns must ALWAYS wake with at least one tick
+    /// due. If it could wake with zero due, the loop would spin at full CPU on a window that
+    /// never repaints, which is precisely the session this ticket is about.
+    #[test]
+    fn waiting_the_returned_duration_always_wakes_with_a_tick_due() {
+        for fps in [24u32, 25, 30, 50, 60, 120] {
+            let t0 = base();
+            let mut ticker = ticker_at(t0, fps);
+            let mut now = t0;
+            for step in 0..40 {
+                let wait = ticker.until_next_tick(now).expect("running clock");
+                now += wait;
+                let due = ticker.due_video_ticks(now);
+                assert!(
+                    due >= 1,
+                    "fps {fps} step {step}: waited {wait:?} and nothing was due"
+                );
+            }
+        }
+    }
+
+    /// The same alignment through the `capture_wait` ceiling. At every fps we ship, one
+    /// frame period is inside 200ms, so the ceiling never truncates a steady-state wait and
+    /// the loop still wakes with work.
+    #[test]
+    fn the_ceiling_never_truncates_a_steady_state_wait() {
+        for fps in [24u32, 30, 60, 120] {
+            let t0 = base();
+            let mut ticker = ticker_at(t0, fps);
+            let mut now = t0;
+            for _ in 0..10 {
+                let wait = ticker.capture_wait(now, CEILING, true);
+                assert!(wait < CEILING, "fps {fps}: {wait:?} should be inside the ceiling");
+                now += wait;
+                assert!(ticker.due_video_ticks(now) >= 1, "fps {fps}");
+            }
+        }
+    }
+
+    /// A session that paints nothing keeps today's pacing exactly. This is the byte-identity
+    /// half of the fix: the no-ink path must be indistinguishable from the code before it.
+    #[test]
+    fn a_session_that_paints_nothing_gets_the_plain_ceiling() {
+        let t0 = base();
+        let mut ticker = ticker_at(t0, 30);
+        assert_eq!(ticker.capture_wait(t0, CEILING, false), CEILING);
+        // Still the ceiling deep into a session, and still the ceiling where the tick-bounded
+        // arm would have answered zero.
+        assert_eq!(ticker.due_video_ticks(t0 + secs(0.1)), 3);
+        assert_eq!(ticker.capture_wait(t0 + secs(0.1), CEILING, false), CEILING);
+        assert_eq!(ticker.capture_wait(t0 + secs(5.0), CEILING, false), CEILING);
+    }
+
+    /// A paused clock owes no tick however long anyone waits, so the answer is the caller's
+    /// ceiling and not a zero. A zero here would spin the loop for the whole pause.
+    #[test]
+    fn a_paused_clock_hands_back_the_ceiling_rather_than_a_zero() {
+        let t0 = base();
+        let mut ticker = ticker_at(t0, 30);
+        {
+            let mut c = ticker.clock.lock().unwrap();
+            c.pause(t0 + secs(1.0));
+        }
+        // Pay everything owed up to the pause, which is what the loop does on its last
+        // unpaused cycle. Without this the ticker is a whole second behind and every answer
+        // below is "already overdue", which says nothing about the pause.
+        assert_eq!(ticker.due_video_ticks(t0 + secs(1.0)), 30);
+        assert_eq!(ticker.until_next_tick(t0 + secs(2.0)), None);
+        assert_eq!(ticker.capture_wait(t0 + secs(2.0), CEILING, true), CEILING);
+        // Running again on resume, at media 1.0 with tick 31 due at media 31/30: back to
+        // about one frame period, with no credit for the paused stretch.
+        {
+            let mut c = ticker.clock.lock().unwrap();
+            c.resume(t0 + secs(3.0));
+        }
+        let wait = ticker.capture_wait(t0 + secs(3.0), CEILING, true);
+        assert!(wait > StdDuration::ZERO && wait < CEILING, "{wait:?}");
+    }
+
+    /// A LOW fps puts the next tick past 200ms, and there the ceiling must win: the wait is
+    /// what the loop has always used, and the tick is simply already overdue when it wakes.
+    #[test]
+    fn a_tick_further_out_than_the_ceiling_is_capped_by_it() {
+        let t0 = base();
+        let ticker = ticker_at(t0, 2); // 500ms per frame
+        assert_eq!(ticker.capture_wait(t0, CEILING, true), CEILING);
+    }
+
+    /// Total by construction: a zero fps owes no tick ever, so it must not read as one
+    /// permanently overdue. Unreachable in production (`spawn` floors fps at 1), pinned so a
+    /// future caller cannot discover it the expensive way.
+    #[test]
+    fn a_zero_fps_owes_no_tick_and_takes_the_ceiling() {
+        let t0 = base();
+        let ticker = ticker_at(t0, 0);
+        assert_eq!(ticker.until_next_tick(t0), None);
+        assert_eq!(ticker.capture_wait(t0, CEILING, true), CEILING);
     }
 }

@@ -272,7 +272,7 @@ impl crate::app::App {
         // their plans apply the very same 4096 / 8192 side limits as the rest.
         if !matches!(
             backend.as_str(),
-            "nvenc" | "vaapi" | "amf" | "qsv" | "videotoolbox" | "software"
+            "nvenc" | "vaapi" | "amf" | "qsv" | "mf" | "videotoolbox" | "software"
         ) {
             return None;
         }

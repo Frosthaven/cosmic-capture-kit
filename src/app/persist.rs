@@ -7,7 +7,7 @@ impl App {
 
     /// The current settings as a `Persisted`.
     fn to_persisted(&self) -> crate::state::Persisted {
-        // When the settings window is open (via `--settings` OR the gear button), this
+        // When the settings window is open (via `settings` OR the gear button), this
         // instance is no longer the live region editor — its `self.region` is whatever
         // it loaded at launch, which is stale the moment another overlay draws a new
         // box. Writing it back would clobber that newer region (the "changing a setting
@@ -21,7 +21,10 @@ impl App {
         };
         crate::state::Persisted {
             region,
-            delay_idx: self.delay_idx,
+            // DRAGON-695: the countdown persists as SECONDS. `delay_idx` is a chip
+            // highlight now, not a setting, and the schema no longer writes it.
+            delay_idx: 0,
+            countdown_secs: self.countdown_secs.value,
             capture_cursor: self.capture_cursor,
             capture_transparency: self.capture_transparency,
             no_wallpaper: !self.capture_wallpaper,
@@ -198,6 +201,7 @@ impl App {
             preview_video_save_originals: self.preview_video_save_originals,
             preview_video_ask_to_save: self.preview_video_ask_to_save,
             mute_others_during_preview: self.mute_others_during_preview,
+            pause_others_during_ink: self.pause_others_during_ink,
             duck_system_audio: self.duck_system_audio,
             appearance_use_system: self.appearance_use_system,
             appearance_mode: self.appearance_mode,
@@ -216,7 +220,8 @@ impl App {
     pub(super) fn apply_persisted(&mut self, p: crate::state::Persisted) {
         crate::state::save(&p);
         self.region = p.region.map(GlobalRect::from_tuple);
-        self.delay_idx = p.delay_idx.min(DELAYS.len() - 1);
+        self.countdown_secs.set_value(p.countdown_secs.min(99));
+        self.delay_idx = countdown_index(self.countdown_secs.value);
         self.capture_cursor = p.capture_cursor;
         self.capture_transparency = p.capture_transparency;
         self.capture_wallpaper = !p.no_wallpaper;
@@ -345,6 +350,7 @@ impl App {
         self.preview_video_save_originals = p.preview_video_save_originals;
         self.preview_video_ask_to_save = p.preview_video_ask_to_save;
         self.mute_others_during_preview = p.mute_others_during_preview;
+        self.pause_others_during_ink = p.pause_others_during_ink;
         self.duck_system_audio = p.duck_system_audio;
         self.appearance_use_system = p.appearance_use_system;
         self.appearance_mode = p.appearance_mode.min(2);
@@ -490,6 +496,7 @@ impl App {
                     }
                     settings::AudioVideoTab::Mixing => {
                         p.mute_others_during_preview = d.mute_others_during_preview;
+                        p.pause_others_during_ink = d.pause_others_during_ink;
                         p.duck_system_audio = d.duck_system_audio;
                         p.audio_sync_auto = d.audio_sync_auto;
                         p.audio_sync_offset_ms = d.audio_sync_offset_ms;

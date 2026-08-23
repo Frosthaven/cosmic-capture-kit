@@ -84,9 +84,19 @@ ENV PATH=/usr/local/cargo/bin:$PATH
 COPY pins.env /opt/pins.env
 
 # ── x264 (the software H.264 encoder ffmpeg's fallback tier uses) ─────────────
+#
+# X264_URL IS A MIRROR LIST since DRAGON-689, so it is unquoted and walked, the
+# same shape the ffmpeg tarball fetch below uses. Quoting it would hand curl one
+# URL made of two joined by a space. The sha256 below still gates whichever
+# mirror answered, so a second host is availability and never trust.
 RUN . /opt/pins.env \
  && cd /tmp \
- && curl -sSL -o x264.tar.xz "$X264_URL" \
+ && fetch_any() { local out="$1"; shift; for u in "$@"; do \
+        curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 \
+             --speed-time 30 --speed-limit 1024 -o "$out" "$u" && return 0; \
+        echo "mirror failed, trying the next: $u" >&2; \
+    done; echo "every mirror failed for $out" >&2; return 1; } \
+ && fetch_any x264.tar.xz $X264_URL \
  && echo "$X264_SHA256  x264.tar.xz" | sha256sum -c - \
  && tar xJf x264.tar.xz \
  && cd "x264-$X264_VERSION" \

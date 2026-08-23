@@ -158,7 +158,7 @@ impl App {
     /// surface (a pre-opened spinner), so several seams call this and only the first one
     /// with a path does anything.
     ///
-    /// * A `--preview` file is NOT copied: it is the user's own file, opened as a viewer,
+    /// * An `editor` file is NOT copied: it is the user's own file, opened as a viewer,
     ///   and silently hijacking their clipboard for it was never asked for.
     /// * An IMAGE over the clipboard SIZE LIMIT ([`crate::share::AUTO_COPY_MAX_BYTES`], a
     ///   fixed constant since DRAGON-353 removed the setting) is skipped with an error toast
@@ -457,7 +457,7 @@ impl App {
         };
         let external = p.external;
         let fallback_monitor = p.monitor;
-        // `--preview` files anchor to the active output (None); in-app captures to the
+        // `editor` files anchor to the active output (None); in-app captures to the
         // capture monitor — the same anchoring as `toggle_preview_appearance`.
         let (output, monitor) = if external {
             (None, fallback_monitor)
@@ -486,7 +486,7 @@ impl App {
     ///   (DRAGON-353 follow-up — `path` stays pinned to the media, so the naming rule reads
     ///   the save side explicitly rather than assuming the two are the same).
     /// * the configured folder for this media kind (`screenshot_dir` / `record_dir`), which
-    ///   DRAGON-467 keeps as THE basis for the Save action. An EXTERNAL `--preview` document
+    ///   DRAGON-467 keeps as THE basis for the Save action. An EXTERNAL `editor` document
     ///   gets `None` instead: it is the user's own file, so it saves back to its own folder,
     ///   not into the capture folder.
     /// * DRAGON-455: a STILL is written as PNG, so its target NAMES png — forced BEFORE the

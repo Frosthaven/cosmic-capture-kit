@@ -7,6 +7,8 @@
 //! Split into [`outline`] (the rxing-based detection + computer-vision geometry, where
 //! the `rxing` types stay) and [`action`] (the pure click-action / URI builders).
 
+use crate::errln;
+
 mod action;
 mod outline;
 
@@ -60,7 +62,7 @@ pub fn scan_codes(img: &image::RgbaImage, rx: i32, ry: i32, rw: u32, rh: u32) ->
             continue;
         }
         if std::env::var_os("CCK_DUMP_POINTS").is_some() {
-            eprintln!(
+            errln!(
                 "RAW {:?} n={} pts={:?}",
                 res.getBarcodeFormat(),
                 pts.len(),

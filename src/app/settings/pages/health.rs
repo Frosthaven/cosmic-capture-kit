@@ -73,7 +73,7 @@ impl crate::app::App {
     ///
     /// The second row (DRAGON-491, macOS only, no other OS has TCC grants to manage) opens the
     /// permission-checker window (`app::permissions`) directly from Settings, rather than only
-    /// via `--permissions` or missing-grant routing.
+    /// via `permissions` or missing-grant routing.
     fn debug_section(&self) -> SectionSpec<'_> {
         let control = widget::row(vec![
             open_folder_btn(Msg::WindowChrome(WindowChromeMsg::OpenDebugLogFolder)),

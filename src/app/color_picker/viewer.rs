@@ -2,7 +2,7 @@
 //!
 //! # What it is, and what it deliberately is not
 //!
-//! `--palette-viewer` opens the window a pick would have opened, with NO overlay and NO
+//! `color --viewer` opens the window a pick would have opened, with NO overlay and NO
 //! pick. The owner's framing is the whole specification: the user wants to see and reuse
 //! the palette they have already built, and asking them to sample a pixel first, just to
 //! reach a list of colours they saved earlier, is a toll on a window that is already

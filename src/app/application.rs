@@ -52,7 +52,7 @@ fn mark_first_view() {
 
 impl cosmic::Application for App {
     type Executor = cosmic::executor::Default;
-    /// How the app was launched (`--settings`, `--preview <file>`, or a normal capture).
+    /// How the app was launched (`settings`, `editor <file>`, or a normal capture).
     type Flags = super::Startup;
     type Message = Msg;
     const APP_ID: &'static str = "dev.thedragon.CosmicCaptureKit";
@@ -83,18 +83,18 @@ impl cosmic::Application for App {
         // "this touches the disk, get it off the loop" worker in the app.
         std::thread::spawn(crate::util::sweep_transient_recordings);
         let settings_only = startup.settings_only;
-        // DRAGON-680: `--palette-viewer`, the colour picker's result window on its own.
+        // DRAGON-680: `color --viewer`, the colour picker's result window on its own.
         // Read into a local here because the struct literal below moves `startup`.
         let palette_viewer = startup.palette_viewer;
-        // `--permissions` (macOS): open only the permission-checker window; like
-        // `--settings`/`--preview` it captures nothing. On Linux the flag is inert
+        // `permissions` (macOS): open only the permission-checker window; like
+        // `settings`/`editor` it captures nothing. On Linux the flag is inert
         // (there is no permission window), so this stays false there and the launch
         // is byte-identical to a bare one.
         #[cfg(target_os = "macos")]
         let permissions_only = startup.permissions_only;
         #[cfg(not(target_os = "macos"))]
         let permissions_only = false;
-        // `--preview <file>`: open straight into the preview overlay for an existing file
+        // `editor <file>`: open straight into the preview overlay for an existing file
         // (image or video by extension), with no capture machinery.
         let startup_preview = startup
             .preview
@@ -140,7 +140,7 @@ impl cosmic::Application for App {
         // notification is a soft nag the permission window re-probes live via its 1s
         // poll, so it no longer gates launch. This snapshot both drives the routing
         // decision AND seeds the window (its poll fills the Notifications card shortly
-        // after open); a `--permissions` launch, which takes no snapshot here, probes
+        // after open); a `permissions` launch, which takes no snapshot here, probes
         // fully at seed time below.
         // DRAGON-440: this snapshot is normally ALREADY TAKEN — `app::run`'s macOS preamble
         // needs it before the boot-time activation policy is set, and hands it over on
@@ -179,7 +179,7 @@ impl cosmic::Application for App {
             .is_some_and(permissions::should_auto_open_probe);
         #[cfg(not(target_os = "macos"))]
         let route_to_permissions = false;
-        // Open the permission window either on an explicit `--permissions`, or when a
+        // Open the permission window either on an explicit `permissions`, or when a
         // capture launch is missing the Screen Recording grant.
         let open_permissions = permissions_only || route_to_permissions;
         // DRAGON-431 BELT ONE (floor lowered to 13.0 by DRAGON-444): can this macOS capture at
@@ -226,7 +226,7 @@ impl cosmic::Application for App {
         // on this latch before minting overlays, so they still land into a paused WM. Only
         // for real capture launches (the same guard the scene grab and seed use); a
         // no-AeroSpace machine returns fast and the latch signals immediately.
-        // DRAGON-680: a `--palette-viewer` launch joins the same suppression. It mints no
+        // DRAGON-680: a `color --viewer` launch joins the same suppression. It mints no
         // overlay, so there is no tiling WM to step out of the way of.
         #[cfg(target_os = "macos")]
         if !settings_only && !preview_mode && !palette_viewer && !open_permissions && !unsupported_os
@@ -238,8 +238,8 @@ impl cosmic::Application for App {
         // DRAGON-431: `unsupported_os` joins the same suppression a permission-routed launch
         // uses. Nothing this gates is optional on macOS 13 — every one of the scene threads
         // reaches ScreenCaptureKit, and reaching it there aborts the process.
-        // DRAGON-680: `--palette-viewer` captures nothing either, so it suppresses the scene
-        // exactly as `--settings` does. Left out, a viewer launch would grab the wallpaper,
+        // DRAGON-680: `color --viewer` captures nothing either, so it suppresses the scene
+        // exactly as `settings` does. Left out, a viewer launch would grab the wallpaper,
         // the cursor and (with the freeze extra on) every display's pixels, for a window that
         // shows none of them, and on macOS would ask ScreenCaptureKit for the privilege.
         let scene_active = !settings_only
@@ -275,11 +275,10 @@ impl cosmic::Application for App {
         );
         // DRAGON-663: the delay this launch is configured for, resolved the same way
         // `App::configured_delay_secs` resolves it once the struct exists (an exact CLI
-        // `--countdown` wins, otherwise the persisted preset). Needed HERE, before the
+        // `--timer` wins, otherwise the persisted preset). Needed HERE, before the
         // struct, because it decides whether the colour picker's flats grab is held.
-        let launch_delay_secs = startup
-            .countdown_secs
-            .unwrap_or_else(|| DELAYS[persisted.delay_idx.min(DELAYS.len() - 1)].1);
+        let launch_delay_secs =
+            startup.countdown_secs.unwrap_or(persisted.countdown_secs.min(99));
         // DRAGON-663: a colour picker with a delay counts down BEFORE it samples, so the
         // snapshot it will report has to be taken when the countdown ends. Holding the grab
         // is what makes that true, and it is also what keeps the countdown's own dim out of
@@ -305,7 +304,7 @@ impl cosmic::Application for App {
             launch_cursor_needed(persisted.capture_cursor, startup.color_picker),
             persisted.freeze,
             // DRAGON-336: the launch KIND gates the frozen-flats grab — the QR/OCR
-            // scanners are a non-freeze reader of the flats, so a `--scan` launch must
+            // scanners are a non-freeze reader of the flats, so a `scan` launch must
             // grab them even with freeze off. DRAGON-582 added the third reader: the
             // colour picker samples them for every pointer move, so it always needs them
             // (`app::color_picker`'s `PixelSource`).
@@ -366,7 +365,7 @@ impl cosmic::Application for App {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let text_scan: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::detect::TextWord>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        // Settings window state. When launched via `--settings`, open the window
+        // Settings window state. When launched via `settings`, open the window
         // immediately (and remember to exit when it closes).
         let mut settings = SettingsState::new();
         settings.only = settings_only;
@@ -417,7 +416,7 @@ impl cosmic::Application for App {
         // (DRAGON-268 follow-up). We only decide HERE that a settings window is wanted;
         // the id is minted in the deferred handler.
         let open_settings_at_startup = settings_only;
-        // Permission-checker window state. Opened when `--permissions` was passed, or
+        // Permission-checker window state. Opened when `permissions` was passed, or
         // when a capture launch is missing the Screen Recording grant (`open_permissions`).
         // `only` (like settings) makes closing it end the instance. The window is only
         // ever minted on macOS; `open_permissions` is always false elsewhere.
@@ -428,7 +427,7 @@ impl cosmic::Application for App {
             // already showing real statuses (the poll then keeps them fresh). macOS-only.
             // Reuse the capture-launch probe when it was taken (routed open); that fast
             // probe carries no notification status (DRAGON-201), but the window's 1s poll
-            // fills the Notifications card in right after open. A `--permissions` launch
+            // fills the Notifications card in right after open. A `permissions` launch
             // took no snapshot here, so probe FULLY now (it can afford the block: the
             // launch is explicit and opens straight into the window).
             #[cfg(target_os = "macos")]
@@ -450,6 +449,43 @@ impl cosmic::Application for App {
         // settings/preview launch never shows the capture kind toggle, so the value is
         // simply unused there.
         let external_recording = crate::instance::any_other_recording();
+        // The launch KIND, hoisted out of the struct literal below because DRAGON-718's
+        // portal hold has to ask about it too, and asking twice would be two chances to
+        // drift. The value and the coercion are unchanged; see the field's own comment for
+        // why a video launch becomes an image one while another instance is recording.
+        let launch_kind = {
+            let k = startup.kind.unwrap_or(Kind::Image);
+            if k == Kind::Video && external_recording {
+                Kind::Image
+            } else {
+                k
+            }
+        };
+        // DRAGON-718: a pinned monitor/window launch whose backend choice is the portal
+        // holds its native pickers until the ScreenCast probe answers. Decided HERE because
+        // this is where the launch mode and the persisted choice are both in hand, and
+        // because `on_output` can fire before the first message is drained — minting those
+        // pickers is the irreversible step that used to commit such a launch to native
+        // capture. Its outer bound is armed with the startup tasks below.
+        //
+        // DRAGON-732: the answer lives on as a three-valued `PortalSeed` rather than a hold
+        // that gets cleared, so a launch the PORTAL picks for keeps minting nothing after
+        // the probe lands. Outputs qualifying late is the ordinary case, not the rare one.
+        #[cfg(target_os = "linux")]
+        let portal_seed = if crate::app::capture_flow::portal_seed_hold_needed(
+            launch_mode,
+            launch_kind,
+            persisted.record_backend == crate::platform::backend::PORTAL_ID,
+            persisted.screenshot_backend == crate::platform::backend::PORTAL_ID,
+            {
+                let p = crate::platform::backend::wayland_protocols();
+                p.image_copy_capture && p.output_source
+            },
+        ) {
+            crate::app::capture_flow::PortalSeed::Holding(std::time::Instant::now())
+        } else {
+            crate::app::capture_flow::PortalSeed::Native
+        };
         // Benchmark monitor dropdown (DRAGON-163): enumerate connected monitors + their
         // TRUE capture footprint once, only for the settings window (the sole place the
         // benchmark lives; a capture launch never needs this and must not pay the probe).
@@ -475,34 +511,25 @@ impl cosmic::Application for App {
             (persisted.record_mic, persisted.record_system_audio),
         );
         crate::util::timing_mark("App::init returning (App struct built, tasks batched)");
-        (
+        let (mut app, task) = (
             App {
                 core,
                 outputs: Vec::new(),
-                // CLI overrides (`--region`/`--window`/`--monitor`, `--image`/
-                // `--video`/`--scan`, `--countdown`) fall back to the defaults. A
+                // CLI overrides (`--region`/`--window`/`--monitor`, `capture`/
+                // `record`/`scan`, `--timer`) fall back to the defaults. A
                 // Scanner kind forces Region mode (its capture invariant). DRAGON-322:
                 // a video kind is coerced to image when another instance is already
-                // recording (only one recording at a time), so a `--video` launch (or the
+                // recording (only one recording at a time), so a `record` launch (or the
                 // persisted default) can't start a second recording alongside one.
-                kind: {
-                    let k = startup.kind.unwrap_or(Kind::Image);
-                    if k == Kind::Video && external_recording {
-                        Kind::Image
-                    } else {
-                        k
-                    }
-                },
+                kind: launch_kind,
                 external_recording,
                 mode: launch_mode,
-                // A CLI `--countdown` seconds value overrides the delay exactly (see
-                // countdown_override); delay_idx still points at the nearest preset so
-                // the delay menu is sensible if the override is later cleared.
-                delay_idx: startup
-                    .countdown_secs
-                    .map(super::countdown_index)
-                    .unwrap_or(persisted.delay_idx)
-                    .min(DELAYS.len() - 1),
+                // DRAGON-695: the persisted countdown is SECONDS, and the chip highlight is
+                // derived from it. A CLI `--timer` value overrides the delay exactly for this
+                // launch (see countdown_override); the chip still lights the nearest preset,
+                // so the delay menu is sensible if the override is later cleared.
+                delay_idx: super::countdown_index(launch_delay_secs),
+                countdown_secs: NumField::new(persisted.countdown_secs.min(99)),
                 countdown_override: startup.countdown_secs,
                 region: persisted.region.map(GlobalRect::from_tuple),
                 region_dragging: false,
@@ -612,11 +639,11 @@ impl cosmic::Application for App {
                     ..Default::default()
                 },
                 keymap,
-                // DRAGON-428: `--no-editor`, carried through from the launch flags.
+                // DRAGON-428: `--skip-editor`, carried through from the launch flags.
                 no_editor: startup.no_editor,
                 // DRAGON-479: armed only by the in-overlay region-copy chord, never at launch.
                 copy_selection_pending: false,
-                // `--preview` (windowed unless `--overlay`) overrides the persisted setting;
+                // `editor` (windowed unless `--overlay`) overrides the persisted setting;
                 // DRAGON-427 then has the last word on Windows 10 (see `effective_preview_windowed`).
                 preview_windowed: super::effective_preview_windowed(
                     startup.preview_windowed.unwrap_or(persisted.preview_windowed),
@@ -636,6 +663,7 @@ impl cosmic::Application for App {
                 preview_video_save_originals: persisted.preview_video_save_originals,
                 preview_video_ask_to_save: persisted.preview_video_ask_to_save,
                 mute_others_during_preview: persisted.mute_others_during_preview,
+                pause_others_during_ink: persisted.pause_others_during_ink,
                 duck_system_audio: persisted.duck_system_audio,
                 appearance_use_system: persisted.appearance_use_system,
                 appearance_mode: persisted.appearance_mode.min(2),
@@ -648,9 +676,12 @@ impl cosmic::Application for App {
                 focused_window: None,
                 #[cfg(target_os = "linux")]
                 portal_origin_output: None,
+                #[cfg(target_os = "linux")]
+                portal_window_rect: None,
                 capture_preview: None,
                 preview_duck: None,
                 preview_duck_refs: Default::default(),
+                ink_duck: None,
                 // Bound lazily, at the first preview mint (`preview_surface_for`) — a
                 // capture that never opens a preview never hosts.
                 #[cfg(any(unix, windows))]
@@ -659,6 +690,8 @@ impl cosmic::Application for App {
                 // that never records is never reachable by a recording command.
                 #[cfg(target_os = "linux")]
                 record_control: None,
+                #[cfg(target_os = "linux")]
+                scan_control: None,
                 trigger_display,
                 preview_output: None,
                 #[cfg(target_os = "linux")]
@@ -672,6 +705,9 @@ impl cosmic::Application for App {
                 preview_mode,
                 palette_viewer,
                 startup_immediate: startup.immediate,
+                // DRAGON-698: armed by `immediate_capture` when a delay is configured,
+                // never at init — a zero-delay immediate launch must stay byte-identical.
+                pending_immediate: None,
                 #[cfg(target_os = "linux")]
                 immediate_kicked: false,
                 settings_size: persisted.settings_size,
@@ -788,6 +824,7 @@ impl cosmic::Application for App {
                 recording_out_path: None,
                 recording_stopping: false,
                 recording_progress: None,
+                recording_finalize: None,
                 recording_paused_at: None,
                 recording_paused_accum: std::time::Duration::ZERO,
                 recording_cancelled: false,
@@ -796,11 +833,13 @@ impl cosmic::Application for App {
                 countdown_tray: None,
                 countdown_gate: None,
                 tray_hides_toolbar: false,
+                toolbar_resolved_at: None,
+                ink: Default::default(),
                 push_to_talk: persisted.push_to_talk,
                 ptt_held: false,
                 hotkeys: None,
                 screenshot_dir: persisted.screenshot_dir,
-                // DRAGON-559: `launch_arms` above — the `--audio` override, or the
+                // DRAGON-559: `launch_arms` above — the `--sound` override, or the
                 // persisted pair when the flag is absent.
                 record_mic: launch_arms.0,
                 record_system_audio: launch_arms.1,
@@ -902,6 +941,14 @@ impl cosmic::Application for App {
                     |c| c.record,
                 ),
                 pipewire_available: false,
+                #[cfg(target_os = "linux")]
+                pipewire_probed: false,
+                // DRAGON-718: a pinned monitor/window launch whose backend choice is the
+                // portal holds its pickers until the probe answers. Armed here because this
+                // is where the launch mode and the persisted choice are both in hand, and
+                // because `on_output` can fire before any message is drained.
+                #[cfg(target_os = "linux")]
+                portal_seed,
                 pipewire_source_types: 0,
                 toast: None,
                 // DRAGON-612: no accept is being held. Only a colour-picker launch can ever
@@ -947,12 +994,29 @@ impl cosmic::Application for App {
                         cosmic::Action::App(Msg::Capture(CaptureMsg::PipewireProbed(ok, types)))
                     }),
                 ];
+                // DRAGON-718: the portal hold's OUTER BOUND, armed in the same place as the
+                // hold itself and in the same commit (DRAGON-118: a wait and its deadline
+                // are one change). Armed only when something is actually holding, so a
+                // native launch queues nothing. `resolve_portal_seed_hold` is idempotent,
+                // so this firing after the probe already settled the hold costs nothing.
+                #[cfg(target_os = "linux")]
+                if portal_seed.holding_since().is_some() {
+                    tasks.push(Task::perform(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                crate::app::capture_flow::PORTAL_SEED_PROBE_BUDGET_MS,
+                            ))
+                            .await;
+                        },
+                        |()| cosmic::Action::App(Msg::Capture(CaptureMsg::PortalSeedDeadline)),
+                    ));
+                }
                 // Appearance override (DRAGON-139): when not following the system, apply
                 // the persisted theme before the first frame so the app launches themed.
                 if let Some(t) = appearance_task {
                     tasks.push(t);
                 }
-                // `--settings`: open the settings window as part of startup — but a
+                // `settings`: open the settings window as part of startup — but a
                 // message-drain AFTER `appearance_task` above, so the window's FIRST paint
                 // already carries the launch-resolved accent instead of flashing
                 // libcosmic's default for a frame (DRAGON-268 follow-up). This
@@ -975,7 +1039,7 @@ impl cosmic::Application for App {
                         super::WindowChromeMsg::OpenSettingsAtStartup { about },
                     ))));
                 }
-                // `--palette-viewer` (DRAGON-680): mint the colour picker's result window
+                // `color --viewer` (DRAGON-680): mint the colour picker's result window
                 // and nothing else. Deferred exactly like the settings open above, and for
                 // the same reason: the appearance `set_theme` queued a few lines up has to
                 // land before the window's first paint. The single-window rule was already
@@ -985,14 +1049,14 @@ impl cosmic::Application for App {
                         super::WindowChromeMsg::OpenPaletteViewer,
                     ))));
                 }
-                // `--permissions` / missing-grant routing: open the permission window.
+                // `permissions` / missing-grant routing: open the permission window.
                 if let Some(t) = permissions_task {
                     tasks.push(t);
                 }
                 // macOS/Windows have no Wayland output-event subscription, so seed the
-                // per-display capture overlays (or the `--preview` window) once here —
+                // per-display capture overlays (or the `editor` window) once here —
                 // the PlainWindows equivalent of the `on_output` hotplug path. The
-                // handler applies the same `--settings`/`--preview` guards `on_output` does.
+                // handler applies the same `settings`/`editor` guards `on_output` does.
                 #[cfg(not(target_os = "linux"))]
                 tasks.push(Task::done(cosmic::Action::App(Msg::WindowChrome(
                     super::WindowChromeMsg::SeedOutputs,
@@ -1018,7 +1082,12 @@ impl cosmic::Application for App {
                 // a resident, when enabled, owns the one always-present tray icon.
                 Task::batch(tasks)
             },
-        )
+        );
+        // DRAGON-695: a `scan` launch is already in the scanner kind and never passes through
+        // `SetKind`, so the control inlet has to be bound here too. Idempotent, and a no-op for
+        // every other kind.
+        app.sync_scan_control(app.kind == Kind::Scanner);
+        (app, task)
     }
 
     fn view(&self) -> Element<'_, Msg> {
@@ -1045,6 +1114,13 @@ impl cosmic::Application for App {
         // the window maps under it with no desktop flash.
         if self.grab_overlay_closing == Some(id) {
             return self.grab_cover_view();
+        }
+        // DRAGON-691: the live recording ink surface. Its own surface, separate from the
+        // per-output capture overlays below, because those opt OUT of the recording
+        // (DRAGON-690) and ink drawn on one would be excluded with the toolbar it carries.
+        // Checked here, before the `outputs` lookup, because its id is not in that list.
+        if self.ink.window() == Some(id) {
+            return self.ink_view();
         }
         if self.is_preview_window(id) {
             return self.preview_view(id);
@@ -1123,6 +1199,7 @@ impl cosmic::Application for App {
             Msg::Permissions(message) => self.update_permissions(message),
             Msg::WindowChrome(message) => self.update_window_chrome(message),
             Msg::ColorPicker(message) => self.update_color_picker(message),
+            Msg::Ink(message) => self.update_ink(message),
             Msg::Preview(id, message) => self.update_preview(id, message),
         };
         // DRAGON-413: publish what this child currently has on screen to the startup

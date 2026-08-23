@@ -328,7 +328,11 @@ pub fn recording_menu(paused: bool) -> Vec<RecordingItem> {
 /// `icon_data` PNGs on Linux, per-item bitmaps on Windows, template `NSImage`s on macOS),
 /// and a host that does not render menu icons simply ignores them. RADIO rows carry NO
 /// icon on purpose: the toggle indicator and the icon fight for the same slot on several
-/// hosts.
+/// hosts. That rule is what shaped DRAGON-757's flat annotation rows, which had to carry
+/// an icon: on the two Linux trays and the Windows popup they carry no toggle state at
+/// all and mark the armed tool in the LABEL ([`ink_row_label`] holds the whole
+/// reasoning), while macOS marks them natively, because AppKit draws an item's state in
+/// its own column BESIDE the image rather than in it.
 ///
 /// Every variant reuses an asset the app already ships for the SAME meaning (owner's
 /// mapping): the settings tabs' glyphs for Capture / Record / Audio, the General page's
@@ -354,7 +358,7 @@ pub enum MenuIcon {
     /// named. Vendored for this feature like `timer` and `trash`; see
     /// `res/icons/ATTRIBUTION.md`.
     ColorPicker,
-    /// Lucide `palette`, the "Colors" submenu that holds the two colour entries
+    /// Lucide `palette`, the "Color" submenu that holds the two colour entries
     /// (DRAGON-680), the glyph the owner named. Vendored like `pipette` was.
     Colors,
     /// Lucide `swatch-book`, the "Palette Viewer" entry (DRAGON-680), the glyph the
@@ -412,6 +416,33 @@ pub enum MenuIcon {
     /// constructs it on those platforms.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Permissions,
+    /// Lucide `highlighter`, the "Live Annotations" submenu (DRAGON-693). Already vendored
+    /// for the app's own icon set, so nothing new is fetched for it. Ordinary accent-tinted
+    /// row: the submenu configures a mode, it does not save or destroy anything.
+    ///
+    /// No surface RENDERS it since DRAGON-757: every tray draws the block as four
+    /// top-level rows carrying their own tool glyphs, so there is no parent row left to put
+    /// it on. It stays the model entry's own answer ([`RadioSubmenu::icon`]), which is where
+    /// the tests pin it.
+    LiveAnnotations,
+    /// Lucide `mouse-pointer`, the Pointer row of the annotation block (DRAGON-757). The
+    /// SAME asset the recording toolbar's pointer button draws: the toolbar asks for
+    /// `input-mouse-symbolic` and `widgets::icons` resolves that to `mouse-pointer`, so one
+    /// tool cannot end up with two glyphs across two surfaces.
+    InkPointer,
+    /// Lucide `pen-line`, the Marker row (DRAGON-757). The toolbar's `pencil-symbolic`,
+    /// resolved the same way.
+    InkMarker,
+    /// Lucide `highlighter`, the Magic Marker row (DRAGON-757). The toolbar's
+    /// `format-text-highlight-symbolic`. It shares its asset with
+    /// [`MenuIcon::LiveAnnotations`] on purpose: that submenu was named after this tool's
+    /// glyph. They stay two variants because they are two different ROWS, and a call site
+    /// naming a submenu where it means a tool is the kind of thing that goes wrong quietly.
+    InkMagicMarker,
+    /// Lucide `eraser`, the "Clear Marks" row (DRAGON-757). The toolbar's `eraser-symbolic`.
+    /// Ordinary accent-tinted, NOT one of the two fixed-tint controls: it empties the
+    /// drawing, it does not touch the recording.
+    InkClear,
 }
 
 impl MenuIcon {
@@ -438,6 +469,11 @@ impl MenuIcon {
             MenuIcon::Finish => include_str!("../res/icons/lucide/save.svg"),
             MenuIcon::Discard => include_str!("../res/icons/lucide/trash.svg"),
             MenuIcon::Permissions => include_str!("../res/icons/lucide/key.svg"),
+            MenuIcon::LiveAnnotations => include_str!("../res/icons/lucide/highlighter.svg"),
+            MenuIcon::InkPointer => include_str!("../res/icons/lucide/mouse-pointer.svg"),
+            MenuIcon::InkMarker => include_str!("../res/icons/lucide/pen-line.svg"),
+            MenuIcon::InkMagicMarker => include_str!("../res/icons/lucide/highlighter.svg"),
+            MenuIcon::InkClear => include_str!("../res/icons/lucide/eraser.svg"),
         }
     }
 }
@@ -500,11 +536,11 @@ pub fn menu_icon_svg_tinted(icon: MenuIcon, rgb: [u8; 3]) -> String {
 pub enum CaptureAction {
     /// The colour picker tool (DRAGON-582). Not a capture: it spawns a child that shows
     /// the dimmed magnifier overlay and opens the result window. Since DRAGON-680 it is
-    /// the first row INSIDE the "Colors" submenu, which itself sits first in the menu.
+    /// the first row INSIDE the "Color" submenu, which itself sits first in the menu.
     ColorPicker,
     /// The palette viewer (DRAGON-680): the picker's result window on its own, with no
     /// overlay and no pick, so the saved palette can be read and reused. It spawns
-    /// `--palette-viewer`, the launch shape that skips straight to the window.
+    /// `color --viewer`, the launch shape that skips straight to the window.
     PaletteViewer,
     /// Scanner (forces Region + scan).
     Scan,
@@ -515,7 +551,7 @@ pub enum CaptureAction {
     /// Monitor capture.
     Monitor,
     /// Region recording (DRAGON-559): the capture twin with the video kind. Spawns the
-    /// SAME child as "Capture Region" plus `--video`, so a fallback (portal-frozen)
+    /// SAME child as "Capture Region" plus `record`, so a fallback (portal-frozen)
     /// session routes through the portal exactly like its capture twin.
     RecordRegion,
     /// Window recording (DRAGON-559; see [`CaptureAction::RecordRegion`]).
@@ -556,10 +592,13 @@ pub struct CaptureItem {
 /// Which LAUNCHER submenu a [`TrayItem::Launchers`] row opens (DRAGON-574).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LauncherSubmenu {
-    /// "Colors": the two colour entries (DRAGON-680), the Color Picker tool and the
+    /// "Color": the two colour entries (DRAGON-680), the Color Picker tool and the
     /// Palette Viewer. Enabled in both states, like the two rows it holds: neither takes
     /// a capture connection, so neither can disturb a running recording.
-    Colors,
+    ///
+    /// DRAGON-695 shortened the owner's label from "Colors" to "Color"; the icon enum's own
+    /// `Colors` variant names the `palette` glyph and is a different thing.
+    Color,
     /// "Capture" ([`CAPTURE_LABEL`]): the three still-capture launchers.
     /// Fully enabled while recording (stills during a recording are fine).
     Capture,
@@ -578,18 +617,18 @@ impl LauncherSubmenu {
     /// The submenu row's label (the owner's verbatim wording).
     pub fn label(self) -> &'static str {
         match self {
-            LauncherSubmenu::Colors => "Colors",
+            LauncherSubmenu::Color => "Color",
             LauncherSubmenu::Capture => CAPTURE_LABEL,
             LauncherSubmenu::Record => "Record",
         }
     }
 
     /// The submenu row's icon (the settings tabs' glyphs, owner's mapping; `palette` for
-    /// Colors, DRAGON-680).
+    /// the Color submenu, DRAGON-680).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // consumed natively off-Linux
     pub fn icon(self) -> MenuIcon {
         match self {
-            LauncherSubmenu::Colors => MenuIcon::Colors,
+            LauncherSubmenu::Color => MenuIcon::Colors,
             LauncherSubmenu::Capture => MenuIcon::Capture,
             LauncherSubmenu::Record => MenuIcon::Record,
         }
@@ -610,15 +649,36 @@ pub enum RadioSubmenu {
     /// recording (a pick applies to the recording LIVE, see
     /// [`audio_toggles_are_live`]).
     Audio,
+    /// "Live Annotations" (DRAGON-693): the three drawing tools as radio rows plus the
+    /// "Clear Marks" action under them. RECORDING ONLY: there is nothing to draw on
+    /// otherwise, so [`tray_menu`] emits it in that state alone rather than emitting it
+    /// disabled.
+    ///
+    /// The one submenu that MIXES kinds, and the reason it does is that its four rows are
+    /// one control: three positions of a selector and the thing that empties it.
+    ///
+    /// **EVERY surface renders this entry FLAT since DRAGON-757**: the same four rows, in
+    /// the same place, at the TOP level of the dropdown, each carrying its own glyph, at
+    /// the owner's word. The two Linux ksni trays went first and the two macOS `NSMenu`s
+    /// and the Windows `HMENU` followed in the same ticket. It stays ONE model entry
+    /// rather than becoming four, because the rendering is what changed and not the
+    /// control: the block is still one thing that appears and disappears together, and
+    /// still recording-only. What the flat walkers need on top of the shared rows is
+    /// additive, [`InkItem::icon`] and [`ink_row_label`]; both are here so the five
+    /// surfaces cannot drift, and both say why they exist. The earlier note that a
+    /// top-level "Clear Marks" would leave half a control in the dropdown's tail was about
+    /// splitting the block, which is not what happened: all four rows moved together.
+    Ink,
 }
 
 impl RadioSubmenu {
-    /// The submenu row's icon (`timer` / the Audio settings tab's glyph).
+    /// The submenu row's icon (`timer` / the Audio settings tab's glyph / `highlighter`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // consumed natively off-Linux
     pub fn icon(self) -> MenuIcon {
         match self {
             RadioSubmenu::Countdown => MenuIcon::Countdown,
             RadioSubmenu::Audio => MenuIcon::Audio,
+            RadioSubmenu::Ink => MenuIcon::LiveAnnotations,
         }
     }
 }
@@ -691,7 +751,7 @@ fn row(label: &'static str, action: CaptureAction, icon: MenuIcon) -> CaptureIte
     CaptureItem { label, action, icon: Some(icon) }
 }
 
-/// The two Colors rows (DRAGON-680), in the owner's order: the pick TOOL first, then the
+/// The two Color rows (DRAGON-680), in the owner's order: the pick TOOL first, then the
 /// window that shows what has already been picked.
 fn colors_launcher_items() -> Vec<CaptureItem> {
     vec![
@@ -726,7 +786,7 @@ fn record_launcher_items() -> Vec<CaptureItem> {
 /// THREE BLOCKS, in this order, since DRAGON-680 item 22 (the owner's restructure):
 /// the LAUNCHERS, then the two per-capture SETTINGS submenus, then the app tail.
 ///
-/// Idle (`recording == false`): the scan row ([`SCAN_LABEL`]), the "Colors" submenu, the
+/// Idle (`recording == false`): the scan row ([`SCAN_LABEL`]), the "Color" submenu, the
 /// "Capture" submenu, the "Record" submenu, a separator, the "Countdown Timer: NN"
 /// radio submenu, the "Audio Recording: <state>" radio submenu, a separator,
 /// "Settings...", Quit, and everything enabled.
@@ -735,7 +795,7 @@ fn record_launcher_items() -> Vec<CaptureItem> {
 /// owner's recolour-round amendment; a pick applies to the recording LIVE, so the
 /// most-adjusted control sits on top), then the three controls ([`recording_menu`],
 /// Pause/Resume leading) and a separator, then the SAME three blocks with the per-state
-/// flags the owner specified: the scan row, Colors and Capture stay enabled
+/// flags the owner specified: the scan row, Color and Capture stay enabled
 /// (stills while recording are fine, and neither colour entry touches a capture
 /// connection), Record is flagged OFF (one recording at a time) and the Countdown Timer
 /// too (a countdown pick has nothing to apply to), Settings stays enabled, and Quit is
@@ -758,6 +818,13 @@ fn record_launcher_items() -> Vec<CaptureItem> {
 pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
     let mut items: Vec<TrayItem> = Vec::new();
     if recording {
+        // DRAGON-693: the Live Annotations submenu leads the whole menu, with its own divider
+        // under it. It is FIRST because it is the only control here the user reaches for
+        // repeatedly during a take (the same reasoning that put the drawing tools at the head
+        // of the in-frame toolbar); pause, finish and cancel are pressed once, at the end.
+        // Recording only: with nothing being recorded there is nothing to draw on.
+        items.push(TrayItem::Radio { menu: RadioSubmenu::Ink, enabled: true });
+        items.push(TrayItem::Separator);
         // The owner's recolour-round amendment: the Audio Recording submenu moves to
         // the VERY TOP while recording, above the controls. Moved, not copied: the
         // launcher group below emits its audio row only while idle.
@@ -770,7 +837,7 @@ pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
     // DRAGON-680 item 20: the row reads "Scan OCR/QR/Barcode" rather than the bare
     // "Scanner" it carried since DRAGON-574. The owner's wording, and it says what the
     // tool finds instead of naming a category the user has to already know. The label
-    // is the ONLY thing that changed: the action, the icon and the `--scan` argv are
+    // is the ONLY thing that changed: the action, the icon and the `scan` argv are
     // untouched, so nothing about what the row DOES moved with it.
     items.push(TrayItem::Action {
         item: row(SCAN_LABEL, CaptureAction::Scan, MenuIcon::Scanner),
@@ -786,7 +853,7 @@ pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
     // history: what the owner settled on is a launcher block that reads scan, colours,
     // captures, recordings.
     items.push(TrayItem::Launchers {
-        menu: LauncherSubmenu::Colors,
+        menu: LauncherSubmenu::Color,
         enabled: true,
         items: colors_launcher_items(),
     });
@@ -853,7 +920,7 @@ pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
 /// ONE place instead of at every site that emits a separator.
 ///
 /// While recording the dropdown is therefore: the Audio Recording submenu,
-/// Pause/Resume, Finish & Save, Cancel & Delete, a separator, the scan row, Colors, the
+/// Pause/Resume, Finish & Save, Cancel & Delete, a separator, the scan row, Color, the
 /// Capture submenu, a separator, Settings..., and no Record, no Countdown Timer,
 /// no Quit. Idle
 /// hides nothing. The full model ([`tray_menu`]) keeps expressing state through its
@@ -889,19 +956,30 @@ pub fn visible_tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
 // ── The "Countdown Timer" radio submenu (DRAGON-574) ─────────────────────────
 //
 // One submenu, four RADIO presets, writing the SAME persisted field every capture launch
-// already honors: `delay_idx` (`state/schema.rs`), the index into the overlay's delay
-// chips (No delay / 3s / 5s / 10s). The overlay, the `--countdown` CLI mapping
-// (`app::countdown_index`) and this submenu therefore agree by construction; a test in
-// `app/mod.rs` pins the preset tables to each other. The title carries the current value
+// already honors: `countdown_secs` (`state/schema.rs`), the default countdown in SECONDS.
+// The submenu still SELECTS by preset index, because four radio rows are what it renders,
+// and it maps that index to seconds on the way in and back on the way out
+// ([`countdown_preset_index`]). The overlay's chips, the `--timer` modifier and this submenu
+// therefore agree by construction; a test in `app/mod.rs` pins the preset tables to each
+// other. The title carries the current value
 // zero-padded ("Countdown Timer: 05"; "00" means off) so it reads without opening. While
 // recording the submenu is DISABLED (the tray_menu flag); a pick while idle persists
 // through [`persist_countdown_idx`] on the resident/daemon surfaces, or through the
 // app's own `PickDelay` handler on a child-owned surface (the app owns the live chip).
 
-/// The four countdown presets, in display order, in SECONDS. Index IS the persisted
-/// `delay_idx`. Must stay equal to the overlay's `DELAYS` table (pinned by
-/// `app::tests`).
+/// The four countdown presets, in display order, in SECONDS. Must stay equal to the
+/// overlay's `DELAYS` table (pinned by `app::tests`).
 pub const COUNTDOWN_PRESET_SECS: [u64; 4] = [0, 3, 5, 10];
+
+/// **Pure**, unit-tested: the preset row a persisted countdown lights (DRAGON-695).
+///
+/// The persisted value is exact seconds and `timer 7` is a legal setting, so the submenu has
+/// to answer "which of my four rows is this" for a value none of them is. It answers with the
+/// NEAREST, the same rule `app::countdown_index` gives the overlay's chips, delegated to it so
+/// the tray and the toolbar can never disagree about which preset a value belongs to.
+pub fn countdown_preset_index(secs: u64) -> usize {
+    crate::app::countdown_index(secs)
+}
 
 /// **Pure**, unit-tested: a preset's radio-row label, zero-padded to two digits (the
 /// owner's spec: 00 / 03 / 05 / 10).
@@ -922,7 +1000,8 @@ pub fn countdown_submenu_title(delay_idx: usize) -> String {
 pub struct CountdownItem {
     /// The row label ([`countdown_label`]).
     pub label: String,
-    /// The `delay_idx` activating this row persists.
+    /// The preset index this row activates; [`persist_countdown_idx`] turns it into the
+    /// seconds that persist.
     pub idx: usize,
     /// Whether this row is the currently-persisted one (the radio mark).
     pub selected: bool,
@@ -953,9 +1032,9 @@ pub fn countdown_choice_at(index: usize) -> Option<usize> {
     (index < COUNTDOWN_PRESET_SECS.len()).then_some(index)
 }
 
-/// Write a countdown radio pick's preset index — the resident/daemon idle route
-/// (DRAGON-574), the countdown twin of [`persist_audio_arms`]: load-modify-save through
-/// the normal settings write path, setting `delay_idx`, so every later capture launch
+/// Write a countdown radio pick's preset — the resident/daemon idle route (DRAGON-574), the
+/// countdown twin of [`persist_audio_arms`]: load-modify-save through the normal settings
+/// write path, setting `countdown_secs` to the preset's SECONDS, so every later capture launch
 /// (tray, hotkey, bare CLI) counts down from the new value. Returns the (clamped) index
 /// written; the caller refreshes its submenu title / radio mark from it. A child-owned
 /// surface does NOT call this: it sends the pick to the app, whose `PickDelay` handler
@@ -963,7 +1042,7 @@ pub fn countdown_choice_at(index: usize) -> Option<usize> {
 pub fn persist_countdown_idx(idx: usize) -> usize {
     let idx = idx.min(COUNTDOWN_PRESET_SECS.len() - 1);
     let mut p = crate::state::load();
-    p.delay_idx = idx;
+    p.countdown_secs = COUNTDOWN_PRESET_SECS[idx];
     crate::state::save(&p);
     idx
 }
@@ -1040,7 +1119,30 @@ impl AudioArmState {
         self.word()
     }
 
-    /// **Pure**, unit-tested: parse the `--audio <channels>` CLI value (DRAGON-559) into
+    /// **Pure**, unit-tested: the CANONICAL CLI word for this state (DRAGON-695) — the exact
+    /// token the `sound` command and the `--sound` option accept back.
+    ///
+    /// Distinct from [`AudioArmState::word`], and the distinction is the point. That one is
+    /// UI copy for a menu title ("Mic + System"), written for someone reading a tray; this is
+    /// vocabulary, written for someone who is going to type it. Printing the UI copy from the
+    /// CLI is what DRAGON-695's review caught: `sound` answered `None`, capitalised, which is
+    /// not a word this command accepts, so what it printed could not be pasted back.
+    ///
+    /// The exact inverse of [`AudioArmState::parse_flag`] (pinned by a round-trip test): every
+    /// word here parses, and parses back to the state it came from. `parse_flag` still takes
+    /// the other spellings (`all`, `microphone`, `sys`, `off`); this picks the ONE the help
+    /// lists, so there is a single answer to "what do I type".
+    pub fn cli_word(self) -> &'static str {
+        match self {
+            AudioArmState::Both => "both",
+            AudioArmState::MicrophoneOnly => "mic",
+            AudioArmState::SystemOnly => "system",
+            AudioArmState::None => "none",
+        }
+    }
+
+    /// **Pure**, unit-tested: parse the `--sound <channels>` CLI value (DRAGON-559, respelled
+    /// by DRAGON-695) into
     /// an arm state, `None` for anything unrecognised so a typo can never silently arm (or
     /// silently NOT disarm) a channel — the caller rejects the launch instead.
     ///
@@ -1059,7 +1161,7 @@ impl AudioArmState {
 }
 
 /// **Pure**, unit-tested: the `(mic, system)` arms a capture launch starts with
-/// (DRAGON-559). A given `--audio` state wins outright — a per-LAUNCH override that the
+/// (DRAGON-559). A given `--sound` state wins outright — a per-LAUNCH override that the
 /// caller must never write back to the settings store — and an absent flag keeps the
 /// persisted pair unchanged. The one place the override decision lives, so the app cannot
 /// half-apply a flag (one channel from the flag, one from the store).
@@ -1199,6 +1301,162 @@ pub fn persist_audio_arms(choice: AudioArmState) -> (bool, bool) {
     (mic, system)
 }
 
+// ── The "Live Annotations" submenu (DRAGON-693) ──────────────────────────────
+//
+// The owner's tiered-support ticket asked for ONE submenu near the top of the recording
+// menu, holding the three drawing tools as checked radio rows and Clear Marks under them.
+// It is the first arming surface the feature has that is not the in-frame toolbar, and that
+// is what let `ink::tools_available` drop its `toolbar_hidden` term: a hidden toolbar is no
+// longer a feature with no door, and neither is a Silver or Bronze session, which has no
+// toolbar on screen at all.
+//
+// The rows are the SAME control the toolbar and the armed window show, so the labels come
+// from `ink::InkTool::label` rather than from string literals here.
+
+// `INK_SUBMENU_LABEL` ("Live Annotations") lived here until DRAGON-757. It named the parent
+// row of the submenu the four annotation rows used to sit in. No surface has such a row any
+// more: the two Linux ksni trays, the two macOS `NSMenu`s and the Windows `HMENU` all render
+// the block as four TOP-LEVEL rows, so the string reached no user. It is not retained for a
+// future caller, because a caller that needs it would be putting the submenu back. The shape
+// tests still need a NAME for the one model entry those four rows come from, and that name
+// is a test fingerprint now rather than user copy; it lives in the test module that uses it.
+
+/// The "Clear Marks" row's label, and THE user-visible name of that action everywhere
+/// (DRAGON-693 renamed it from "Erase": the toolbar's tooltip, the armed window's button and
+/// this row all read the same word now). A const so a re-wording breaks the shape tests
+/// rather than quietly agreeing with them. No em/en-dashes, project rule.
+pub const CLEAR_MARKS_LABEL: &str = "Clear Marks";
+
+/// What activating a Live Annotations row asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InkAction {
+    /// Move the selector to this tool. Picking the selected one is a no-op, like every other
+    /// radio control here.
+    Pick(crate::ink::InkTool),
+    /// Clear every mark at once. Always enabled: it is an action rather than a mode, and it
+    /// is harmless with nothing on screen.
+    Clear,
+}
+
+/// One row of the "Live Annotations" block: its label, what it asks for, its glyph, whether
+/// it is a RADIO row, and whether it carries the mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InkItem {
+    /// The row label.
+    pub label: &'static str,
+    /// What activating it asks for.
+    pub action: InkAction,
+    /// The row's glyph (DRAGON-757), the same asset the recording toolbar's button for this
+    /// tool draws. Every other row model here carries its icon the same way; the annotation
+    /// rows only ever needed one once they went top level, since a submenu showed its
+    /// parent's glyph and not its rows'. Every surface reads it now.
+    pub icon: MenuIcon,
+    /// Is this one of the three radio positions? False for Clear Marks, which is the one row
+    /// that can never carry the armed mark: it is an action rather than a position. Every
+    /// surface reads the flag for that, macOS by leaving the item's `NSMenuItem` state off,
+    /// Linux and Windows through [`ink_row_label`]. It also kept Clear Marks out of the
+    /// host radio groups the rows sat in until DRAGON-757, where a fourth id inside Win32's
+    /// contiguous `CheckMenuRadioItem` range would have marked the wrong row.
+    pub radio: bool,
+    /// Whether it carries the radio mark. Always false for Clear Marks.
+    pub selected: bool,
+}
+
+/// **Pure**, unit-tested: the block's four rows in display order, with `current` marked.
+///
+/// ONE source for every renderer, so the rows, their order and the mark cannot drift between
+/// the two Linux trays, the two mac menus and the Windows popup.
+pub fn ink_items(current: crate::ink::InkTool) -> Vec<InkItem> {
+    let mut out: Vec<InkItem> = crate::ink::InkTool::ORDER
+        .iter()
+        .map(|&tool| InkItem {
+            label: tool.label(),
+            action: InkAction::Pick(tool),
+            icon: ink_tool_icon(tool),
+            radio: true,
+            selected: tool == current,
+        })
+        .collect();
+    out.push(InkItem {
+        label: CLEAR_MARKS_LABEL,
+        action: InkAction::Clear,
+        icon: MenuIcon::InkClear,
+        radio: false,
+        selected: false,
+    });
+    out
+}
+
+/// **Pure**, unit-tested: one drawing tool's glyph (DRAGON-757). Each is the asset the
+/// recording toolbar's button for that tool already draws, so the tray row and the toolbar
+/// button a user just clicked cannot show the same tool two ways.
+fn ink_tool_icon(tool: crate::ink::InkTool) -> MenuIcon {
+    match tool {
+        crate::ink::InkTool::Pointer => MenuIcon::InkPointer,
+        crate::ink::InkTool::Marker => MenuIcon::InkMarker,
+        crate::ink::InkTool::MagicMarker => MenuIcon::InkMagicMarker,
+    }
+}
+
+/// The mark a FLAT top-level annotation row carries while its tool is armed (DRAGON-757),
+/// on the surfaces whose armed mark is TEXT (the two Linux ksni trays and the Windows
+/// popup; macOS marks the item itself, see [`ink_row_label`]).
+/// A const so a re-spelling breaks the shape tests rather than quietly agreeing with them.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // mac marks the NSMenuItem instead
+pub const INK_ARMED_MARK: &str = "✓"; // U+2713 CHECK MARK
+
+/// **Pure**, unit-tested: the label a FLAT top-level annotation row renders with
+/// (DRAGON-757): the row's own label, plus [`INK_ARMED_MARK`] on the armed tool.
+///
+/// Both terms of the test earn their place. `selected` is the mark itself, and `radio` is
+/// what keeps it off "Clear Marks": that row is an action rather than a position, so it can
+/// never be the armed one, and asking both means a later non-radio row cannot pick up a mark
+/// by accident.
+///
+/// **WHY the mark is TEXT on Linux, which is the whole X11 answer.** The four rows went top
+/// level so each could carry its tool's icon, and dbusmenu leaves it to the HOST whether one
+/// row renders an icon AND a toggle indicator: `toggle-type`, `toggle-state` and `icon-data`
+/// are three independent properties and the protocol says nothing about them sharing a row.
+/// This project already recorded that they fight for the same slot on several hosts (see
+/// [`MenuIcon`]), which is why no radio row here has ever carried an icon, and the hosts in
+/// question are exactly the X11 / libdbusmenu ones the owner flagged. So a `CheckmarkItem`
+/// row would put the ICON at the host's discretion, and the icon is the thing that was
+/// asked for. The LABEL is the one property every dbusmenu host renders, so the mark lives
+/// there and the rows carry no toggle type at all: the icon is then unambiguously the row's
+/// own, and the armed tool reads on a host that renders no menu icons whatsoever.
+///
+/// **WINDOWS takes the same answer, for the same shape of reason** (DRAGON-757). Win32 draws
+/// a selected item's mark in the item's CHECK-MARK AREA, and that is the same leading column
+/// an `hbmpItem` bitmap is drawn in: "About Menus" describes the selected-state bitmap as the
+/// one displayed next to the item and requires an application-supplied one to be exactly the
+/// size of the default check mark, which is the metric (`SM_CXMENUCHECK`) our own menu
+/// bitmaps are already rasterized at. What Windows draws for a row that is BOTH checked and
+/// carrying an `hbmpItem` is documented nowhere, so the icon would be at the renderer's
+/// discretion, and the icon is what was asked for. The bitmap is therefore unconditional and
+/// the mark is text there too.
+///
+/// **macOS is the one surface that marks the ITEM**, because AppKit is explicit that an
+/// `NSMenuItem`'s state image and its `image` occupy separate columns, so
+/// `setState: NSControlStateValueOn` gives a native check mark and keeps the glyph. It calls
+/// [`ink_items`] and reads `selected` directly rather than calling this.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // mac marks the NSMenuItem instead
+pub fn ink_row_label(row: InkItem) -> String {
+    if row.radio && row.selected {
+        format!("{} {}", row.label, INK_ARMED_MARK)
+    } else {
+        row.label.to_string()
+    }
+}
+
+// `ink_choice_at` lived here until DRAGON-757. It mapped a display-order INDEX back to a
+// tool, because a `ksni` RadioGroup reports a pick as an index into its own options and the
+// three tools were one such group on both Linux trays. The flat top-level rows have no index
+// space at all: each row is its own `ksni` item holding its own `InkAction`, so "a pick can
+// never arm the wrong tool" stopped being a range check and became structural. It is not
+// retained for a future caller, because a caller that needs it would be reintroducing the
+// group. `crate::ink::InkTool::at` is what it wrapped and that stays: the Windows popup
+// still marks a CONTIGUOUS command-id range and resolves a pick by offset into it.
+
 impl CaptureAction {
     /// The CLI argv a launcher / Settings action passes to a spawned one-shot child, or
     /// `None` for the one action that never spawns: [`CaptureAction::Quit`] (it tears the
@@ -1208,27 +1466,29 @@ impl CaptureAction {
     /// never spawn: they are [`TrayItem::Radio`] rows, not actions, so they cannot reach
     /// any `spawn_args().unwrap_or(…)` launcher arm.
     ///
-    /// A LIST since DRAGON-559 (it was `spawn_flag`, one flag): the record entries spawn
-    /// their capture twin's mode flag PLUS `--video`, on purpose. CLI.md's convention is
-    /// composition (`--monitor --video` records a monitor), the parser already reads the
-    /// pair, and a dedicated `--record-<mode>` flag would be a second spelling of an argv
-    /// that already exists. The record children deliberately carry NO `--audio` flag (an
-    /// absent flag keeps the persisted arms, which are exactly what the tray's Audio
-    /// Recording submenu manages) and NO `--countdown` flag (an absent flag reads the
-    /// persisted `delay_idx`, which is exactly what the Countdown Timer submenu writes).
+    /// A LIST since DRAGON-559 (it was `spawn_flag`, one flag), and since DRAGON-695 EVERY
+    /// entry is a list, because the grammar is `<command> [options]`: a still capture is
+    /// `capture --monitor` and a recording of the same thing is `record --monitor`. The old
+    /// shape composed a mode flag with `record`; the verb carries that now, which is one word
+    /// shorter and cannot be half-applied.
+    ///
+    /// The record children deliberately carry NO `--sound` option (an absent one keeps the
+    /// persisted arms, which are exactly what the tray's Audio Recording submenu manages) and
+    /// NO `--timer` (an absent one reads the persisted `countdown_secs`, which is exactly what
+    /// the Countdown Timer submenu writes).
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub fn spawn_args(self) -> Option<&'static [&'static str]> {
         match self {
-            CaptureAction::ColorPicker => Some(&["--color-picker"]),
-            CaptureAction::PaletteViewer => Some(&["--palette-viewer"]),
-            CaptureAction::Scan => Some(&["--scan"]),
-            CaptureAction::Region => Some(&["--region"]),
-            CaptureAction::Window => Some(&["--window"]),
-            CaptureAction::Monitor => Some(&["--monitor"]),
-            CaptureAction::RecordRegion => Some(&["--region", "--video"]),
-            CaptureAction::RecordWindow => Some(&["--window", "--video"]),
-            CaptureAction::RecordMonitor => Some(&["--monitor", "--video"]),
-            CaptureAction::Settings => Some(&["--settings"]),
+            CaptureAction::ColorPicker => Some(&["color", "--picker"]),
+            CaptureAction::PaletteViewer => Some(&["color", "--viewer"]),
+            CaptureAction::Scan => Some(&["scan"]),
+            CaptureAction::Region => Some(&["capture", "--region"]),
+            CaptureAction::Window => Some(&["capture", "--window"]),
+            CaptureAction::Monitor => Some(&["capture", "--monitor"]),
+            CaptureAction::RecordRegion => Some(&["record", "--region"]),
+            CaptureAction::RecordWindow => Some(&["record", "--window"]),
+            CaptureAction::RecordMonitor => Some(&["record", "--monitor"]),
+            CaptureAction::Settings => Some(&["settings"]),
             CaptureAction::Quit => None,
         }
     }
@@ -1598,6 +1858,12 @@ mod tests {
         assert_eq!(recording_menu(false)[0].label, "Pause Recording");
     }
 
+    /// The Live Annotations model entry's fingerprint for [`shape`]. NOT user copy: since
+    /// DRAGON-757 every surface renders that entry as four TOP-LEVEL rows carrying their own
+    /// labels, so no menu shows this text anywhere. It names the ONE model entry those four
+    /// rows still come from, which is what the shape pins below are about.
+    const INK_BLOCK_FINGERPRINT: &str = "Live Annotations";
+
     /// A compact fingerprint of one [`TrayItem`] for shape pins: `(label, enabled)`,
     /// where a submenu's label is its base label and a separator's is "".
     fn shape(item: &TrayItem) -> (String, bool) {
@@ -1609,6 +1875,7 @@ mod tests {
                 let label = match menu {
                     RadioSubmenu::Countdown => "Countdown Timer",
                     RadioSubmenu::Audio => "Audio Recording",
+                    RadioSubmenu::Ink => INK_BLOCK_FINGERPRINT,
                 };
                 (label.to_string(), *enabled)
             }
@@ -1617,13 +1884,13 @@ mod tests {
     }
 
     /// The owner's IDLE shape, as of DRAGON-680 item 25: THREE blocks, the launchers
-    /// (the scan row, Colors, Capture, Record), the two per-capture settings
+    /// (the scan row, Color, Capture, Record), the two per-capture settings
     /// submenus (Countdown Timer, Audio Recording), and the app tail (Settings...,
     /// Quit), each pair separated by one divider, everything enabled.
     ///
     /// Two rows have moved more than once inside DRAGON-680 alone, so what SETTLED is
     /// recorded here and the middle steps are not mistaken for the intent. The colour
-    /// entry: item 12 made it the "Colors" submenu at the head of the launchers, item 19
+    /// entry: item 12 made it the "Color" submenu at the head of the launchers, item 19
     /// moved it to its own block above Settings, item 22 brought it back into the
     /// launchers before the captures. The recording launchers: item 22 folded them into
     /// the capture submenu, item 25 gave them their own row again.
@@ -1635,7 +1902,7 @@ mod tests {
             got,
             vec![
                 (SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
                 (String::new(), true), // separator
@@ -1650,11 +1917,12 @@ mod tests {
         assert!(!items.iter().any(|i| matches!(i, TrayItem::Control(_))));
     }
 
-    /// The owner's WHILE-RECORDING shape of the full STATE model: the Audio Recording
-    /// submenu leads the WHOLE menu, then the three controls and a separator, then the
+    /// The owner's WHILE-RECORDING shape of the full STATE model: the Live Annotations
+    /// submenu leads the WHOLE menu with its own divider (DRAGON-693), then the Audio
+    /// Recording submenu, then the three controls and a separator, then the
     /// same three blocks with Record, the Countdown Timer and Quit flagged OFF (rendered
     /// as HIDDEN since the hide round; see [`visible_tray_menu`]) while the scan row,
-    /// Colors, Capture and Settings stay on. The
+    /// Color, Capture and Settings stay on. The
     /// audio submenu is MOVED to the top, not copied: the middle block emits its row only
     /// while idle.
     ///
@@ -1668,13 +1936,15 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("Audio Recording".to_string(), true), // leads the menu; live arms
+                (INK_BLOCK_FINGERPRINT.to_string(), true), // DRAGON-693: leads the menu
+                (String::new(), true),                     // its own divider, under it
+                ("Audio Recording".to_string(), true), // then the live arms
                 ("Pause Recording".to_string(), true),
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
                 (SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), false), // flagged off: one recording at a time
                 (String::new(), true), // separator, introducing an empty block
@@ -1684,12 +1954,12 @@ mod tests {
                 ("Quit".to_string(), false), // flagged off while recording
             ]
         );
-        // Paused flips only the pause control's label (now the second row, under the
-        // leading audio submenu).
+        // Paused flips only the pause control's label (the fourth row now, under the
+        // leading annotation submenu, its divider and the audio submenu).
         let paused = tray_menu(true, true);
-        assert_eq!(paused[0], items[0]);
-        assert_eq!(shape(&paused[1]).0, "Resume Recording");
-        assert_eq!(&paused[2..], &items[2..]);
+        assert_eq!(&paused[..3], &items[..3]);
+        assert_eq!(shape(&paused[3]).0, "Resume Recording");
+        assert_eq!(&paused[4..], &items[4..]);
     }
 
     /// The RENDERED while-recording dropdown (the owner's hide rule): the flagged-off
@@ -1707,18 +1977,128 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("Audio Recording".to_string(), true), // leads the whole menu
+                (INK_BLOCK_FINGERPRINT.to_string(), true), // DRAGON-693: leads the menu
+                (String::new(), true),                     // its own divider
+                ("Audio Recording".to_string(), true),
                 ("Pause Recording".to_string(), true),
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
                 (SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
             ]
         );
+    }
+
+    /// The Live Annotations block exists ONLY while recording (DRAGON-693). Idle has
+    /// nothing to draw on, so it is absent rather than present and disabled: a disabled row
+    /// is HIDDEN by the hide round anyway, and a model that emits one would be claiming the
+    /// control could apply to something.
+    #[test]
+    fn the_annotation_block_is_recording_only() {
+        let idle: Vec<TrayItem> = tray_menu(false, false);
+        assert!(
+            !idle.iter().any(|i| matches!(i, TrayItem::Radio { menu: RadioSubmenu::Ink, .. })),
+            "the idle menu must not offer live annotations"
+        );
+        for paused in [false, true] {
+            let rec = tray_menu(true, paused);
+            assert!(matches!(
+                rec.first(),
+                Some(TrayItem::Radio { menu: RadioSubmenu::Ink, enabled: true })
+            ));
+            assert!(matches!(rec.get(1), Some(TrayItem::Separator)));
+        }
+    }
+
+    /// The block's ROWS: three tools as radio positions with the current one marked, then
+    /// Clear Marks, which is NOT a radio row. That last part is what keeps the armed mark off
+    /// the action row on every surface, macOS by leaving its `NSMenuItem` state off and the
+    /// other three through `ink_row_label`. It was load-bearing for a second reason until
+    /// DRAGON-757: it kept Clear Marks out of the host radio groups the rows sat in, Win32's
+    /// contiguous `CheckMenuRadioItem` range and `ksni`'s index-reporting `RadioGroup`.
+    #[test]
+    fn the_annotation_rows_are_three_tools_and_one_action() {
+        use crate::ink::InkTool;
+        let rows = ink_items(InkTool::Marker);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().map(|r| r.label).collect::<Vec<_>>(),
+            vec!["Pointer", "Marker", "Magic Marker", CLEAR_MARKS_LABEL]
+        );
+        assert!(rows[..3].iter().all(|r| r.radio));
+        assert!(!rows[3].radio, "Clear Marks must not join the radio group");
+        assert_eq!(rows[3].action, InkAction::Clear);
+        // Every row names a glyph (DRAGON-757), and each one is the asset the recording
+        // toolbar's button for that tool already draws, so the two surfaces cannot show one
+        // tool two ways. Pinned by NAME rather than by "is some": the point is WHICH glyph.
+        assert_eq!(
+            rows.iter().map(|r| r.icon).collect::<Vec<_>>(),
+            vec![
+                MenuIcon::InkPointer,
+                MenuIcon::InkMarker,
+                MenuIcon::InkMagicMarker,
+                MenuIcon::InkClear,
+            ]
+        );
+        // Exactly one mark, on the current tool.
+        assert_eq!(rows.iter().filter(|r| r.selected).count(), 1);
+        assert!(rows[1].selected);
+        for tool in InkTool::ORDER {
+            let rows = ink_items(tool);
+            let marked = rows.iter().find(|r| r.selected).expect("something is marked");
+            assert_eq!(marked.action, InkAction::Pick(tool));
+        }
+    }
+
+    /// A pick's INDEX maps back to the tool at that display position, and a stray index arms
+    /// nothing. The index space is the three tools alone, so Clear Marks (row 3) can never be
+    /// reached through it.
+    ///
+    /// This pinned `ink_choice_at` until DRAGON-757 flattened the Linux rows out of their
+    /// radio group. It pins `InkTool::at` directly now, because the Windows popup still marks
+    /// a CONTIGUOUS command-id range and resolves a pick by offset into it, and that is the
+    /// one caller left. The Linux rows answer the same question structurally: each carries its
+    /// own `InkAction`, so there is no index to get wrong.
+    #[test]
+    fn an_annotation_pick_index_maps_back_to_its_tool() {
+        use crate::ink::InkTool;
+        assert_eq!(InkTool::at(0), Some(InkTool::Pointer));
+        assert_eq!(InkTool::at(1), Some(InkTool::Marker));
+        assert_eq!(InkTool::at(2), Some(InkTool::MagicMarker));
+        assert_eq!(InkTool::at(3), None, "the action row is outside the tool space");
+        assert_eq!(InkTool::at(99), None);
+    }
+
+    /// The FLAT rows' labels (DRAGON-757): exactly one carries [`INK_ARMED_MARK`], it is the
+    /// armed tool, and "Clear Marks" never does whatever is armed. This is what the two Linux
+    /// ksni trays and the Windows popup render; macOS marks the `NSMenuItem` instead.
+    ///
+    /// The mark is in the LABEL because those rows carry no toggle state: they had to keep
+    /// their icons on renderers that give a mark and an icon the same slot, dbusmenu hosts on
+    /// X11 and Win32's check-mark area alike. See `ink_row_label`.
+    #[test]
+    fn one_flat_annotation_row_carries_the_armed_mark() {
+        use crate::ink::InkTool;
+        for tool in InkTool::ORDER {
+            let rows = ink_items(tool);
+            let labels: Vec<String> = rows.iter().map(|r| ink_row_label(*r)).collect();
+            let marked: Vec<&String> =
+                labels.iter().filter(|l| l.contains(INK_ARMED_MARK)).collect();
+            assert_eq!(marked.len(), 1, "exactly one row is armed for {tool:?}");
+            assert_eq!(marked[0], &format!("{} {}", tool.label(), INK_ARMED_MARK));
+            assert_eq!(
+                labels[3], CLEAR_MARKS_LABEL,
+                "the action row is never marked, whatever is armed"
+            );
+        }
+        // An unarmed row renders its bare label, unchanged from the model.
+        let rows = ink_items(InkTool::MagicMarker);
+        assert_eq!(ink_row_label(rows[0]), "Pointer");
+        assert_eq!(ink_row_label(rows[1]), "Marker");
     }
 
     /// THE separator invariant, over every state the model has: a rendered dropdown never
@@ -1756,7 +2136,7 @@ mod tests {
         assert_eq!(visible_tray_menu(false, false), tray_menu(false, false));
     }
 
-    /// The Colors submenu (DRAGON-680): the pick TOOL then the Palette Viewer, each with
+    /// The Color submenu (DRAGON-680): the pick TOOL then the Palette Viewer, each with
     /// the glyph the owner named, enabled in BOTH states (neither takes a capture
     /// connection, so a live recording changes nothing about them).
     #[test]
@@ -1764,13 +2144,13 @@ mod tests {
         for recording in [false, true] {
             let items = tray_menu(recording, false);
             let colors = items.iter().find_map(|i| match i {
-                TrayItem::Launchers { menu: LauncherSubmenu::Colors, enabled, items } => {
+                TrayItem::Launchers { menu: LauncherSubmenu::Color, enabled, items } => {
                     Some((*enabled, items.clone()))
                 }
                 _ => None,
             });
-            let (enabled, rows) = colors.expect("a Colors submenu in every state");
-            assert!(enabled, "Colors stays enabled while recording");
+            let (enabled, rows) = colors.expect("a Color submenu in every state");
+            assert!(enabled, "Color stays enabled while recording");
             assert_eq!(
                 rows.iter().map(|i| (i.label, i.action, i.icon)).collect::<Vec<_>>(),
                 vec![
@@ -1785,15 +2165,15 @@ mod tests {
         }
     }
 
-    /// DRAGON-680 item 22, the owner's placement: the launchers read scan row, Colors,
+    /// DRAGON-680 item 22, the owner's placement: the launchers read scan row, Color,
     /// Capture, with NO divider among them, in BOTH states.
     ///
-    /// Pinned as RELATIVE positions rather than indices, so what was asked for (Colors
+    /// Pinned as RELATIVE positions rather than indices, so what was asked for (Color
     /// after the scan row and before the captures, the whole set in one unbroken block)
     /// survives a later row being added above. The whole-list shape tests above pin the
     /// exact order; this one pins the reason.
     ///
-    /// Item 19 put Colors in its own block above Settings and this test pinned that; item
+    /// Item 19 put Color in its own block above Settings and this test pinned that; item
     /// 22 replaced it. Both are the owner's, days apart, which is why the assertion is
     /// about the launcher block rather than about dividers around one row.
     #[test]
@@ -1813,7 +2193,7 @@ mod tests {
                 ))
                 .expect("a scan row in every state");
             let colors = at(&TrayItem::Launchers {
-                menu: LauncherSubmenu::Colors,
+                menu: LauncherSubmenu::Color,
                 enabled: true,
                 items: colors_launcher_items(),
             });
@@ -1861,7 +2241,7 @@ mod tests {
             assert_eq!(row.icon, Some(MenuIcon::Scanner), "the rename left the glyph alone");
             assert_eq!(
                 row.action.spawn_args(),
-                Some(&["--scan"][..]),
+                Some(&["scan"][..]),
                 "the rename left the argv alone"
             );
         }
@@ -1939,7 +2319,7 @@ mod tests {
                 }
                 TrayItem::Launchers { menu, .. } => {
                     let expected = match menu {
-                        LauncherSubmenu::Colors => MenuIcon::Colors,
+                        LauncherSubmenu::Color => MenuIcon::Colors,
                         LauncherSubmenu::Capture => MenuIcon::Capture,
                         LauncherSubmenu::Record => MenuIcon::Record,
                     };
@@ -1949,6 +2329,7 @@ mod tests {
                     let expected = match menu {
                         RadioSubmenu::Countdown => MenuIcon::Countdown,
                         RadioSubmenu::Audio => MenuIcon::Audio,
+                        RadioSubmenu::Ink => MenuIcon::LiveAnnotations,
                     };
                     assert_eq!(menu.icon(), expected);
                 }
@@ -2062,31 +2443,31 @@ mod tests {
     fn capture_action_spawn_args_match_the_cli_launch_flags() {
         // Every launcher / Settings action maps to the CLI argv the resident spawns a
         // one-shot child with; Quit never spawns (it tears the resident down). The
-        // record entries (DRAGON-559) are their capture twins plus `--video` — the
-        // CLI.md composition, not a new mode flag — and carry NO `--audio` and NO
-        // `--countdown` flag, so a tray-launched recording reads the persisted arms and
+        // record entries (DRAGON-559) are their capture twins plus `record` — the
+        // CLI.md composition, not a new mode flag — and carry NO `--sound` and NO
+        // `--timer` flag, so a tray-launched recording reads the persisted arms and
         // countdown the tray's own submenus manage.
-        assert_eq!(CaptureAction::ColorPicker.spawn_args(), Some(&["--color-picker"][..]));
+        assert_eq!(CaptureAction::ColorPicker.spawn_args(), Some(&["color", "--picker"][..]));
         // DRAGON-680: the Palette Viewer's own launch shape, the flag that skips the
         // overlay and the pick and opens the window straight away.
-        assert_eq!(CaptureAction::PaletteViewer.spawn_args(), Some(&["--palette-viewer"][..]));
-        assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["--scan"][..]));
-        assert_eq!(CaptureAction::Region.spawn_args(), Some(&["--region"][..]));
-        assert_eq!(CaptureAction::Window.spawn_args(), Some(&["--window"][..]));
-        assert_eq!(CaptureAction::Monitor.spawn_args(), Some(&["--monitor"][..]));
+        assert_eq!(CaptureAction::PaletteViewer.spawn_args(), Some(&["color", "--viewer"][..]));
+        assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["scan"][..]));
+        assert_eq!(CaptureAction::Region.spawn_args(), Some(&["capture", "--region"][..]));
+        assert_eq!(CaptureAction::Window.spawn_args(), Some(&["capture", "--window"][..]));
+        assert_eq!(CaptureAction::Monitor.spawn_args(), Some(&["capture", "--monitor"][..]));
         assert_eq!(
             CaptureAction::RecordRegion.spawn_args(),
-            Some(&["--region", "--video"][..])
+            Some(&["record", "--region"][..])
         );
         assert_eq!(
             CaptureAction::RecordWindow.spawn_args(),
-            Some(&["--window", "--video"][..])
+            Some(&["record", "--window"][..])
         );
         assert_eq!(
             CaptureAction::RecordMonitor.spawn_args(),
-            Some(&["--monitor", "--video"][..])
+            Some(&["record", "--monitor"][..])
         );
-        assert_eq!(CaptureAction::Settings.spawn_args(), Some(&["--settings"][..]));
+        assert_eq!(CaptureAction::Settings.spawn_args(), Some(&["settings"][..]));
         assert_eq!(CaptureAction::Quit.spawn_args(), None);
     }
 
@@ -2284,6 +2665,34 @@ mod audio_flag_parse_tests {
         assert_eq!(AudioArmState::parse_flag("NONE"), Some(AudioArmState::None));
     }
 
+    /// DRAGON-695: what the `sound` command PRINTS is a word the `sound` command ACCEPTS.
+    ///
+    /// The bug this pins is small and exactly the kind that survives review: the print used
+    /// the tray's UI copy, so bare `sound` answered `sound: None` and a set answered
+    /// `sound: Mic + System`, neither of which can be typed back. The round trip is the
+    /// property worth having, in both directions, so the two tables cannot drift.
+    #[test]
+    fn the_printed_word_is_a_word_the_parser_takes() {
+        for state in [
+            AudioArmState::Both,
+            AudioArmState::MicrophoneOnly,
+            AudioArmState::SystemOnly,
+            AudioArmState::None,
+        ] {
+            let word = state.cli_word();
+            assert_eq!(AudioArmState::parse_flag(word), Some(state), "{word}");
+            assert_eq!(word, word.to_ascii_lowercase(), "{word} must be lowercase");
+        }
+        // And it is the spelling the help lists, not one of `parse_flag`'s other accepted
+        // forms, so there is ONE answer to "what do I type".
+        assert_eq!(AudioArmState::Both.cli_word(), "both");
+        assert_eq!(AudioArmState::MicrophoneOnly.cli_word(), "mic");
+        assert_eq!(AudioArmState::SystemOnly.cli_word(), "system");
+        assert_eq!(AudioArmState::None.cli_word(), "none");
+        // The tray's UI copy is a different thing and stays as it was.
+        assert_eq!(AudioArmState::Both.word(), "Mic + System");
+    }
+
     /// Anything else is a reject, never a guess: a typo silently arming a channel (or
     /// silently NOT disarming one, for a user who asked for `none`) is the failure this
     /// parser exists to prevent. The caller turns `None` into a refused launch.
@@ -2302,7 +2711,7 @@ mod audio_flag_parse_tests {
 mod launch_arm_override_tests {
     use super::*;
 
-    /// A given `--audio` state beats the persisted pair outright, whatever the pair was:
+    /// A given `--sound` state beats the persisted pair outright, whatever the pair was:
     /// the override is complete, never a per-channel merge.
     #[test]
     fn a_flag_beats_the_persisted_arms() {

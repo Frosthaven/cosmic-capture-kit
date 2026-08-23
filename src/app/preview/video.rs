@@ -43,6 +43,70 @@ pub(super) const PREVIEW_VIDEO_LOADING_MESSAGES: [&str; 20] = [
     "Developing the reel",
 ];
 
+/// What the waiting view says while a recording finalizes (DRAGON-728).
+///
+/// Three faces because there are three honest things to say, and the copy is the same
+/// question as the number: a phase that cannot be measured can still be NAMED, and a phase
+/// that is not running at all should say nothing new.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum FinalizeReadout {
+    /// Nothing to add: the playful line and the spinner, exactly as they have always been.
+    Spinner,
+    /// A phase that can be named but not counted: the spinner with an honest label.
+    Working(&'static str),
+    /// A phase that can be counted: the label, a bar, and a percentage. The fraction is
+    /// always inside `0.0..=1.0`.
+    Measured(&'static str, f32),
+}
+
+/// **Pure**, unit-tested (DRAGON-728): what the preview's waiting view should show.
+///
+/// The whole decision, so the view stays a rendering of it and the rules are provable
+/// headless. Four of them:
+///
+/// * A STILL never finalizes a recording, so its own loading copy is untouched. The waiting
+///   view is shared, and a screenshot showing "Baking your annotations" would be nonsense.
+/// * With no pass running the answer is the existing spinner, which is every recording that
+///   is not an inked one above the DRAGON-724 live-composite gate, and every moment after the
+///   pass ends while the poster extracts.
+/// * The ink bake gets its own sentence. A user who drew on the screen will accept "Baking
+///   your annotations" taking longer than "Finalizing your recording", which is the ticket's
+///   own point, and it is the truth: that pass re-encodes the whole video because a filtered
+///   stream cannot be stream-copied.
+/// * A phase with no honest number keeps the spinner and never a frozen bar. That is the
+///   lesson `chrome::upload_progress_track` already carries: a static bar parked on one value
+///   reads as broken, not as "there is nothing to show yet".
+pub(super) fn finalize_readout(
+    is_video: bool,
+    progress: Option<crate::record::finalize_progress::Progress>,
+) -> FinalizeReadout {
+    use crate::record::finalize_progress::Phase;
+    let Some(p) = progress.filter(|_| is_video) else {
+        return FinalizeReadout::Spinner;
+    };
+    match (p.phase, p.fraction()) {
+        (Phase::BakingInk { .. }, Some(f)) => FinalizeReadout::Measured("Baking your annotations", f),
+        // The bake with no denominator to divide by, and the span after its last overlay
+        // frame. Both are the bake, so both keep its sentence.
+        (Phase::BakingInk { .. }, None) => FinalizeReadout::Working("Baking your annotations"),
+        (Phase::FinishingInk { .. }, _) => FinalizeReadout::Working("Finishing the encode"),
+        // The plain mux is fast (measured at 3.6s for a two minute take, DRAGON-716) and has
+        // no number, so it keeps the playful copy rather than trading it for a flat label.
+        (Phase::Muxing, _) => FinalizeReadout::Spinner,
+    }
+}
+
+/// **Pure**, unit-tested (DRAGON-728): a fraction as the percentage the user reads.
+///
+/// Rounded DOWN, so a pass that is 99.7% through says 99 rather than claiming to be finished
+/// while the encoder is still working. Only a genuinely complete count reads 100.
+pub(super) fn percent_text(fraction: f32) -> String {
+    // `as u8` saturates in Rust, so a nonsense input lands at an end of the range rather
+    // than wrapping into a plausible-looking wrong number.
+    let pct = (fraction.clamp(0.0, 1.0) * 100.0).floor() as u8;
+    format!("{pct}%")
+}
+
 /// The video preview's payload: the poster, inline playback state, and the scrub
 /// playhead. The micro-editor's future state (timelines, segments, undo, crossfade)
 /// extends this struct.
@@ -561,11 +625,22 @@ impl App {
 
     /// Store the extracted waveform buckets (empty = extraction failed / silent;
     /// the lanes then stay flat).
+    ///
+    /// DRAGON-733: these peaks are also the ONE honest answer to "is there audio in the track
+    /// loaded", which is the owner's own wording for when the preview editor should pause the
+    /// user's other media. They are read here and nowhere else, so the guard settles on the
+    /// same numbers the soundtrack lanes draw.
     pub(super) fn on_waveform(&mut self, id: window::Id, peaks: Arc<Vec<(f32, f32)>>) -> Task<cosmic::Action<Msg>> {
         if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && !peaks.is_empty()
         {
-            vid.waveform = Some(peaks);
+            vid.waveform = Some(peaks.clone());
+        }
+        // An EMPTY vector is an extraction that failed, not a silent track, and the two must
+        // not be conflated: a failed extraction knows nothing, so it leaves the open-time
+        // guess standing rather than un-pausing the desktop on no evidence.
+        if !peaks.is_empty() {
+            self.settle_preview_duck(id, TrackAudio::Read { audible: peaks_carry_sound(&peaks) });
         }
         Task::none()
     }
@@ -953,5 +1028,104 @@ mod tests {
         // 59.6s rounds to 60s, which rolls into the next minute rather than clipping to
         // "00:00:59" or truncating oddly.
         assert_eq!(fmt_hms(59.6), "00:01:00");
+    }
+}
+
+/// The finalize readout (DRAGON-728): what the waiting view says, and when it says a number.
+#[cfg(test)]
+mod finalize_readout_tests {
+    use super::*;
+    use crate::record::finalize_progress::{Phase, Progress};
+
+    fn baking(done: u64, total: u64) -> Option<Progress> {
+        Some(Progress { phase: Phase::BakingInk { attempt: 1 }, done, total })
+    }
+
+    /// **The default path, unchanged.** No pass running means exactly the spinner and the
+    /// playful line this view has always shown, which is every recording that is not an inked
+    /// one above the DRAGON-724 live-composite gate.
+    #[test]
+    fn with_no_finalize_running_the_view_is_what_it_always_was() {
+        assert_eq!(finalize_readout(true, None), FinalizeReadout::Spinner);
+        assert_eq!(
+            finalize_readout(true, Some(Progress { phase: Phase::Muxing, done: 0, total: 0 })),
+            FinalizeReadout::Spinner,
+            "the plain mux keeps the playful copy too"
+        );
+    }
+
+    /// A STILL capture shares this view and never finalizes a recording, so it can never be
+    /// handed a recording's phase.
+    #[test]
+    fn a_still_capture_never_shows_a_recordings_phase() {
+        assert_eq!(finalize_readout(false, baking(500, 1_000)), FinalizeReadout::Spinner);
+    }
+
+    /// The measurable phase: the bake's own sentence and its own number.
+    #[test]
+    fn the_ink_bake_says_what_it_is_doing_and_how_far_along_it_is() {
+        let FinalizeReadout::Measured(label, f) = finalize_readout(true, baking(1_216, 2_433))
+        else {
+            panic!("the feed is the phase that counts");
+        };
+        assert_eq!(label, "Baking your annotations");
+        assert!((f - 0.4998).abs() < 0.01, "{f}");
+    }
+
+    /// **No frozen bar.** The span after the last overlay frame cannot be counted, so it keeps
+    /// the spinner with an honest label rather than a bar parked on its last value, which is
+    /// the lesson `chrome::upload_progress_track` already carries.
+    #[test]
+    fn a_phase_with_no_number_keeps_the_spinner_and_a_label() {
+        assert_eq!(
+            finalize_readout(
+                true,
+                Some(Progress {
+                    phase: Phase::FinishingInk { attempt: 1 },
+                    done: 2_433,
+                    total: 2_433
+                })
+            ),
+            FinalizeReadout::Working("Finishing the encode")
+        );
+        // A bake whose worker could not say how many frames it emitted is still the bake, so
+        // it keeps that sentence and simply has nothing to count.
+        assert_eq!(
+            finalize_readout(true, baking(10, 0)),
+            FinalizeReadout::Working("Baking your annotations")
+        );
+    }
+
+    /// House copy rules, on strings that reach the screen: no em-dashes, one line each.
+    #[test]
+    fn every_label_obeys_the_copy_rules() {
+        for r in [
+            finalize_readout(true, baking(1, 2)),
+            finalize_readout(true, baking(1, 0)),
+            finalize_readout(
+                true,
+                Some(Progress { phase: Phase::FinishingInk { attempt: 2 }, done: 1, total: 2 }),
+            ),
+        ] {
+            let label = match r {
+                FinalizeReadout::Measured(l, _) | FinalizeReadout::Working(l) => l,
+                FinalizeReadout::Spinner => panic!("expected a label"),
+            };
+            assert!(!label.contains('—'), "{label}");
+            assert!(!label.contains('\n'), "{label}");
+            assert!(!label.is_empty());
+        }
+    }
+
+    /// The percentage never rounds UP into a finished-looking number, and never leaves the
+    /// range whatever it is handed.
+    #[test]
+    fn the_percentage_rounds_down_and_stays_in_range() {
+        assert_eq!(percent_text(0.0), "0%");
+        assert_eq!(percent_text(0.5), "50%");
+        assert_eq!(percent_text(0.999), "99%", "still working, so not 100");
+        assert_eq!(percent_text(1.0), "100%");
+        assert_eq!(percent_text(-3.0), "0%");
+        assert_eq!(percent_text(9.0), "100%");
     }
 }

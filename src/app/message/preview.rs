@@ -151,14 +151,14 @@ pub enum PreviewMsg {
     UploadCopyLink(String),
     /// Open the SETTINGS pane from the preview editor's chrome. A fullscreen-overlay
     /// document converts itself to a window first (an exclusive layer surface would sit
-    /// over the settings window); the pane itself is a detached `--settings` child, or a
+    /// over the settings window); the pane itself is a detached `settings` child, or a
     /// `--focus-settings` poke when one is already open — this multi-document HOST must
     /// never convert ITSELF into the settings pane the way the capture overlay's gear does.
     OpenSettings,
     /// DRAGON-582: launch the COLOUR PICKER tool from the image editor's bottom bar.
     ///
-    /// Spawns a detached `--color-picker` child rather than running the picker in this
-    /// process, for the same reason the editor's gear spawns a `--settings` child: the
+    /// Spawns a detached `color --picker` child rather than running the picker in this
+    /// process, for the same reason the editor's gear spawns a `settings` child: the
     /// picker needs its own launch-instant frozen scene of the WHOLE desktop (which this
     /// process, opened long after its capture, does not have) and its own per-output
     /// overlays. The editor stays open underneath, and the picker's overlay covers it

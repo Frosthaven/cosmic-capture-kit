@@ -137,7 +137,7 @@ pub fn activate_title(_title: &str) {
     }
 }
 
-/// The file the blocked `--settings` launch touches to ask the live settings pane to
+/// The file the blocked `settings` launch touches to ask the live settings pane to
 /// focus itself (`sub_settings_poke` polls it while the pane is open). macOS + Windows
 /// (DRAGON-153 / DRAGON-246): both raise the pane by SELF-activation from the owning
 /// process (cross-process focus is cooperative-only on macOS 14+ and foreground-locked on
@@ -147,7 +147,7 @@ pub fn settings_focus_poke_path() -> String {
     format!("{}/cosmic-capture-kit-settings.poke", crate::util::runtime_dir())
 }
 
-/// Windows (DRAGON-246): a blocked second `--settings` launch (the daemon spawns one per
+/// Windows (DRAGON-246): a blocked second `settings` launch (the daemon spawns one per
 /// "Settings" click; the in-app gear spawns `--focus-settings`) asks the live holder to come
 /// forward + un-hide its own settings window. Write the poke file the holder polls
 /// (`sub_settings_poke` → `SettingsFocusPoke` → `window::show_and_focus`) — the Windows

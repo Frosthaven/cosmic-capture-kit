@@ -26,6 +26,42 @@ impl AsRef<str> for EncoderInfo {
     }
 }
 
+/// PCI vendor ids of the silicon behind the three VENDOR-KEYED Windows tiers. Media
+/// Foundation is deliberately absent: it is the vendor-agnostic wrapper tier, so there is no
+/// id to key it on and it is never gated (see `plan::mf_plan_with`).
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const PCI_VENDOR_NVIDIA: u32 = 0x10DE;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const PCI_VENDOR_AMD: u32 = 0x1002;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+const PCI_VENDOR_INTEL: u32 = 0x8086;
+
+/// Whether a tier whose encoder only exists on `vendor`'s silicon is worth PROBING, given
+/// the PCI vendor ids of the adapters this machine actually has. Pure, unit-tested.
+///
+/// DRAGON-754. Each Windows hardware tier is gated by a real ffmpeg probe-ENCODE, and a tier
+/// whose vendor is not in the machine fails that probe after doing real work: on the owner's
+/// NVIDIA + AMD box the `h264_qsv` probe is the slowest of the four, and it was being run on
+/// every launch that read this list, only ever to answer no. `h264_nvenc` needs an NVIDIA
+/// GPU, `h264_amf` an AMD one and `h264_qsv` Intel Quick Sync silicon, which is an Intel
+/// iGPU or an Arc card; all three enumerate as DXGI adapters under their PCI vendor id, so
+/// "no adapter of that vendor" and "the probe will say no" are the same fact.
+///
+/// **It FAILS OPEN, and that is load-bearing**: an EMPTY adapter list means "DXGI told us
+/// nothing", which covers a failed `CreateDXGIFactory1`, a session with only the Basic Render
+/// Driver, and any future case nobody has met, so it must mean "probe everything" and not
+/// "this machine has no GPU". The gate can therefore only ever skip a probe that a REAL
+/// enumeration positively contradicts. This never widens what the list offers, and it never
+/// changes what a probe ANSWERS: it only declines to ask a question whose answer is known.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn vendor_silicon_present(adapter_vendors: &[u32], vendor: u32) -> bool {
+    adapter_vendors.is_empty() || adapter_vendors.contains(&vendor)
+}
+
 /// Probe the encoders usable on this machine, friendly-labelled, in preference
 /// order (so `first()` is the best available): NVENC / VAAPI when the device +
 /// ffmpeg encoder exist, then Software, which is always offered.
@@ -42,7 +78,8 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
             hevc: hardware_hevc_ok_with(&enc, "videotoolbox"),
         });
     }
-    // Windows hardware tier (DRAGON-238): NVENC > AMF > QSV, each offered only when the
+    // Windows hardware tier (DRAGON-238, plus Media Foundation in DRAGON-701):
+    // NVENC > AMF > QSV > MF, each offered only when the
     // encoder is BUILT INTO ffmpeg AND a real probe-encode actually initialises (Windows
     // has no `/dev` node to sniff — the honest gate is "does the encoder open"). Ranked
     // before the always-on Software entry. The Linux nvidia/vaapi `/dev` checks below are
@@ -51,35 +88,79 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
     // a missing/unreadable adapter degrades to the historical vendor-only fallback.
     #[cfg(windows)]
     {
-        use crate::platform::windows::gpu::adapter_name_for_vendor;
-        if enc.contains("h264_nvenc") && hw_encoder_probe_ok("h264_nvenc") {
+        use crate::platform::windows::gpu::{
+            adapter_name_for_vendor, adapter_vendors, primary_adapter_name,
+        };
+        // DRAGON-754: read the adapter set ONCE (it is cached anyway) and let
+        // `vendor_silicon_present` decide, per tier, whether its probe-encode can tell us
+        // anything we do not already know. The `enc.contains` build check stays FIRST in each
+        // row, exactly as before: it is a string search over output already in hand.
+        let vendors = adapter_vendors();
+        if enc.contains("h264_nvenc")
+            && vendor_silicon_present(&vendors, PCI_VENDOR_NVIDIA)
+            && hw_encoder_probe_ok("h264_nvenc")
+        {
             v.push(EncoderInfo {
                 id: "nvenc".into(),
                 label: format!(
                     "{} (NVENC)",
-                    adapter_name_for_vendor(0x10DE).unwrap_or_else(|| "NVIDIA".into())
+                    adapter_name_for_vendor(PCI_VENDOR_NVIDIA).unwrap_or_else(|| "NVIDIA".into())
                 ),
                 hevc: hardware_hevc_ok_with(&enc, "nvenc"),
             });
         }
-        if enc.contains("h264_amf") && hw_encoder_probe_ok("h264_amf") {
+        if enc.contains("h264_amf")
+            && vendor_silicon_present(&vendors, PCI_VENDOR_AMD)
+            && hw_encoder_probe_ok("h264_amf")
+        {
             v.push(EncoderInfo {
                 id: "amf".into(),
                 label: format!(
                     "{} (AMF)",
-                    adapter_name_for_vendor(0x1002).unwrap_or_else(|| "AMD".into())
+                    adapter_name_for_vendor(PCI_VENDOR_AMD).unwrap_or_else(|| "AMD".into())
                 ),
                 hevc: hardware_hevc_ok_with(&enc, "amf"),
             });
         }
-        if enc.contains("h264_qsv") && hw_encoder_probe_ok("h264_qsv") {
+        if enc.contains("h264_qsv")
+            && vendor_silicon_present(&vendors, PCI_VENDOR_INTEL)
+            && hw_encoder_probe_ok("h264_qsv")
+        {
             v.push(EncoderInfo {
                 id: "qsv".into(),
                 label: format!(
                     "{} (Intel Quick Sync (QSV))",
-                    adapter_name_for_vendor(0x8086).unwrap_or_else(|| "Intel".into())
+                    adapter_name_for_vendor(PCI_VENDOR_INTEL).unwrap_or_else(|| "Intel".into())
                 ),
                 hevc: hardware_hevc_ok_with(&enc, "qsv"),
+            });
+        }
+        // Media Foundation (DRAGON-701), listed LAST among the hardware tiers because on an
+        // x86 box it reaches the same silicon as the three above through one more layer. On
+        // an ARM64 Windows build it is the only hardware tier there is, which is why it has
+        // to be listed at all rather than left as an auto-ladder-only fallback: the settings
+        // encoder row, the codec row's HEVC answer, the Health page and the benchmark all
+        // read THIS list, so a tier missing from it is a tier the user is told they do not
+        // have while their recordings use it.
+        //
+        // The probe forces hardware (`MF_HW_ENCODING`). Without that, Microsoft's software
+        // H.264 MFT answers on every Windows machine and this row would never be absent.
+        // The label is vendor-agnostic for the same reason the tier is.
+        //
+        // It goes through `mf_probe_args`, which adds the NV12 the recording actually feeds
+        // (DRAGON-708). Forcing hardware WITHOUT naming that pixel format fails on EVERY
+        // machine, so this row was absent everywhere: the comment above promised the row
+        // disappears only when there is no hardware MFT, and it was in fact never shown.
+        // The list is read by the settings encoder row, the codec row, the Health page and
+        // the benchmark, so all four were telling the user they lacked a tier they had.
+        if enc.contains("h264_mf") && hw_encoder_probe_ok_with("h264_mf", &mf_probe_args()) {
+            v.push(EncoderInfo {
+                id: "mf".into(),
+                label: format!(
+                    "{} (Media Foundation)",
+                    primary_adapter_name().unwrap_or_else(|| "GPU".into())
+                ),
+                hevc: hardware_hevc_ok_with(&enc, "mf"),
             });
         }
     }
@@ -309,5 +390,56 @@ mod tests {
     #[test]
     fn nvml_text_on_a_clean_exit_is_not_a_mismatch() {
         assert!(!nvml_mismatch(true, "Failed to initialize NVML: transient", ""));
+    }
+}
+
+/// DRAGON-754: which Windows tier probes are worth spawning at all. Pure, so the whole truth
+/// table is provable on any host, which is the point of keeping the rule out of the plugin.
+#[cfg(test)]
+mod vendor_silicon_present_tests {
+    use super::{PCI_VENDOR_AMD, PCI_VENDOR_INTEL, PCI_VENDOR_NVIDIA, vendor_silicon_present};
+
+    /// The owner's box: an RTX 4090 and a Ryzen iGPU, no Intel silicon anywhere. NVENC and
+    /// AMF are still asked; the QSV probe, whose only possible answer here is no, is not.
+    #[test]
+    fn a_vendor_the_machine_lacks_is_not_probed() {
+        let vendors = [PCI_VENDOR_NVIDIA, PCI_VENDOR_AMD];
+        assert!(vendor_silicon_present(&vendors, PCI_VENDOR_NVIDIA));
+        assert!(vendor_silicon_present(&vendors, PCI_VENDOR_AMD));
+        assert!(!vendor_silicon_present(&vendors, PCI_VENDOR_INTEL));
+    }
+
+    /// FAIL OPEN. An empty list is "DXGI told us nothing", never "this machine has no GPU",
+    /// so every probe still runs and the behaviour is exactly what it was before the gate.
+    #[test]
+    fn an_unreadable_adapter_set_probes_everything() {
+        for vendor in [PCI_VENDOR_NVIDIA, PCI_VENDOR_AMD, PCI_VENDOR_INTEL] {
+            assert!(vendor_silicon_present(&[], vendor), "{vendor:#x}");
+        }
+    }
+
+    /// A machine with only one vendor's silicon: that tier is probed and the other two are
+    /// skipped. An ARM64 Windows box reaches this shape with no matching vendor at all, and
+    /// Media Foundation, which is never gated, is the tier that answers there.
+    #[test]
+    fn a_single_vendor_machine_skips_the_other_tiers() {
+        let intel_only = [PCI_VENDOR_INTEL];
+        assert!(vendor_silicon_present(&intel_only, PCI_VENDOR_INTEL));
+        assert!(!vendor_silicon_present(&intel_only, PCI_VENDOR_NVIDIA));
+        assert!(!vendor_silicon_present(&intel_only, PCI_VENDOR_AMD));
+        // A vendor nobody keys a tier on (Qualcomm) leaves all three gated out.
+        let arm = [0x5143u32];
+        for vendor in [PCI_VENDOR_NVIDIA, PCI_VENDOR_AMD, PCI_VENDOR_INTEL] {
+            assert!(!vendor_silicon_present(&arm, vendor), "{vendor:#x}");
+        }
+    }
+
+    /// Duplicates are kept by the reader (two cards of one vendor), and must not confuse the
+    /// answer.
+    #[test]
+    fn repeated_adapters_of_one_vendor_still_read_as_present() {
+        let two_nvidia = [PCI_VENDOR_NVIDIA, PCI_VENDOR_NVIDIA];
+        assert!(vendor_silicon_present(&two_nvidia, PCI_VENDOR_NVIDIA));
+        assert!(!vendor_silicon_present(&two_nvidia, PCI_VENDOR_INTEL));
     }
 }

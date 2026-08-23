@@ -53,11 +53,21 @@ impl App {
         // below), so this is the same answer given one update sooner, with no timer armed to
         // give it.
         self.accept_pending = None;
-        let cmds: Vec<_> = self
-            .outputs
-            .iter()
-            .map(|o| self.close_overlay_surface(o.id))
-            .collect();
+        // DRAGON-691: the live ink surface goes with them. It is not in `self.outputs` (its
+        // own surface, so the recording keeps the ink while the toolbar's overlay is excluded
+        // from it), so it would otherwise survive its own session and sit over the preview.
+        // The SCENE is dropped too: this is a permanent overlay close, so there is nothing
+        // for the strokes to be drawn on ever again.
+        let mut cmds: Vec<_> = vec![self.close_ink_surface()];
+        self.ink.tool = crate::ink::InkTool::Pointer;
+        self.ink.live = None;
+        // The LOG is kept, not cleared, and that is the DRAGON-691 amendment 2 change: a
+        // window recording's ink is composited in AFTER the session, so the strokes have to
+        // outlive the surface they were drawn on. `stop_recording` hands the log to the bake;
+        // `finish_session` drops it with the process.
+        self.ink.window_rects.clear();
+        self.ink.window_rect_misses = 0;
+        cmds.extend(self.outputs.iter().map(|o| self.close_overlay_surface(o.id)));
         self.outputs.clear();
         // `lab/flatpak`: the fallback window's close was just issued (through the helper
         // above); clearing the id FIRST-thing-after means its `Closed` echo reads as our
@@ -116,6 +126,12 @@ impl App {
         // tray "Cancel countdown", `fail_session`. Idempotent, and a no-op on every session
         // that never armed a video countdown.
         self.abandon_warming();
+        // DRAGON-694: the live-annotation media guard ends with the session, so other players
+        // resume even if a tool was still armed at an ending `clear_recording_state` never
+        // reached (a teardown, a `fail_session`). Explicit, though the process exiting would
+        // close the babysitter's stdin and resume them anyway; that last net is what makes a
+        // crash safe, and this one is what makes the ordinary path immediate.
+        self.ink_duck = None;
         // DRAGON-174: the per-session status icon lives for the WHOLE session and exits
         // with it — tear it down here (removes an own NSStatusItem / ksni item; reverts a
         // resident relay to idle). Explicit even though the process exits right after, so
@@ -236,7 +252,7 @@ impl App {
     /// macOS/Windows: seed `self.outputs` + mint one capture overlay window per
     /// display, once at startup. This replaces the Wayland `OutputEvent` → `on_output`
     /// path (there is no output-event subscription off Wayland). Mirrors `on_output`'s
-    /// guards: `--settings` gets no overlays, and `--preview <file>` opens the file's
+    /// guards: `settings` gets no overlays, and `editor <file>` opens the file's
     /// preview on the active output instead of any capture overlay.
     #[cfg(not(target_os = "linux"))]
     // The final overlay-seeding branch is a cfg'd macOS `{ return … }` block followed by
@@ -244,11 +260,11 @@ impl App {
     // the lint on macOS only (Linux compiles the tail branch and never sees it).
     #[cfg_attr(target_os = "macos", allow(clippy::needless_return))]
     pub(super) fn seed_outputs_mac(&mut self) -> Task<cosmic::Action<Msg>> {
-        // `--settings` is a standalone window with no capture overlays.
+        // `settings` is a standalone window with no capture overlays.
         if self.settings.only {
             return Task::none();
         }
-        // DRAGON-680: so is `--palette-viewer`, the colour picker's result window with no
+        // DRAGON-680: so is `color --viewer`, the colour picker's result window with no
         // overlay phase behind it. Its own window is opened from `init` (through
         // `WindowChromeMsg::OpenPaletteViewer`), so there is nothing to do here but refuse.
         if self.palette_viewer {
@@ -260,7 +276,7 @@ impl App {
         // and a `Task` to route through `fail_session` (which records the failure, shows the
         // DRAGON-415 alert, and exits cleanly).
         //
-        // Checked after the `--settings` guard and before everything else on purpose: a
+        // Checked after the `settings` guard and before everything else on purpose: a
         // settings launch is perfectly usable on 13 and must not be interrupted, while every
         // branch below this leads to a capture one way or another.
         #[cfg(target_os = "macos")]
@@ -283,13 +299,13 @@ impl App {
             );
             return self.fail_session();
         }
-        // The permission-checker window (`--permissions` / missing-grant routing) is
+        // The permission-checker window (`permissions` / missing-grant routing) is
         // likewise a standalone window — no capture overlays, and no tiling-WM pause
         // (nothing is being captured). Same guard shape as settings.
         if self.permissions.window.is_some() {
             return Task::none();
         }
-        // `--preview <file>`: no capture overlays — open the preview on the active
+        // `editor <file>`: no capture overlays — open the preview on the active
         // output, mirroring `on_output`'s preview branch.
         if self.preview_mode {
             // DRAGON-427: the spawned editor child opens the handed-over capture through the
@@ -561,7 +577,7 @@ impl App {
             }
             cmds.push(window::gain_focus(id));
         }
-        // Arm the button meters for the overlay we just seeded: on a `--video` launch the
+        // Arm the button meters for the overlay we just seeded: on a `record` launch the
         // kind is set at init WITHOUT going through `SetKind`, so `sync_meters` never ran
         // and both channels' armed-idle meters sat idle. This is the macOS overlay-up seam
         // — the parity point for the Linux output-hotplug meter arming. Idempotent (a
@@ -729,6 +745,13 @@ impl App {
                 // pre-order-front chrome strip already classified it as an AeroSpace popup;
                 // this backstops that title-scoped, through the shared entry point.
                 crate::platform::opt_out_of_tiling(&o.name);
+                // DRAGON-690: and out of the recordings WE make. This overlay draws the
+                // recording chip for the whole session, so without this the controls are in
+                // every display / region video. Done HERE, at placement, rather than at
+                // recording start: the macOS content filter is built on the worker thread
+                // the moment a recording begins, so registering any later is a race, and
+                // registering early costs nothing (the id only ever feeds our own filter).
+                crate::platform::exclude_window_from_capture(&o.name);
                 // A tiling WM never manages the overlay (the DRAGON-154 chrome-strip opt-out,
                 // or the escape-hatch pause), so nothing re-homes it — no burst needed.
                 //
@@ -915,6 +938,12 @@ impl App {
         // already set the komorebi bit pre-show; this is the idempotent, title-scoped
         // confirmation through the shared entry point.
         crate::platform::opt_out_of_tiling(name);
+        // DRAGON-690: and out of screen captures, so the recording chip this overlay draws
+        // is not in the video. `WDA_EXCLUDEFROMCAPTURE` needs a placed top-level window, so
+        // it belongs here with the other once-it-is-on-screen steps rather than in
+        // `place_overlay`'s pre-show styling. A build older than 19041 gets no exclusion at
+        // all (never `WDA_MONITOR`, whose black box would be worse); the arm decides.
+        crate::platform::exclude_window_from_capture(name);
         // DRAGON-280: now the overlay is on-screen (phase 2 done), re-assert HWND_TOPMOST
         // once. place_overlay's two-phase off-screen->on-screen show can race a fullscreen
         // app's own topmost / DWM independent-flip state; a cheap z-order-only SetWindowPos
@@ -1000,7 +1029,7 @@ impl App {
         // DRAGON-309: resolve the TRIGGER monitor's rect from `preview_output` (the same
         // by-output-name lookup as the overlay preview) and hand it in so the NSWindow is
         // repositioned CENTERED on that monitor — winit's default cascade lands it on the
-        // active display, which for a cross-display capture is the wrong one. `--preview`
+        // active display, which for a cross-display capture is the wrong one. `editor`
         // (no capture anchor) passes `None` and keeps winit's placement.
         let monitor = self
             .preview_output
@@ -1068,7 +1097,7 @@ impl App {
     /// [`crate::platform::windows::window::show_centered`] positions it natively while
     /// still hidden (no flash), keeping the restyle-before-show opt-out ordering intact.
     /// The anchor is the capture output when known (`preview_output`), else the display
-    /// under the pointer (`--preview`). Retries briefly if the title hasn't landed yet
+    /// under the pointer (`editor`). Retries briefly if the title hasn't landed yet
     /// (same 30 x 40ms budget as `configure_overlay`), then gives up loudly. Only acts
     /// on the current preview window. No `WS_EX_TOOLWINDOW`: it keeps its taskbar button.
     #[cfg(target_os = "windows")]
@@ -1311,7 +1340,7 @@ impl App {
     }
 
     /// Like [`Self::preview_surface`] but on the compositor's *active* output (the one the
-    /// user is on) — used by `--preview`, which has no capture selection to anchor to. The
+    /// user is on) — used by `editor`, which has no capture selection to anchor to. The
     /// real monitor size arrives later via the surface's resize event.
     #[cfg(target_os = "linux")]
     pub(super) fn preview_surface_active(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
@@ -1484,10 +1513,21 @@ impl App {
             let (lx, ly) = o.units().to_point((px, py));
             r.contains(cosmic::iced::Point::new(lx, ly)).then_some(o.id)
         });
+        // DRAGON-691: the same dance, one surface richer. The ink surface takes the pointer
+        // everywhere it is armed EXCEPT over the toolbar, where the controls must win, so it
+        // is the exact complement of the answer above. AppKit has no per-rect input region
+        // (which is why this poll exists at all), so a whole-window flip is the only way to
+        // say it, and the ink surface covers the display it is on.
+        //
+        // Computed BEFORE the unchanged-hover early return below, because the arm state can
+        // change without the hover changing: disarming a tool while the pointer sits
+        // somewhere neutral must still let go of the screen.
+        let ink_pass = !self.ink_drawing_armed() || hovered.is_some();
+        let ink_task = self.set_ink_passthrough(ink_pass);
         if hovered == self.passthrough_solid {
-            return Task::none();
+            return ink_task;
         }
-        let mut cmds = Vec::new();
+        let mut cmds = vec![ink_task];
         if let Some(prev) = self.passthrough_solid.take() {
             cmds.push(window::enable_mouse_passthrough(prev));
         }
@@ -1516,6 +1556,13 @@ impl App {
                 crate::platform::windows::window::cursor_in_window_logical(&o.name)?;
             r.contains(cosmic::iced::Point::new(lx, ly)).then_some(o.id)
         });
+        // DRAGON-691: the ink surface is the exact complement of the toolbar's answer: it
+        // takes the pointer wherever a tool is armed except over the controls. Win32 has no
+        // per-rect input region either, so this is the same whole-window `WS_EX_TRANSPARENT`
+        // flip the overlays use. Computed before the unchanged-hover return below, because
+        // disarming a tool must let go of the screen even if the pointer never moved.
+        let ink_pass = !self.ink_drawing_armed() || hovered.is_some();
+        let _ = self.set_ink_passthrough(ink_pass);
         if hovered == self.passthrough_solid {
             return Task::none();
         }
@@ -1721,11 +1768,11 @@ impl App {
     // macOS and fails to resolve those Linux-only items.
     #[cfg(target_os = "linux")]
     pub(super) fn on_output(&mut self, ev: OutputEvent, output: OutputHandle) -> Task<cosmic::Action<Msg>> {
-        // `--settings` is a standalone window with no capture overlays.
+        // `settings` is a standalone window with no capture overlays.
         if self.settings.only {
             return Task::none();
         }
-        // DRAGON-680: `--palette-viewer` likewise. The same guard as the `seed_outputs_mac`
+        // DRAGON-680: `color --viewer` likewise. The same guard as the `seed_outputs_mac`
         // twin above, wired at BOTH seeds so the flag cannot mean different things per
         // platform (the rule `preview_mode` already follows here).
         if self.palette_viewer {
@@ -1754,7 +1801,7 @@ impl App {
                     .map(|pw| pw as f32 / lw as f32)
                     .filter(|s| s.is_finite() && *s >= 1.0)
                     .unwrap_or(1.0);
-                // `--preview <file>`: no capture overlays — open the preview on the active
+                // `editor <file>`: no capture overlays — open the preview on the active
                 // output once outputs exist, then ignore the rest. (The surface targets
                 // the active monitor itself; we don't need this event's specific output.)
                 if self.preview_mode {
@@ -1802,7 +1849,7 @@ impl App {
                 // `seed_overlays_mac`'s call, and until DRAGON-457 the parity that side
                 // already claimed to have.
                 //
-                // A launch that STARTS in video kind (`--video`, a bound recording hotkey,
+                // A launch that STARTS in video kind (`record`, a bound recording hotkey,
                 // an immediate `--active-monitor --video`) sets `self.kind` at init and
                 // never passes through `SetKind`, which off this seam is the only thing on
                 // Linux that calls `sync_meters`. So the mic and system meters were never
@@ -1821,8 +1868,11 @@ impl App {
                 // picker overlay while it is pending. `immediate_kicked` makes the kick
                 // one-shot; later output events just register (below). macOS/Windows resolve
                 // immediately in `seed_outputs_mac` (they read a real global cursor position).
+                // DRAGON-698: `pending_immediate` keeps the suppression while a deferred
+                // immediate capture counts down — `startup_immediate` was already spent by
+                // then, and a hotplugged output must not mint a picker under the countdown.
                 #[cfg(target_os = "linux")]
-                if self.startup_immediate.is_some() {
+                if self.startup_immediate.is_some() || self.pending_immediate.is_some() {
                     if !self.immediate_kicked {
                         self.immediate_kicked = true;
                         return Task::perform(
@@ -1864,6 +1914,25 @@ impl App {
                         }
                         return self.request_fallback_cast(super::portal::RequestOrigin::LaunchSeed);
                     }
+                    return Task::none();
+                }
+                // DRAGON-718: a pinned monitor/window launch whose backend choice is the
+                // PORTAL mints nothing yet. Minting here is what silently committed such a
+                // launch to native capture: these surfaces ARE the native picker, and once
+                // they exist the portal is never asked. The seed is settled by the probe
+                // answer (`PipewireProbed`) or by its own bounded deadline
+                // (`PortalSeedDeadline`), and whichever arrives first mints these or
+                // dispatches the portal picker instead. The output is already registered
+                // above, which is what those handlers need.
+                //
+                // DRAGON-732: ask the SEED, not "is a wait still pending". A launch the
+                // portal is picking for mints nothing for the life of that request, and
+                // that is the only reading which survives the probe answering: on this
+                // desktop the outputs qualify AFTER it does, every time, so the old
+                // is-still-waiting test let each of them mint a picker beside the portal's
+                // own dialog. `on_pipewire_cast_ready` puts the seed back to `Native` when
+                // the request answers, so a cancelled dialog can mint again.
+                if !self.portal_seed.mints_native_pickers() {
                     return Task::none();
                 }
                 // No auto-seeded region: monitors without a region show a "begin

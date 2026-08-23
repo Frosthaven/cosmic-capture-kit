@@ -15,7 +15,7 @@
 //! while paused) and its menu is the ONE portable
 //! [`crate::recording_ui::visible_tray_menu`] model, both states: while recording the
 //! three controls lead (Pause / Resume Recording, Finish & Save Recording, Cancel &
-//! Delete Recording), then the shared launcher block (the scan row, the "Colors"
+//! Delete Recording), then the shared launcher block (the scan row, the "Color"
 //! submenu, the "Capture" submenu) and Settings..., with the flagged-off rows
 //! HIDDEN (no Record, no Countdown Timer, no Quit while recording; the hide round's why
 //! is on `visible_tray_menu`) and the empty middle block's divider collapsed with it.
@@ -72,6 +72,11 @@ pub enum TrayEvent {
     /// Quit item — a child-owned icon has no resident to quit, so the least-weird uniform
     /// behavior is to end this capture session (the app dispatches it to `finish_session`).
     Quit,
+    /// A "Live Annotations" radio pick (DRAGON-693): move the ink selector to this tool.
+    /// Mirrors the macOS enum, so the app's handling is platform-free.
+    InkTool(crate::ink::InkTool),
+    /// The "Live Annotations" submenu's "Clear Marks" row (DRAGON-693).
+    InkClear,
 }
 
 /// The state the item renders: whether a recording is in progress (idle vs recording icon
@@ -87,6 +92,10 @@ struct TrayState {
     mic: bool,
     system_audio: bool,
     delay_idx: usize,
+    /// The live-annotation tool the app currently has selected (DRAGON-693), for the Live
+    /// Annotations submenu's radio mark. The APP owns the selector; this is a mirror it
+    /// pushes on every change.
+    ink: crate::ink::InkTool,
 }
 
 /// The single recording tray item: its live state, the app's accent colour (the icon
@@ -142,15 +151,19 @@ impl ksni::Tray for RecordingTray {
 
     /// The control menu: the ONE portable [`visible_tray_menu`] model (DRAGON-574 +
     /// the hide round), both states. While NOT recording (the idle session icon): the
-    /// scan row, the Colors / Capture / Record submenus, a separator, the
+    /// scan row, the Color / Capture / Record submenus, a separator, the
     /// Countdown Timer and Audio
     /// Recording radio submenus, a separator, Settings..., Quit (a child-owned idle
-    /// icon quits the session/app). While recording: the three controls and a
-    /// separator lead, then the same group with the flagged-off rows HIDDEN (no
-    /// Record, no Countdown Timer, no Quit; the why is on `visible_tray_menu`).
+    /// icon quits the session/app). While recording: the four FLAT Live Annotations
+    /// rows lead (DRAGON-757, see [`ink_flat_items`]), then a separator, the Audio
+    /// Recording submenu and the three controls, then the same group with the
+    /// flagged-off rows HIDDEN (no Record, no Countdown Timer, no Quit; the why is on
+    /// `visible_tray_menu`).
     /// Labels, order, icons and visibility all come from the model so this surface
-    /// matches the resident / daemons exactly. A left-click opens the menu, so every
-    /// control is one click away.
+    /// matches the resident / daemons exactly, apart from the annotation block, which
+    /// is the one entry the two LINUX surfaces render flat and the other platforms
+    /// still open as a submenu. A left-click opens the menu, so every control is one
+    /// click away.
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         build_menu_items(self.state, self.accent)
     }
@@ -222,14 +235,14 @@ fn build_menu_items(state: TrayState, accent: [u8; 3]) -> Vec<ksni::MenuItem<Rec
                 ),
                 action => {
                     // `spawn_args` because a record entry's argv is its capture twin's
-                    // flag plus `--video` (DRAGON-559). A row that spawns a child defers
+                    // flag plus `record` (DRAGON-559). A row that spawns a child defers
                     // past the menu dismiss (DRAGON-574: the dropdown was getting baked
                     // into the fallback's frozen frame; DRAGON-598 derived the set from
                     // `spawn_args` so a new row cannot fall out of it). DRAGON-600 moved
                     // the wait into the child: the host closes its dropdown only when the
                     // launched process takes keyboard focus, so waiting here would only
                     // hold the menu up longer.
-                    let args = action.spawn_args().unwrap_or(&["--region"]);
+                    let args = action.spawn_args().unwrap_or(&["capture", "--region"]);
                     let from_menu = crate::recording_ui::spawn_waits_for_menu_dismiss(action);
                     items.push(
                         StandardItem {
@@ -260,7 +273,7 @@ fn build_menu_items(state: TrayState, accent: [u8; 3]) -> Vec<ksni::MenuItem<Rec
                     submenu: rows
                         .into_iter()
                         .map(|row| {
-                            let args = row.action.spawn_args().unwrap_or(&["--region"]);
+                            let args = row.action.spawn_args().unwrap_or(&["capture", "--region"]);
                             StandardItem {
                                 label: row.label.to_string(),
                                 // Belt and braces: a host that opens a disabled submenu
@@ -292,6 +305,9 @@ fn build_menu_items(state: TrayState, accent: [u8; 3]) -> Vec<ksni::MenuItem<Rec
             }
             TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled } => {
                 items.push(countdown_submenu_items(state, enabled, accent));
+            }
+            TrayItem::Radio { menu: RadioSubmenu::Ink, enabled } => {
+                items.extend(ink_flat_items(state.ink, enabled, accent));
             }
         }
     }
@@ -382,6 +398,76 @@ fn countdown_submenu_items(
         ..Default::default()
     }
     .into()
+}
+
+/// The "Live Annotations" block as FOUR TOP-LEVEL ksni rows (DRAGON-757, replacing
+/// DRAGON-693's submenu): Pointer, Marker, Magic Marker, Clear Marks, each carrying the glyph
+/// the recording toolbar's button for it already draws. The owner's ask: the tools are what a
+/// user reaches for repeatedly mid-take, and a submenu put a hover and a second click in front
+/// of every one of them.
+///
+/// They go exactly where the submenu stood, at the head of the recording menu, and the model's
+/// own separator under the block still closes it. No separator is emitted ABOVE them: the block
+/// leads the whole dropdown, and a rule at the very top reads as a rendering bug on every host.
+/// If the block ever moves off the top, the separator belongs in `tray_menu` with every other
+/// block boundary, not here.
+///
+/// ## Why these are plain rows and the armed tool is marked in the LABEL
+///
+/// This is the X11 half of the ask, and it decided the row KIND. `ksni` would take a
+/// `CheckmarkItem` here, and a check or radio row is the idiomatic way to show which of a set
+/// is on. But dbusmenu carries `toggle-type`, `toggle-state` and `icon-data` as three
+/// independent properties and says nothing about one row rendering a toggle indicator AND an
+/// icon; whether it does is the HOST's choice. This project already recorded that the two
+/// fight for the same slot on several hosts (`recording_ui::MenuIcon`'s doc), and those hosts
+/// are the GTK / libdbusmenu ones on X11 that the owner flagged, not the COSMIC applet. A
+/// toggle row would therefore put the ICON at the host's discretion, and the icon is precisely
+/// what was asked for.
+///
+/// So the rows carry NO toggle type: the icon slot is unambiguously the row's own, and the
+/// armed mark rides in the label instead (`recording_ui::ink_row_label`), the one property
+/// every dbusmenu host renders. That also means the armed tool still reads on a host that
+/// renders no menu icons at all, which a tint-based or icon-based mark could not promise.
+///
+/// A pick also cannot arm the wrong tool any more, and not by a range check: a `RadioGroup`
+/// reported a pick as an index into its own options, which is why Clear Marks had to be kept
+/// out of the group. Each row here holds its OWN `InkAction` in its own closure, so there is
+/// no index space left to shift. Every route still sends the app an event rather than acting:
+/// the APP owns the selector, the scene and the surface.
+fn ink_flat_items(
+    current: crate::ink::InkTool,
+    enabled: bool,
+    accent: [u8; 3],
+) -> Vec<ksni::MenuItem<RecordingTray>> {
+    use crate::recording_ui::{ink_items, ink_row_label, InkAction};
+    use ksni::menu::StandardItem;
+    ink_items(current)
+        .into_iter()
+        .map(|row| {
+            let action = row.action;
+            StandardItem {
+                label: ink_row_label(row),
+                // Belt and braces, like the launcher rows: the model only ever emits this
+                // block enabled (and the hide round would drop it otherwise), but a row that
+                // says it is usable and is not would be the tray lying.
+                enabled,
+                icon_data: menu_icon_png(Some(row.icon), accent),
+                activate: Box::new(move |t: &mut RecordingTray| match action {
+                    InkAction::Pick(tool) => {
+                        // Mark it here too, so the next menu build shows the pick even before
+                        // the app's own state reaches us. The old radio group did the same.
+                        t.state.ink = tool;
+                        let _ = t.tx.send(TrayEvent::InkTool(tool));
+                    }
+                    InkAction::Clear => {
+                        let _ = t.tx.send(TrayEvent::InkClear);
+                    }
+                }),
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
 }
 
 /// Rasterize a menu-item ICON (DRAGON-574) as the PNG bytes ksni's `icon_data` carries:
@@ -653,6 +739,23 @@ impl TraySession {
         }
     }
 
+    /// Reflect the selected live-annotation tool (DRAGON-693), so the Live Annotations
+    /// submenu's radio mark follows however the tool was picked: the tray itself, the
+    /// toolbar's buttons, the armed window's selector or Escape.
+    pub fn set_ink(&self, tool: crate::ink::InkTool) {
+        match &self.backing {
+            Backing::Daemon(d) => {
+                d.state.borrow_mut().ink = tool;
+                d.push();
+            }
+            Backing::Own(o) => {
+                o.handle.update(|t| {
+                    t.state.ink = tool;
+                });
+            }
+        }
+    }
+
     /// Reflect pause state (resident: resend the snapshot so the icon + Pause/Resume label
     /// update there; own: flip the item's icon + Pause/Resume label via the ksni handle).
     pub fn set_paused(&self, paused: bool) {
@@ -684,7 +787,14 @@ impl OwnBacking {
         use ksni::blocking::TrayMethods;
         let (tx, events) = std::sync::mpsc::channel();
         let tray = RecordingTray {
-            state: TrayState { recording, paused: false, mic, system_audio, delay_idx },
+            state: TrayState {
+                recording,
+                paused: false,
+                mic,
+                system_audio,
+                delay_idx,
+                ink: crate::ink::InkTool::default(),
+            },
             accent,
             tx,
             icon_cache: std::cell::RefCell::new(None),
@@ -729,6 +839,11 @@ impl DaemonBacking {
                             Command::ToggleSystemAudio => TrayEvent::ToggleSystemAudio,
                             Command::Stop => TrayEvent::Stop,
                             Command::Cancel => TrayEvent::Cancel,
+                            Command::InkTool(tool) => TrayEvent::InkTool(tool),
+                            Command::InkClear => TrayEvent::InkClear,
+                            // DRAGON-695: the absolute audio verb. The app owns the arms and
+                            // computes the flips, exactly as it does for a tray radio pick.
+                            Command::SetAudioArms(arms) => TrayEvent::AudioArms(arms),
                         };
                         if tx.send(ev).is_err() {
                             break;
@@ -744,6 +859,7 @@ impl DaemonBacking {
                 paused: false,
                 mic,
                 system: system_audio,
+                ..Default::default()
             }),
             commands,
         };
@@ -931,7 +1047,14 @@ mod tests {
     use ksni::Tray as _;
 
     fn state(recording: bool, paused: bool, mic: bool, system_audio: bool) -> TrayState {
-        TrayState { recording, paused, mic, system_audio, delay_idx: 0 }
+        TrayState {
+            recording,
+            paused,
+            mic,
+            system_audio,
+            delay_idx: 0,
+            ink: crate::ink::InkTool::default(),
+        }
     }
 
     fn tray(state: TrayState) -> RecordingTray {
@@ -993,7 +1116,7 @@ mod tests {
     fn idle_menu_is_the_owners_shape_with_quit_enabled() {
         // DRAGON-574, re-laid-out by DRAGON-680 items 20, 22 and 25: while NOT recording,
         // the session icon shows the owner's idle shape in three blocks. The launchers
-        // (the scan row, Colors, Capture, Record), a separator, the two
+        // (the scan row, Color, Capture, Record), a separator, the two
         // per-capture settings submenus (Countdown Timer, Audio Recording), a separator,
         // then Settings... and Quit ENABLED, since a child-owned idle icon quits the
         // capture session/app. The radio submenu titles come from the app-reported state
@@ -1004,13 +1127,14 @@ mod tests {
             mic: true,
             system_audio: false,
             delay_idx: 2,
+            ink: crate::ink::InkTool::default(),
         });
         let menu = t.menu();
         assert_eq!(
             top_shapes(&menu),
             vec![
                 (crate::recording_ui::SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
                 (String::new(), true), // separator
@@ -1021,7 +1145,7 @@ mod tests {
                 ("Quit Cosmic Capture Kit".to_string(), true),
             ]
         );
-        // The launcher submenus hold their full-label rows, all enabled: Colors at index
+        // The launcher submenus hold their full-label rows, all enabled: Color at index
         // 1, Capture at 2, Record at 3 (DRAGON-680 item 25 gave the recordings
         // their own parent back, which is also what tells them apart from the stills:
         // the same target glyph serves "Capture Region" and "Record Region").
@@ -1070,8 +1194,10 @@ mod tests {
     #[test]
     fn recording_menu_leads_with_audio_then_the_controls() {
         // DRAGON-574 (superseding the DRAGON-558/559 recording shape) + the hide
-        // round + the recolour-round amendment, re-laid-out by DRAGON-680 item 22: the
-        // Audio Recording submenu (live arms) leads the WHOLE menu, then the three
+        // round + the recolour-round amendment, re-laid-out by DRAGON-680 item 22 and led
+        // by DRAGON-693's Live Annotations rows, which DRAGON-757 promoted out of their
+        // submenu to the TOP level, with their divider under them: then the Audio
+        // Recording submenu (live arms), then the three
         // controls and a separator, then the launcher block, then Settings. The
         // flagged-off rows are HIDDEN, so there is no Countdown Timer and no Quit, and
         // with the middle block empty its divider goes too. (The COSMIC applet cannot
@@ -1083,27 +1209,50 @@ mod tests {
             mic: true,
             system_audio: false,
             delay_idx: 1,
+            ink: crate::ink::InkTool::default(),
         });
         let menu = t.menu();
+        let mark = crate::recording_ui::INK_ARMED_MARK;
         assert_eq!(
             top_shapes(&menu),
             vec![
+                // The four annotation rows, at the top level, the armed one marked in its
+                // LABEL because these rows carry no toggle type (see `ink_flat_items`).
+                (format!("Pointer {mark}"), true),
+                ("Marker".to_string(), true),
+                ("Magic Marker".to_string(), true),
+                (crate::recording_ui::CLEAR_MARKS_LABEL.to_string(), true),
+                (String::new(), true), // the annotation block's own divider
                 ("Audio Recording: Mic Only".to_string(), true),
                 ("Pause Recording".to_string(), true),
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
                 (crate::recording_ui::SCAN_LABEL.to_string(), true),
-                ("Colors".to_string(), true),
+                ("Color".to_string(), true),
                 (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
             ]
         );
+        // No submenu is left anywhere in the block, and the dropdown opens with a row
+        // rather than a rule: the model's divider closes the block from below and nothing
+        // is emitted above it.
+        assert!(
+            matches!(&menu[0], ksni::MenuItem::Standard(_)),
+            "the annotation rows are plain top-level items, not a submenu"
+        );
+        assert!(
+            // The parent row's label by VALUE: `INK_SUBMENU_LABEL` is gone with the last
+            // submenu that rendered it (DRAGON-757 finished the job on macOS and Windows),
+            // so this pins the string a regression would have to bring back.
+            !top_shapes(&menu).iter().any(|(label, _)| label == "Live Annotations"),
+            "the Live Annotations parent row is gone"
+        );
         // Capture keeps its trio and stays usable (stills during a recording are
         // fine), while the Record submenu is gone entirely: one recording at a time
         // (DRAGON-559's rule, back on the parent row since item 25).
-        let capture = match &menu[7] {
+        let capture = match &menu[12] {
             ksni::MenuItem::SubMenu(s) => s,
             _ => panic!("Capture is a submenu"),
         };
@@ -1119,15 +1268,98 @@ mod tests {
             !top_shapes(&menu).iter().any(|(label, _)| label == "Record"),
             "the Record submenu is hidden while a child records"
         );
-        // Paused flips the first CONTROL (the row under the audio submenu) to Resume.
+        // Paused flips the first CONTROL (the row under the four annotation rows, their
+        // divider and the audio submenu) to Resume.
         let paused = tray(TrayState {
             recording: true,
             paused: true,
             mic: true,
             system_audio: false,
             delay_idx: 0,
+            ink: crate::ink::InkTool::default(),
         });
-        assert_eq!(top_shapes(&paused.menu())[1].0, "Resume Recording");
+        assert_eq!(top_shapes(&paused.menu())[6].0, "Resume Recording");
+    }
+
+    /// The FLAT annotation rows (DRAGON-757): four top-level items, each with its own PNG
+    /// glyph and its own action, the armed one marked in its label.
+    ///
+    /// The icon assertion is the owner's ask, and the row KIND is what makes it hold on an
+    /// X11 / libdbusmenu host: a `ksni` toggle row would hand the icon slot to the host's
+    /// indicator, so these carry no toggle type and the mark rides in the label instead
+    /// (`ink_flat_items`). Pinning `Standard` here is what would break if someone
+    /// "tightened" these back into a `CheckmarkItem`.
+    #[test]
+    fn the_annotation_rows_are_flat_top_level_items_with_icons() {
+        let t = tray(TrayState {
+            recording: true,
+            paused: false,
+            mic: false,
+            system_audio: false,
+            delay_idx: 0,
+            ink: crate::ink::InkTool::Marker,
+        });
+        let menu = t.menu();
+        let mark = crate::recording_ui::INK_ARMED_MARK;
+        let rows: Vec<&ksni::menu::StandardItem<RecordingTray>> = menu[..4]
+            .iter()
+            .map(|i| match i {
+                ksni::MenuItem::Standard(s) => s,
+                _ => panic!("every annotation row is a plain StandardItem"),
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|r| r.label.clone()).collect::<Vec<String>>(),
+            vec![
+                "Pointer".to_string(),
+                format!("Marker {mark}"),
+                "Magic Marker".to_string(),
+                crate::recording_ui::CLEAR_MARKS_LABEL.to_string(),
+            ]
+        );
+        // Every row carries a rasterized glyph, and the four are DIFFERENT pictures: the
+        // point is that a user tells the tools apart at a glance, which one shared icon
+        // would not deliver.
+        for row in &rows {
+            assert!(row.icon_data.starts_with(b"\x89PNG"), "{} misses its glyph", row.label);
+        }
+        let magic = menu_icon_png(Some(MenuIcon::InkMagicMarker), t.accent);
+        for (i, row) in rows.iter().enumerate() {
+            for (j, other) in rows.iter().enumerate().skip(i + 1) {
+                assert_ne!(
+                    row.icon_data, other.icon_data,
+                    "rows {i} and {j} draw the same glyph"
+                );
+            }
+        }
+        assert_eq!(rows[2].icon_data, magic, "Magic Marker draws the highlighter");
+        // Each row acts for ITSELF: no index space to shift, which is what used to make
+        // "keep Clear Marks out of the radio group" load-bearing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut t = RecordingTray {
+            state: t.state,
+            accent: t.accent,
+            tx,
+            icon_cache: std::cell::RefCell::new(None),
+        };
+        for (i, item) in t.menu()[..4].iter().enumerate() {
+            let ksni::MenuItem::Standard(row) = item else { panic!("row {i} is standard") };
+            (row.activate)(&mut t);
+        }
+        assert_eq!(
+            rx.try_iter().collect::<Vec<TrayEvent>>(),
+            vec![
+                TrayEvent::InkTool(crate::ink::InkTool::Pointer),
+                TrayEvent::InkTool(crate::ink::InkTool::Marker),
+                TrayEvent::InkTool(crate::ink::InkTool::MagicMarker),
+                TrayEvent::InkClear,
+            ]
+        );
+        // A pick marks locally too, so the next menu build shows it without waiting for the
+        // app: the last PICK above was Magic Marker (Clear Marks arms nothing).
+        assert_eq!(t.state.ink, crate::ink::InkTool::MagicMarker);
+        assert_eq!(top_shapes(&t.menu())[2].0, format!("Magic Marker {mark}"));
+        assert_eq!(top_shapes(&t.menu())[1].0, "Marker", "only one row is marked");
     }
 
     /// An idle countdown pick updates the rendered mark and sends the pick to the app
@@ -1141,7 +1373,7 @@ mod tests {
             tx,
             icon_cache: std::cell::RefCell::new(None),
         };
-        // Index 5: the launcher block (the scan row, Colors, Capture, Record)
+        // Index 5: the launcher block (the scan row, Color, Capture, Record)
         // and its trailing divider, THEN the Countdown Timer that opens the middle
         // block (DRAGON-680 items 22 and 25).
         let countdown = match t.menu().swap_remove(5) {
@@ -1181,9 +1413,12 @@ mod tests {
                         "submenu {i} ({}) misses its PNG icon",
                         s.label
                     );
-                    // Radio ROWS never carry icons (the toggle indicator owns that slot).
+                    // Radio ROWS never carry icons: the toggle indicator owns that slot on
+                    // several hosts. That rule is why DRAGON-757's annotation rows had to
+                    // leave their radio group to gain glyphs, and why they carry no toggle
+                    // type now (`ink_flat_items`).
                     if let [ksni::MenuItem::RadioGroup(_)] = &s.submenu[..] {
-                        // RadioItem has no icon field at all: structural guarantee.
+                        // `RadioItem` has an icon field, but nothing here fills it.
                     }
                 }
                 ksni::MenuItem::Separator => {}

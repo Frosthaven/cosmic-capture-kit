@@ -94,6 +94,15 @@ pub(in crate::app) enum ClickSurface {
     /// "this launch is asking you to point at something" surface, and both are the surface
     /// the owner asked a right click to back out of.
     CaptureOverlay,
+    /// The live recording's INK surface (DRAGON-742): the layer surface a Gold session draws
+    /// on, or the armed toplevel Silver and Bronze mint. It is not one of `self.outputs`, so
+    /// without its own variant it resolved to [`Self::Other`] and a right click on it meant
+    /// nothing at all.
+    ///
+    /// It is the surface an armed tool takes the pointer on, which is exactly why the owner
+    /// asked for a right click here: while a tool is armed the pointer is a crosshair over the
+    /// whole recorded output, and this is where "give me my screen back" gets pressed.
+    Ink,
     /// A preview editor document, window or overlay. Its own right-click behaviour already
     /// exists (the timeline's Cut here / Delete segment menu), and closing an editor full of
     /// unsaved annotations on a stray click is exactly the accident this must not cause.
@@ -140,6 +149,40 @@ pub(in crate::app) fn right_click_cancels(
     matches!(surface, ClickSurface::CaptureOverlay) && !recording && !countdown
 }
 
+/// **Pure**, unit-tested: does an unclaimed input on `surface` mean DISARM the live annotation
+/// tool (DRAGON-742)?
+///
+/// The owner asked for it as "i would also like right click, or v, to disarm markers the same
+/// way escape does", and this is the WHETHER of both of those. The right click asks it with
+/// the surface the press landed on; bare `V` asks it with the surface the press was delivered
+/// to, after [`crate::shortcuts::is_ink_disarm_key`] has said the key is the disarm key. One
+/// predicate for both, because two would be two chances to let the mouse and the keyboard
+/// disagree about when the mode can be left.
+///
+/// The two terms, and why each is a term:
+///
+/// * `surface`: the two surfaces the recording itself owns. [`ClickSurface::Ink`] is where an
+///   armed tool takes the pointer, so it is where the owner's right click lands; the toolbar
+///   the ink surface cuts a hole for is drawn on a [`ClickSurface::CaptureOverlay`], so a
+///   press that goes through that hole must mean the same thing rather than nothing. Every
+///   other surface is excluded on the same reasoning [`right_click_cancels`] gives, and one of
+///   them matters more here than there: `V` is an ordinary letter, and the settings window and
+///   the colour picker's result window both carry TEXT INPUTS a `v` could be typed into.
+/// * `armed`: a DRAWING tool is selected. Not "a recording is live": with the selector
+///   already on Pointer there is no mode to leave, so declining is what keeps a right click on
+///   the recording toolbar from meaning anything the user did not ask for.
+///
+/// A `false` is a no-op, never a swallow: the press was already unclaimed when it reached this
+/// decision, so declining leaves it exactly where it was.
+///
+/// **It can never fire at the same time as [`right_click_cancels`]**, and the two are ordered
+/// rather than arbitrated because of it. `armed` implies `App::ink_available`, which implies a
+/// live recording, and `right_click_cancels` refuses outright while one is running. So the
+/// right-press arm may ask this one first with no risk of stealing a cancel.
+pub(in crate::app) fn ink_disarm_fires(surface: ClickSurface, armed: bool) -> bool {
+    matches!(surface, ClickSurface::Ink | ClickSurface::CaptureOverlay) && armed
+}
+
 impl App {
     /// Derive `nav_open` from the width the settings window will actually spawn
     /// at. Mirrors `open_config_window`'s clamp: the saved width (or the default)
@@ -181,6 +224,12 @@ impl App {
             || Some(id) == self.color_picker.window
         {
             return ClickSurface::Other;
+        }
+        // DRAGON-742: the ink surface, asked in the SAME position `view_window` asks it, which
+        // is before the preview lookup and before the `outputs` scan because its id is in
+        // neither list.
+        if self.ink.window() == Some(id) {
+            return ClickSurface::Ink;
         }
         if self.is_preview_window(id) {
             return ClickSurface::Preview;
@@ -279,7 +328,7 @@ impl App {
                 // `settings::open_settings` does for the in-process convert path.
                 //
                 // BOTH mints need it, and only that one had it. This is the OTHER way a
-                // settings window is born: a standalone `--settings` process. On macOS that
+                // settings window is born: a standalone `settings` process. On macOS that
                 // is the ONLY way (the convert path re-execs unconditionally), so the Cloud
                 // page there listed no accounts at all until something else happened to
                 // reload it; on Windows 10 and after an update install, every platform took
@@ -874,7 +923,13 @@ impl App {
                 {
                     o.fallback_win_size = Some((w, h));
                 }
-                // Learn the preview overlay's monitor size (needed for `--preview`, which
+                // DRAGON-693: the Silver / Bronze ARMED annotation toplevel, same story. Its
+                // size is what Silver's letterbox bridge is built from and what Bronze fits its
+                // frozen snapshot inside, so both need it before the first stroke lands.
+                if self.ink_window_resized(id, w, h) {
+                    return Task::none();
+                }
+                // Learn the preview overlay's monitor size (needed for `editor`, which
                 // opens on the active output before its size is known). The returned task
                 // clears the windowed preview's transient max_size hint on first configure.
                 self.preview_resized(id, w.round() as u32, h.round() as u32)
@@ -967,7 +1022,7 @@ impl App {
                     // eighteen history swatches, which is what the owner saw as focus
                     // vanishing after the last input instead of coming back to the first.
                     //
-                    // Process-wide is honest here rather than sloppy: a `--color-picker`
+                    // Process-wide is honest here rather than sloppy: a `color --picker`
                     // launch opens this window and nothing else. What else the flag carries
                     // costs nothing we use — Escape and Ctrl+F route to `on_escape` /
                     // `on_search`, which this app does not implement (its own `handle_key`
@@ -1000,7 +1055,7 @@ impl App {
                     None => Task::none(),
                 }
             }
-            // DRAGON-680: the `--palette-viewer` launch's deferred window open. The whole
+            // DRAGON-680: the `color --viewer` launch's deferred window open. The whole
             // decision lives in `color_picker::viewer`; this arm only drains it.
             WindowChromeMsg::OpenPaletteViewer => self.open_palette_viewer(),
             #[cfg(windows)]
@@ -1147,7 +1202,7 @@ impl App {
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::SettingsFocusPoke => {
-                // A blocked second `--settings` launch asked us to come forward. The
+                // A blocked second `settings` launch asked us to come forward. The
                 // poke tick fires every 300ms while the pane is open; only act when
                 // the file is present (removing it consumes the request).
                 let poke = crate::platform::compositor::settings_focus_poke_path();
@@ -1255,7 +1310,7 @@ impl App {
                     // DRAGON-336 phase 2: this is the SETTINGS pane going away, not a
                     // preview — but the process may still be hosting preview documents, and
                     // ending it would take them with it. So it is still a "last surface out"
-                    // decision: exit only when nothing is left. A `--settings` launch (the
+                    // decision: exit only when nothing is left. A `settings` launch (the
                     // only way these coexist today) opens no preview, so this is inert there
                     // and the historical behavior is unchanged.
                     return if self.previews.is_empty() {
@@ -1275,7 +1330,7 @@ impl App {
                 }
                 if Some(id) == self.permissions.window {
                     // The permission-checker window closed — end this instance (it,
-                    // like `--settings`, never returns to a capture overlay). Same
+                    // like `settings`, never returns to a capture overlay). Same
                     // last-surface-out guard as the settings window above.
                     //
                     // DRAGON-412: closing IS an answer for the recommended / optional
@@ -1376,9 +1431,25 @@ impl App {
             // teardown here would be a second definition of it that could drift. The gate
             // above rules out both of `Close`'s non-teardown branches (recording, countdown),
             // so this always reaches the same ending Escape reaches on a selector overlay.
+            //
+            // DRAGON-742 gave the same press a SECOND meaning, on the same principle: while a
+            // live annotation tool is armed it DISARMS, and it reaches that through
+            // `disarm_ink_tool`, the one disarm Escape and bare `V` also go through. Three
+            // routes that merely look alike are three routes that can drift, and what drifts
+            // silently is DRAGON-739's painted cursor.
+            //
+            // The disarm is asked FIRST, and the order costs nothing: the two are mutually
+            // exclusive by construction (see `ink_disarm_fires`), because a tool can only be
+            // armed while a recording is live and `right_click_cancels` refuses outright while
+            // one is. Reading them in this order only says which is the narrower meaning.
             WindowChromeMsg::RightPressed(id) => {
+                let surface = self.click_surface(id);
+                if ink_disarm_fires(surface, self.ink_drawing_armed()) {
+                    log::debug!("right click while a live annotation tool is armed: disarming");
+                    return self.disarm_ink_tool();
+                }
                 if right_click_cancels(
-                    self.click_surface(id),
+                    surface,
                     self.recording.is_some(),
                     self.countdown.is_some(),
                 ) {
@@ -1407,9 +1478,30 @@ impl App {
                     }
                     Task::none()
                 } else if self.recording.is_some() {
-                    // Stop & save the recording (the worker finalizes; the poll
-                    // opens the player).
-                    self.stop_recording()
+                    // DRAGON-691 amendment: during a LIVE RECORDING Escape puts the ink tool
+                    // selector back on POINTER, and does nothing else. Pressing it again with
+                    // Pointer already selected does nothing at all (`ink_select` refuses a
+                    // no-op change), so the key is safe to lean on.
+                    //
+                    // It used to STOP AND SAVE the recording, which is the behaviour this
+                    // replaces and the reason the change is a fix rather than a preference.
+                    // Escape is the key a user hits to back out of a mode, and once the screen
+                    // can BE a mode (an armed drawing tool takes the pointer on every
+                    // platform) that reflex has to mean "give me my screen back". Ending the
+                    // take instead is the one outcome that cannot be undone, and it was one
+                    // keypress away for the whole recording.
+                    //
+                    // Ending a recording is unaffected and still has two deliberate controls:
+                    // the toolbar's stop chip and cancel button, and the tray menu. Nothing
+                    // here can cancel or save, which is the point.
+                    //
+                    // DRAGON-742: through `disarm_ink_tool` since the owner asked for a right
+                    // click and bare `V` to do this too, and "the same way escape does" is a
+                    // promise best kept by all three calling the same method. NOTHING else in
+                    // this arm is shared with them: the settings-search collapse, the countdown
+                    // step-back and the teardown below are Escape's other duties in Escape's
+                    // other contexts, and the two new routes inherit none of them.
+                    self.disarm_ink_tool()
                 } else if self.countdown.is_some() {
                     // DRAGON-659: the same abandon the toolbar's ✕ does, since a video countdown
                     // has a recording worker running behind it, and Escape must not leave it
@@ -1432,6 +1524,18 @@ impl App {
                         crate::diag::note_failure(
                             crate::diag::Failure::Cancelled,
                             "the user cancelled the colour picker's countdown",
+                        );
+                        return self.teardown();
+                    }
+                    // DRAGON-698: a deferred immediate capture's countdown ends the
+                    // session on Escape too — the launch minted no picker overlay, so
+                    // there is no selector to step back to. Same reasoning, same three
+                    // agreeing cancel routes as the colour picker (`CancelCapture`, the
+                    // tray's Cancel row, and here).
+                    if self.pending_immediate.take().is_some() {
+                        crate::diag::note_failure(
+                            crate::diag::Failure::Cancelled,
+                            "the user cancelled a deferred immediate capture's countdown",
                         );
                         return self.teardown();
                     }
@@ -1516,7 +1620,15 @@ mod right_click_cancel_tests {
     /// what a right click destroys.
     #[test]
     fn every_other_combination_does_nothing() {
-        for surface in [ClickSurface::CaptureOverlay, ClickSurface::Preview, ClickSurface::Other] {
+        for surface in [
+            ClickSurface::CaptureOverlay,
+            // DRAGON-742's surface belongs in this matrix too: it is where an armed tool takes
+            // the pointer, so it is the surface most right-clicked during a session, and a
+            // right click there must still never CANCEL one.
+            ClickSurface::Ink,
+            ClickSurface::Preview,
+            ClickSurface::Other,
+        ] {
             for recording in [true, false] {
                 for countdown in [true, false] {
                     let want = surface == ClickSurface::CaptureOverlay && !recording && !countdown;
@@ -1526,6 +1638,97 @@ mod right_click_cancel_tests {
                         "{surface:?} / recording={recording} / countdown={countdown}"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// DRAGON-742: a right click, or bare `V`, disarms a live annotation tool.
+#[cfg(test)]
+mod ink_disarm_tests {
+    use super::{ink_disarm_fires, right_click_cancels, ClickSurface};
+
+    const EVERY_SURFACE: [ClickSurface; 4] = [
+        ClickSurface::Ink,
+        ClickSurface::CaptureOverlay,
+        ClickSurface::Preview,
+        ClickSurface::Other,
+    ];
+
+    /// The happy path, and both surfaces that have it. The ink surface is where an armed tool
+    /// takes the pointer; the capture overlay is what shows through the hole the ink surface
+    /// cuts for the recording toolbar, so a press that lands there has to mean the same thing
+    /// rather than nothing.
+    #[test]
+    fn an_armed_tool_disarms_from_either_of_the_recordings_own_surfaces() {
+        assert!(ink_disarm_fires(ClickSurface::Ink, true));
+        assert!(ink_disarm_fires(ClickSurface::CaptureOverlay, true));
+    }
+
+    /// With the selector already on Pointer there is no mode to leave, so nothing fires. This
+    /// is the term that keeps a right click on an ordinary live recording's toolbar, or a `v`
+    /// typed at one, from meaning something the user never asked for.
+    #[test]
+    fn nothing_disarms_while_no_drawing_tool_is_armed() {
+        for surface in EVERY_SURFACE {
+            assert!(!ink_disarm_fires(surface, false), "{surface:?}");
+        }
+    }
+
+    /// The preview editor and our ordinary windows are excluded, armed or not. It matters more
+    /// here than it does for the cancel: `V` is an ordinary letter, and the settings window and
+    /// the colour picker's result window both carry text inputs one could be typed into.
+    #[test]
+    fn a_press_on_any_other_surface_of_ours_is_left_alone() {
+        for surface in [ClickSurface::Preview, ClickSurface::Other] {
+            for armed in [true, false] {
+                assert!(!ink_disarm_fires(surface, armed), "{surface:?} armed={armed}");
+            }
+        }
+    }
+
+    /// **The two right-click meanings can never both fire**, which is what lets the arm ask
+    /// them in a fixed order instead of arbitrating between them.
+    ///
+    /// The crossing is asserted over the WHOLE matrix, with the app's own implication written
+    /// in: a tool can only be armed while a recording is live (`App::ink_drawing_armed` is
+    /// gated on `ink_available`, which is gated on `self.recording`), and `right_click_cancels`
+    /// refuses outright while one is. So there is no reachable input where both answer true,
+    /// and a future edit that widened either one would fail here rather than silently making a
+    /// stray click end a take.
+    #[test]
+    fn a_disarm_and_a_cancel_can_never_both_fire() {
+        for surface in EVERY_SURFACE {
+            for armed in [true, false] {
+                // `armed` implies a live recording; the un-armed rows are free to be either.
+                for recording in if armed { vec![true] } else { vec![true, false] } {
+                    for countdown in [true, false] {
+                        let disarms = ink_disarm_fires(surface, armed);
+                        let cancels = right_click_cancels(surface, recording, countdown);
+                        assert!(
+                            !(disarms && cancels),
+                            "{surface:?} armed={armed} recording={recording} \
+                             countdown={countdown}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole matrix, exhaustively, so a term added or removed later is a visible diff
+    /// rather than a quiet widening of what an unclaimed press can do.
+    #[test]
+    fn every_other_combination_does_nothing() {
+        for surface in EVERY_SURFACE {
+            for armed in [true, false] {
+                let want = matches!(surface, ClickSurface::Ink | ClickSurface::CaptureOverlay)
+                    && armed;
+                assert_eq!(
+                    ink_disarm_fires(surface, armed),
+                    want,
+                    "{surface:?} / armed={armed}"
+                );
             }
         }
     }

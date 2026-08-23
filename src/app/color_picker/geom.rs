@@ -2372,7 +2372,14 @@ pub fn segment_corners(index: usize, n: usize) -> [bool; 2] {
 /// The MOST segments any bar holds, which is the widest harmony card
 /// ([`harmony_card_lengths`]'s maximum). It exists so a menu's placement can be clamped
 /// without the caller carrying its own row length around.
-pub const MAX_SEGMENTS: usize = 5;
+///
+/// READ from the monochromatic ramp's own count rather than restated, since DRAGON-705 took
+/// that ramp to nine and this to nine with it: the ramp is the widest card by a distance now
+/// (the rotations top out at tetradic's four), and two spellings of one number is how they
+/// would drift. That the ramp really IS the widest card is pinned by
+/// `a_swatch_bar_fills_its_card_at_every_count`, so a future card wider than the ramp fails
+/// there rather than clipping a menu.
+pub const MAX_SEGMENTS: usize = crate::color::MONOCHROME_STEPS;
 
 /// Pure, unit-tested: the x of segment `index`'s left edge inside its CARD, for placing that
 /// segment's context menu.
@@ -6373,6 +6380,11 @@ mod window_size_tests {
         }
         // The owner's five, in the owner's order (item 20).
         assert_eq!(rows.len(), 5);
+        // The MONOCHROMATIC card is the wide one, on purpose (DRAGON-705): it is a gradient
+        // to pick a shade off, not a set of rotations, so it holds nine where the widest
+        // rotation card holds four. The grid the cursor walks is ragged for that reason.
+        assert_eq!(rows[4], 9, "the monochromatic ramp is nine shades");
+        assert_eq!(rows[..4].iter().copied().max(), Some(4), "a rotation card grew");
         // Every group's scroll offset climbs, and the first is the top of the panel.
         assert_eq!(harmony_group_offset(0), 0.0);
         for g in 1..rows.len() {

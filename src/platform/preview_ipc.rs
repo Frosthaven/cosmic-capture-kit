@@ -264,7 +264,7 @@ pub struct OpenRequest {
     /// The SOURCE display's point→pixel backing scale — `PreviewState::source_scale`
     /// (`1.0` on an unscaled output, on every platform). Must be finite and positive.
     pub source_scale: f32,
-    /// `true` when previewing a pre-existing file (`--preview`) rather than a fresh
+    /// `true` when previewing a pre-existing file (`editor`) rather than a fresh
     /// capture — `PreviewState::external`.
     pub external: bool,
     /// The saved file's size in bytes, once known — `PreviewState::size`.

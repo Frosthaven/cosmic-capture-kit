@@ -38,10 +38,16 @@ why you can toggle freely mid-take without leaving a gap.
 If you turn on push to talk in
 [Settings, under Audio & Video](../settings/audio-video.md), the microphone
 button stops being a switch and becomes an indicator. Your microphone is live
-only while you hold the microphone key, which is **M** by default.
+only while you hold the microphone shortcut, which is **Shift+Alt+M** by
+default.
 
-Holding the key lights the button up even before you start recording, so it
-doubles as a quick microphone test.
+Holding it lights the button up even before you start recording, so it doubles
+as a quick microphone test.
+
+Where your desktop offers a shortcut service of its own, this one is registered
+with it, so it works while the app you are recording has the focus. That is the
+point of hold to talk, and it is why the shortcut is a chord rather than a
+plain letter.
 
 ## The controls while recording
 
@@ -99,13 +105,21 @@ turn this on.
 
 | Key | What it does |
 |---|---|
-| Enter | Stops the recording and saves it |
-| Esc | Also stops the recording and saves it |
-| M | Microphone on or off |
-| S | System audio on or off |
+| Shift+Alt+Enter | Stops the recording and saves it |
+| Shift+Alt+M | Microphone on or off |
+| Shift+Alt+S | System audio on or off |
+| Esc | Puts the drawing tools back on Pointer. It never stops the recording |
+| V | The same as Esc |
+| Right click | The same as Esc |
 
-These work before a recording starts too, so you can set your channels up with
-the keyboard and watch the buttons respond.
+The three chords are the same on every computer, and they are chords so they
+cannot fire while you are typing. They work before a recording starts too, so
+you can set your channels up with the keyboard and watch the buttons respond.
+
+Esc, V and right click all do exactly the same thing, so use whichever is
+nearest, and none of them can stop or cancel the take. They do nothing while no
+drawing tool is turned on. See [Live annotation](live-annotation.md) for the
+drawing tools themselves.
 
 ## If recording will not start
 

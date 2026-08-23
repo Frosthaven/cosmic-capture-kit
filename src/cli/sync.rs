@@ -1,8 +1,10 @@
-//! The `--make-sync-clip` / `--calibrate-sync` subcommands (DRAGON-119): a
+//! The `debug make-sync-clip` / `debug calibrate-sync` subcommands (DRAGON-119): a
 //! one-time, end-to-end A/V-sync calibration the in-app auto-calibration cannot
 //! do (it only sees frame→encoder lag, not the compositor's delivery lag).
 //! Measurement + clip generation live in [`crate::record`] (`sync_probe`); this
 //! module is the argument handling, the printout, and the settings write.
+
+use crate::{errln, outln};
 
 use std::path::{Path, PathBuf};
 
@@ -11,12 +13,12 @@ pub const SYNC_WORKFLOW: &str = "\
 A/V sync check (recordings already compensate for the audio device's latency
 automatically; this VERIFIES end-to-end sync and offers a manual override for
 exotic setups):
-    1. cosmic-capture-kit --make-sync-clip      write the reference clip
+    1. cosmic-capture-kit debug make-sync-clip      write the reference clip
     2. Play the clip in any video player, with system audio audible
     3. Record it with a normal capture (region around the player; system audio ON)
-    4. cosmic-capture-kit --calibrate-sync <recording.mp4> --apply   (manual override)";
+    4. cosmic-capture-kit debug calibrate-sync <recording.mp4> --apply   (manual override)";
 
-/// `--make-sync-clip [PATH]`: write the flash/beep reference clip (default name
+/// `debug make-sync-clip [PATH]`: write the flash/beep reference clip (default name
 /// `cck-sync-reference.mp4` in the user's record dir, else the cwd), then verify
 /// it by measuring our own output — a clip whose flashes and beeps don't measure
 /// as simultaneous would calibrate garbage, so that's a hard error.
@@ -28,25 +30,25 @@ pub fn make_sync_clip(path_arg: Option<&str>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = crate::record::write_sync_clip(&out) {
-        eprintln!("--make-sync-clip: {e}");
+        errln!("debug make-sync-clip: {e}");
         std::process::exit(1);
     }
     // Self-check: the generator and the analyzer must agree the clip is aligned.
     match crate::record::measure_av_offset(&out) {
         Ok(m) if m.confident && m.offset_secs.abs() <= 0.025 => {
-            println!("Wrote the A/V-sync reference clip: {}", out.display());
-            println!(
+            outln!("Wrote the A/V-sync reference clip: {}", out.display());
+            outln!(
                 "  self-check: flash/beep offset {:+.1} ms over {} pairs: OK",
                 m.offset_secs * 1000.0,
                 m.pairs
             );
-            println!();
-            println!("{SYNC_WORKFLOW}");
+            outln!();
+            outln!("{SYNC_WORKFLOW}");
         }
         Ok(m) => {
             let _ = std::fs::remove_file(&out);
-            eprintln!(
-                "--make-sync-clip: self-check failed. The clip measured {:+.1} ms \
+            errln!(
+                "debug make-sync-clip: self-check failed. The clip measured {:+.1} ms \
                  (spread {:.1} ms, {} pairs{}); removed it. This is a tool bug or a \
                  broken ffmpeg build, not something a re-run fixes.",
                 m.offset_secs * 1000.0,
@@ -58,7 +60,7 @@ pub fn make_sync_clip(path_arg: Option<&str>) {
         }
         Err(e) => {
             let _ = std::fs::remove_file(&out);
-            eprintln!("--make-sync-clip: self-check failed ({e}); removed the clip.");
+            errln!("debug make-sync-clip: self-check failed ({e}); removed the clip.");
             std::process::exit(1);
         }
     }
@@ -80,41 +82,41 @@ fn sync_clip_path(arg: Option<&str>) -> PathBuf {
     dir.join(crate::record::SYNC_CLIP_NAME)
 }
 
-/// `--calibrate-sync <file> [--apply]`: measure a recording of the reference clip
+/// `debug calibrate-sync <file> [--apply]`: measure a recording of the reference clip
 /// and print the true offset; with `--apply` (and a confident measurement),
 /// persist it into the settings.
 pub fn calibrate_sync(file: Option<&Path>, apply: bool) {
     let Some(file) = file else {
-        eprintln!(
-            "--calibrate-sync: expected a recording file\n\
-             usage: cosmic-capture-kit --calibrate-sync <recording.mp4> [--apply]"
+        errln!(
+            "debug calibrate-sync: expected a recording file\n\
+             usage: cosmic-capture-kit debug calibrate-sync <recording.mp4> [--apply]"
         );
         std::process::exit(2);
     };
     if !file.exists() {
-        eprintln!("--calibrate-sync: file not found: {}", file.display());
+        errln!("debug calibrate-sync: file not found: {}", file.display());
         std::process::exit(1);
     }
     let m = match crate::record::measure_av_offset(file) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("--calibrate-sync: {e}");
+            errln!("debug calibrate-sync: {e}");
             std::process::exit(1);
         }
     };
     let t_ms = (m.offset_secs * 1000.0).round() as i32;
-    println!("A/V sync measurement for {}:", file.display());
-    println!("  offset : {t_ms:+} ms  (positive = audio leads video = the compensation to store)");
-    println!("  spread : {:.0} ms over {} flash/beep pairs", m.spread_secs * 1000.0, m.pairs);
-    println!("  confidence: {}", if m.confident { "OK" } else { "LOW (spread > 120 ms)" });
-    println!(
+    outln!("A/V sync measurement for {}:", file.display());
+    outln!("  offset : {t_ms:+} ms  (positive = audio leads video = the compensation to store)");
+    outln!("  spread : {:.0} ms over {} flash/beep pairs", m.spread_secs * 1000.0, m.pairs);
+    outln!("  confidence: {}", if m.confident { "OK" } else { "LOW (spread > 120 ms)" });
+    outln!(
         "  note: recordings made from now on already compensate for the audio device's\n\
          \x20       latency automatically (DRAGON-119), so measuring an OLD recording and\n\
          \x20       applying an offset is usually unnecessary. Use this to VERIFY sync, and\n\
          \x20       --apply only for a stubborn residual on an exotic setup."
     );
     if !m.confident {
-        eprintln!(
+        errln!(
             "\nNot applying a low-confidence measurement. Re-record with the capture \
              region tight around the player and other sounds quiet, then try again."
         );
@@ -125,11 +127,11 @@ pub fn calibrate_sync(file: Option<&Path>, apply: bool) {
     let (new_offset, new_base) = apply_values(t_ms, p.audio_sync_offset_ms, old_base);
     if apply {
         let mut p = p;
-        println!("\nApplied:");
-        println!("  audio_sync_offset_ms  : {} -> {}", p.audio_sync_offset_ms, new_offset);
-        println!("  av_calibration_base_ms: {old_base} -> {new_base}");
+        outln!("\nApplied:");
+        outln!("  audio_sync_offset_ms  : {} -> {}", p.audio_sync_offset_ms, new_offset);
+        outln!("  av_calibration_base_ms: {old_base} -> {new_base}");
         if !p.audio_sync_auto {
-            println!(
+            outln!(
                 "  note: auto A/V sync is OFF, so this offset stays fixed until you \
                  re-calibrate (or turn auto sync back on)."
             );
@@ -138,11 +140,11 @@ pub fn calibrate_sync(file: Option<&Path>, apply: bool) {
         p.av_calibration_base_ms = new_base;
         crate::state::save(&p);
     } else {
-        println!(
+        outln!(
             "\nWould store: audio_sync_offset_ms {} -> {}, av_calibration_base_ms {} -> {}",
             p.audio_sync_offset_ms, new_offset, old_base, new_base
         );
-        println!("Re-run with --apply to persist.");
+        outln!("Re-run with --apply to persist.");
     }
 }
 

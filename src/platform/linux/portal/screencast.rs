@@ -68,6 +68,23 @@ pub struct CastSession {
     pub fd: OwnedFd,
     pub streams: Vec<StreamInfo>,
     pub restore_token: Option<String>,
+    /// A SECOND, independent PipeWire remote for the same session, opened only for a
+    /// WINDOW grant, for DRAGON-737's pixel tie-break. `None` on every other source type
+    /// and whenever the portal refused the second open.
+    ///
+    /// **It has to be minted here or not at all**, and it must not be a `dup` of `fd`.
+    /// The portal fd is a SOCKET to the PipeWire daemon carrying one stateful connection:
+    /// `dup` hands out a second descriptor for the same file description, so a second
+    /// `pw_context_connect_fd` over it would send a second hello down a connection the
+    /// daemon already considers open, and closing one descriptor never reaches the daemon
+    /// as EOF while the other is alive. Two `OpenPipeWireRemote` calls give two SEPARATE
+    /// connections, which is what the portal interface is for. The ashpd `Session` that
+    /// can ask for one lives and dies inside [`request`], so a later caller has nothing
+    /// left to ask with.
+    ///
+    /// Dropping it unused just closes a socket nobody spoke on, which is the whole cost of
+    /// carrying it on a grant that turns out not to need it.
+    pub probe_fd: Option<OwnedFd>,
 }
 
 /// Why a cast request didn't yield a stream.
@@ -168,6 +185,25 @@ pub async fn request(
     };
 
     let fd = sc.open_pipe_wire_remote(&session).await.map_err(unavailable)?;
+    // DRAGON-737: a WINDOW grant may need to look at its own first frame to decide WHICH
+    // window it got (two same-size toplevels tie on the size key). That means a second
+    // PipeWire connection, and this is the only moment one can be opened: `session` is
+    // dropped when this function returns. Best effort, and never for a monitor grant,
+    // which has the stream's own position and needs no such evidence.
+    let probe_fd = if matches!(source, SourceType::Window) {
+        match sc.open_pipe_wire_remote(&session).await {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log::debug!(
+                    "portal: the second PipeWire remote for the window tie-break was \
+                     refused ({e}); the grant falls back to the size and activation keys"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let restore_token = streams.restore_token().map(|s| s.to_string());
     let streams = streams
         .streams()
@@ -182,6 +218,7 @@ pub async fn request(
         fd,
         streams,
         restore_token,
+        probe_fd,
     })
 }
 

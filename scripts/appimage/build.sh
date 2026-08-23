@@ -79,7 +79,7 @@ esac
 # The VERSION must NOT be, because this file UPDATES ITSELF IN PLACE (DRAGON-532).
 # `install_linux_appimage` renames the new release over `$APPIMAGE` and never
 # touches the name, so that the user's capture shortcut, their autostart entry
-# (`Exec=$APPIMAGE resident`) and the daemon's own respawn all keep working. A
+# (`Exec=$APPIMAGE tray`) and the daemon's own respawn all keep working. A
 # version in the name would therefore be WRONG the moment the first update lands:
 # the file would still say 0.28.1 while containing 0.29.0, and a user who later
 # downloaded the new version by hand would own two files, with their shortcut

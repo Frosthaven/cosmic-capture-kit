@@ -58,8 +58,24 @@ pub struct Persisted {
     /// express a literal None).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<(i32, i32, i32, i32)>,
-    #[serde(default)]
+    /// DEPRECATED (config v13, DRAGON-695): the index into the overlay's four delay chips
+    /// (0/3/5/10 seconds). Replaced by [`Self::countdown_secs`], which holds the seconds
+    /// themselves, and never serialized again (`skip_serializing`) so only pre-v13 configs
+    /// still carry it, for the one-time migration in `store::migrate`.
+    #[serde(default, skip_serializing)]
     pub delay_idx: usize,
+    /// The default pre-capture countdown, in SECONDS (DRAGON-695). `0` is no countdown.
+    ///
+    /// The ONE countdown truth. It used to be [`Self::delay_idx`], an index into a four-entry
+    /// preset table, which meant the `timer` command could not persist a value the presets do
+    /// not offer: `timer 7` would have had to land on 5 or 10. The seconds are stored instead,
+    /// the overlay's delay chips select the preset nearest to them, and the tray's Countdown
+    /// Timer submenu writes a preset's seconds rather than its index.
+    ///
+    /// Range 0 to 99, the same bound the `timer` command and the `--timer` modifier enforce.
+    /// A hand-edited config outside it is clamped on load rather than refused.
+    #[serde(default)]
+    pub countdown_secs: u64,
     /// Whether captures include the mouse cursor (default on).
     #[serde(default = "default_true")]
     pub capture_cursor: bool,
@@ -378,7 +394,7 @@ pub struct Persisted {
     pub capture_active_monitor_hotkey: String,
     /// macOS/Windows (DRAGON-428): the "no editor" twin of [`Self::capture_hotkey`] — the
     /// same All In One capture picker, but the finished capture is saved, copied and
-    /// notified WITHOUT opening the preview editor (the daemon adds `--no-editor`).
+    /// notified WITHOUT opening the preview editor (the daemon adds `--skip-editor`).
     /// Default UNSET (empty), like every capture hotkey. A serde-defaulted additive field,
     /// so old configs load with it absent (no store-version bump). Linux ignores it; the
     /// settings row is macOS/Windows-only.
@@ -398,7 +414,7 @@ pub struct Persisted {
     /// PICKER tool. Default UNSET (empty), like every other global hotkey here. A
     /// serde-defaulted additive field, so old configs load with it absent (no
     /// store-version bump). Linux has no daemon-owned global hotkey and ignores it; a
-    /// Linux user binds a COSMIC custom shortcut to `--color-picker` instead (README).
+    /// Linux user binds a COSMIC custom shortcut to `color --picker` instead (README).
     #[serde(default = "default_capture_hotkey")]
     pub color_picker_hotkey: String,
     /// macOS (DRAGON-130): whether the first-run Screen Recording permission prompt
@@ -589,8 +605,8 @@ pub struct Persisted {
     #[serde(default = "default_record_codec")]
     pub record_codec: String,
     /// Preferred video encoder id: the "auto" sentinel (the default) or a concrete id
-    /// ("nvenc" | "vaapi" | "software" on Linux, plus "videotoolbox" / "amf" / "qsv"
-    /// off Linux). "auto" STAYS persisted until the user explicitly picks in the
+    /// ("nvenc" | "vaapi" | "software" on Linux, plus "videotoolbox" on macOS and
+    /// "amf" / "qsv" / "mf" on Windows). "auto" STAYS persisted until the user explicitly picks in the
     /// settings encoder dropdown; an auto resolution is NEVER written back here
     /// (DRAGON-571: it used to be, so one transient first-launch probe failure, a
     /// sleeping driver or an NVENC session held by a game, pinned "software" forever
@@ -742,7 +758,7 @@ pub struct Persisted {
     /// (updates `audio_sync_offset_ms` after each recording). Default on.
     #[serde(default = "default_true")]
     pub audio_sync_auto: bool,
-    /// End-to-end A/V calibration base (ms), measured once via `--calibrate-sync`
+    /// End-to-end A/V calibration base (ms), measured once via `debug calibrate-sync`
     /// (DRAGON-119): the part of the audio-leads-video offset the app cannot observe
     /// live (compositor frame-delivery lag). Auto-calibration adds it on top of each
     /// recording's measured median. Clamped to -2000..=2000 on load; 0 (the serde
@@ -790,7 +806,7 @@ pub struct Persisted {
     // DRAGON-353: `preview_after_capture` ("Open in preview editor") lived here. The editor
     // is now the capture's destination unconditionally — it copies to the clipboard on open
     // and owns every save/share action — so the toggle is REMOVED. The preview-less
-    // save+copy+notify path still exists for a `--no-editor` launch (DRAGON-428, including
+    // save+copy+notify path still exists for a `--skip-editor` launch (DRAGON-428, including
     // the daemon's "(no editor)" hotkeys) and for the cases where no editor CAN open (no
     // known output). DRAGON-451 retired the third user of it, the region "Copy selection"
     // quick-action; DRAGON-479 brought that user back — as a FIXED, non-configurable primary+C
@@ -800,6 +816,13 @@ pub struct Persisted {
     /// resuming them when it closes. Default on.
     #[serde(default = "default_true")]
     pub mute_others_during_preview: bool,
+    /// Pause other media players (the same guard) while a LIVE-ANNOTATION tool is armed
+    /// during a recording, resuming them on disarm (DRAGON-694). Default OFF, and it is a
+    /// separate setting from the one above on purpose: this trigger changes what the
+    /// recording CONTAINS, because the pause is audible in the recorded system track, and
+    /// annotating over a video that is meant to be playing is a real use of the feature.
+    #[serde(default)]
+    pub pause_others_during_ink: bool,
     /// Duck (lower) the recorded system audio while the mic hears speech, so voiceover
     /// stays clear over desktop sound (DRAGON-128). Applied at capture into the
     /// recorded track. Default on.

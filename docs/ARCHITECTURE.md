@@ -7,13 +7,14 @@ points to.
 
 ## Module tree
 
-- `src/main.rs`: argv parsing (mode/kind/countdown/`--audio`/`--preview`/
-  `--inspect`/`--settings`/`--permissions`), the settings single-instance lock
+- `src/main.rs`: argv parsing (the subcommand grammar: `capture` / `record` /
+  `scan` / `color` / `editor` / `timer` / `sound` / `settings` / `permissions` /
+  `tray`, each with its own options), the settings single-instance lock
   (`src/instance.rs`; a CAPTURE launch takes no lock at all since DRAGON-351),
   launches the `cosmic::Application`.
-- `src/cli/`: `diagnostics.rs` (the `--test` harness), `inspect.rs`
+- `src/cli/`: `diagnostics.rs` (the diagnostics harness), `inspect.rs`
   (metadata dump) and `sync.rs` (the A/V-sync reference clip + calibration).
-  See [`CLI.md`](../CLI.md) for the user-facing flag list.
+  See [`CLI.md`](../CLI.md) for the user-facing command list.
 - `src/app/` — the application; see below.
 - `src/record/`, `src/encode/` — recording + encoding; see "Pipeline" below.
 - `src/audio/` — mic capture/cleanup chain (`input.rs` composes the stages,
@@ -165,7 +166,8 @@ points to.
     syscall in the plugin**: the item naming, the account-id validation and the
     file name are pure and unit-tested on every host; `platform/*/secrets.rs`
     only calls its OS.
-  - `child.rs` — the `--cloud-upload` helper's whole life. An upload runs in a
+  - `child.rs` — the cloud-upload helper's whole life. It is internal plumbing,
+    not a command anyone types, and it is not in `CLI.md`. An upload runs in a
     DETACHED re-exec (the same technique every other post-capture action uses),
     because a transfer can take minutes and this app's model is one-shot. One
     outer budget, `UPLOAD_BUDGET`, armed before anything else. It records no
@@ -200,7 +202,8 @@ points to.
   stub (macOS mounts `platform/mac/tray.rs` instead — the resident menu bar
   lives in `src/platform/mac/daemon.rs`, see "Resident mode"). `util.rs` also holds
   `locate_tool` — the ffmpeg/ffprobe locator (env override → `.app` `Resources/`
-  sidecar → dev `vendor/ffmpeg/macos-arm64/` → `PATH`).
+  sidecar → dev `vendor/ffmpeg/macos-<arch>/` → `PATH`; the dev directory is
+  per-architecture since DRAGON-700, `arm64` or `x86_64`).
 
 ### `src/app/`
 
@@ -227,23 +230,23 @@ points to.
   (`PermStatus`/`CardAction`/`card_action` — unit-tested, the `login_item`
   `row_state` pattern), the `Probe` snapshot + `probe_now` (off-view live
   probes), and `open_permissions_window`; `view.rs` (cfg macOS) the card view.
-  Mirrors the `--settings` window plumbing exactly: `PermissionsState` field on
+  Mirrors the `settings` window plumbing exactly: `PermissionsState` field on
   `App`, a `view_window` branch, `sub_permission_poll` (1s live refresh while
   open), a `PermissionsMsg` domain (`update/permissions.rs`). Entry points: the
-  `--permissions` CLI flag; a capture launch missing the Screen Recording grant
+  `permissions` command; a capture launch missing the Screen Recording grant
   routes here instead of an empty capture (`application.rs`, superseding the old
   bare `request_screen_capture`, keeping the `mac_first_run_seen` once-guard as
   the card's Request-vs-Open-Settings input); and the resident daemon spawns a
-  `--permissions` child ONCE at startup when the grant is missing. The Screen
+  `permissions` child ONCE at startup when the grant is missing. The Screen
   Recording card carries a **Relaunch** button — macOS only applies that grant
-  to a fresh launch, so the button spawns `current_exe --permissions` detached
+  to a fresh launch, so the button spawns `current_exe permissions` detached
   and exits.
 - `color_picker/` — the **colour picker tool** (DRAGON-582): a dimmed overlay with a
   magnifier that follows the pointer, and the result window a pick opens. `mod.rs`
   holds the state, the `PixelSource` seam and `open_color_picker_window`; `geom.rs`
   the pure decisions (which source pixel, the magnifier raster, the label-placement
   ladder, the window size, the recents write rule); `view.rs` both views. A
-  `--color-picker` launch mints the SAME per-output overlays a capture does, through
+  `color --picker` launch mints the SAME per-output overlays a capture does, through
   the same `shell` seam, so it inherits layer-shell / portal-fallback / PlainWindows /
   Windows-10-software routing without a second copy of any of it.
 
@@ -322,7 +325,11 @@ points to.
   `color::Harmony`. The rotations keep the base's saturation and value and lead with the base;
   MONOCHROMATIC is deliberately different, one ordered dark-to-light ramp of the base's hue
   with the base at the slot its own value earns and the step sized to the room on both sides
-  (`color::monochrome_ramp`). Each card's swatches are ONE full-width segmented bar, no gaps,
+  (`color::monochrome_ramp`). That ramp holds NINE segments since DRAGON-705
+  (`color::MONOCHROME_STEPS`, which `geom::MAX_SEGMENTS` reads), so it is deliberately the
+  widest card in the panel: it is read as a gradient rather than as a set, and the owner
+  wanted a finer ladder of shades than the tetradic card's four rotations allowed.
+  Each card's swatches are ONE full-width segmented bar, no gaps,
   rounded at the bar's two ends only, drawn at the window's current alpha over a single shared
   checkerboard. Clicking a segment APPLIES it as the current colour (DRAGON-687's
   follow-up run reversed the original click-does-nothing rule), and every discrete
@@ -384,11 +391,11 @@ points to.
   **Four entry points, one argv.** The tray / menu-bar entry
   (`recording_ui::CaptureAction::ColorPicker`, first in the idle menu, before
   Scanner), the preview editor's toolbar pipette (`PreviewMsg::OpenColorPicker`,
-  which adds `CCK_COLOR_TO_PID`), the `--color-picker` flag, and the
+  which adds `CCK_COLOR_TO_PID`), the `color --picker` command, and the
   `CaptureHotkeySlot::ColorPicker` global-shortcut slot (index 6, LAST so the six
   capture slots keep their indices; ships UNBOUND like every slot, and on Linux the
   Global tab shows the command instead of a chord). Every one of them spawns
-  `--color-picker`; the result window's own pick-again pipette
+  `color --picker`; the result window's own pick-again pipette
   (`ColorPickerMsg::PickAgain`) does the same rather than re-entering the overlay in
   this process, because a re-entry would have to re-grab the frozen scene and, on the
   portal fallback, re-request a ScreenCast mid-session.
@@ -485,6 +492,592 @@ separates a revealed pointer from a moved one is
 `widgets::color_pick::pointer_report_moves_sample`; read its doc before
 touching pointer handling in the picker. The same disturbance applies to any of
 our surfaces mapping over a live picker, not just the region path.
+
+### Recording is the exception: the toolbar opts out per window (DRAGON-690)
+
+A STILL is over in a moment, so timing can carry it. A RECORDING runs for
+minutes with our overlay on screen the whole time, because that overlay draws
+the recording chip (stop, mic, system audio). Timing cannot exclude a window
+that has to stay up, so recording is the one path with a real filter, and the
+seam is `platform::exclude_window_from_capture(title)`.
+
+It is deliberately PER-WINDOW, and that is a contract rather than a detail:
+DRAGON-691 draws on the screen during a recording, and that ink must stay IN the
+video while the controls stay OUT of it. So a window asks for itself, and no arm
+may widen that to "our process's windows". The rule is the pure
+`platform::mac_window_is_capture_excluded`, tested on every host. The capture
+overlays are still the only caller: DRAGON-691 shipped the drawing surface as a
+SEPARATE surface (see the next section) that simply does not call the seam,
+which is the shape this paragraph predicted.
+
+The two platforms exclude in different places, and the difference is visible:
+
+* **macOS** excludes at the STREAM. The recording target's `SCContentFilter` is
+  built `initWithDisplay:excludingWindows:` over the ids that opted out
+  (`platform::mac::recording_display_target` and its named-display sibling), so
+  only recordings WE make are affected. `NSWindow.sharingType = .none` was the
+  obvious alternative and is ruled out: ScreenCaptureKit honoured it through
+  macOS 14 and ignores it from macOS 15, and Apple's answer is that no public
+  API prevents capture. A mechanism that lapses on the newest OS is worse than
+  none.
+* **Windows** excludes at the WINDOW, with
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, because Win32 offers
+  nothing per-stream. That is OS-wide for the window, so another application's
+  recorder does not see our capture overlay either. Below build 19041 there is
+  no exclusion at all: the older `WDA_MONITOR` paints a black rectangle, which
+  is worse than the toolbar it replaces. The band is the pure
+  `platform::win_build_can_exclude_from_capture`.
+* **Linux** has no arm, and that is a protocol fact. Neither
+  `ext-image-copy-capture` nor the ScreenCast portal can leave a window out of a
+  display capture.
+
+Window-mode recording needs none of this anywhere: it records one chosen
+toplevel's own pixels, and the toolbar is a different window.
+
+### Drawing on the screen while recording (DRAGON-691)
+
+A three-way tool selector (Pointer, Marker, Magic Marker) plus a Clear Marks
+button, offered in the recording toolbar and in the tray's "Live Annotations"
+rows (DRAGON-693, top level since DRAGON-757) while any recording runs.
+Pointer is the default and the ordinary recording state. On the GOLD tier the
+ink is an ordinary composited surface, so the recording captures it exactly as
+it captures everything else on the desktop: nothing in `src/record/`,
+`record::finalize`, the mixer or the encoders changes, and there is no
+re-encode. The other two tiers are the next section.
+
+**The Magic Marker's dissolve is gated on ACTIVITY, in GENERATIONS.** A
+generation is a batch of magic ink that holds together and then fades together.
+While one is still holding, new drawing joins it and extends its hold, which is
+what makes "keep drawing and nothing moves" work; under `MAGIC_HOLD_MS` (2s) the
+batch is solid, and from there one sweep runs so all of it is gone at
+`MAGIC_GONE_MS` (3s).
+
+The moment a generation's sweep BEGINS it is closed (`ink::gen_accepts`): new
+drawing opens a fresh generation with its own hold, and the closed one runs to
+completion underneath. That is the DRAGON-691 amendment 2 fix, and the behaviour
+it replaces is the one the owner tested and disliked: with a single scene-wide
+clock, drawing anything reset it, so starting a stroke while the previous batch
+was halfway through dissolving stopped that dissolve and brought the ink back.
+Several generations can now be fading at once at their own rates, which is what a
+whiteboard actually does.
+
+An activity gate rather than a per-point age, because the two are different
+behaviours: a per-point age fades the start of a long explanation while its end
+is still being drawn. Draw order still decides the ORDER things leave in, which
+is why the per-point timestamps are carried.
+
+The sweep is a soft FRONT travelling through the scene's draw order
+(`ink::sweep_front`, `ink::magic_alpha`), from `-SWEEP_EDGE` to `1.0`, so nothing
+has begun to lift when the hold ends and nothing is left when the sweep does.
+**The scene is APPEND-ONLY, and that is what makes a bake possible at all.**
+Nothing is ever removed from `ink::InkLog` while a recording runs: strokes and
+generations are appended, and an Erase is appended as the INSTANT it was pressed.
+What is on screen is a question about a TIME, answered by `ink::visible_at`
+(`ink::any_visible_at` for the surface's lifetime, `ink::fading_at` for the fade
+tick), never a question about what the log still holds. DRAGON-693 added a third
+appended record beside the strokes and the erases, the FINAL SWEEP
+(`InkLog::wipes`), for the same reason: a Silver or Bronze disarm has to REPLAY
+as a lift, not as an absence.
+
+The live scene used to DROP clips it could no longer show, and every term of that
+justification was true of the overlay, which only ever asks about now, and false
+of the window-mode bake, which re-reads the same log after the session and
+replays it from media 0. "Invisible now" is not "invisible then". It cost the
+owner a whole drawing: the middle of three, dissolving while the third was being
+drawn, deleted by the fade tick that finished its sweep, and absent from the
+finished video at every instant, including the seconds it had been on screen. A
+renderer may SKIP ink it cannot see (an invisible clip costs `visible_at` one
+comparison) and may never FORGET it.
+
+**Escape during a live recording selects Pointer and does nothing else**
+(`WindowChromeMsg::Close`). It used to stop and save the recording, which put the
+one irreversible outcome a keypress away for the whole take, on the key a user
+hits to back out of a mode. Stop and cancel stay on the toolbar and in the tray.
+On Linux the armed ink surface takes `OnDemand` keyboard for exactly this reason:
+without it a user who clicked the ink last would be holding the screen with no
+key that gives it back.
+
+**Three routes reach that disarm, and they share ONE method** (DRAGON-742,
+`App::disarm_ink_tool`): Escape, a RIGHT CLICK on the recording's own surfaces,
+and bare `V`, the letter the preview editor already spends on its own Pointer
+tool. The owner asked for the second and third as "the same way escape does",
+and one method is what makes that literally true. The reason it matters is what
+a disarm does BESIDE moving the selector: the Silver / Bronze final sweep, the
+tray's Live Annotations rows, the DRAGON-694 media un-duck, the surface
+sync, and DRAGON-739's painted cursor, which `update_ink` drops to `None` after
+every ink message and which a route that only moved `ink.tool` would leave
+switched on, drawing a pointer into the recorded file for the rest of the
+session. The two decisions are pure and unit-tested, one per question:
+`shortcuts::is_ink_disarm_key` (which key) and
+`app::update::window_chrome::ink_disarm_fires` (whether it applies, shared by
+both new routes so the mouse and the keyboard cannot drift apart). The
+convergence itself is guarded structurally by `app::ink`'s
+`disarm_route_tests`, which refuses any other site spelling
+`SelectTool(InkTool::Pointer)` for itself. Escape's OTHER duties, the settings
+search collapse, the countdown step-back and the teardown, are not inherited by
+either new route.
+
+`crate::ink` is the pure half (the dissolve curve, the per-point timestamps that
+drive it, the availability gate, the region clamp, the input-zone rect
+subtraction) and `app::ink` is the surface and the scene. `widgets::ink_canvas`
+draws finished polygons and reports press / move / release; it is deliberately
+not `widgets::annotation_canvas`, which is an editor.
+
+**The ink gets its own surface, and that is the whole reason DRAGON-690's seam is
+per-window.** The recording toolbar is iced UI drawn inside the per-output
+capture overlay, and that overlay opts out of our recordings. Ink drawn on it
+would be excluded with it: on screen, absent from the file. So a second surface
+is minted on the recorded output, and its contract is that it never calls
+`platform::exclude_window_from_capture`.
+
+The toolbar has to stay visible and clickable ABOVE the ink, or a user can arm a
+tool and then not reach the button that disarms it. Each platform says that
+differently:
+
+* **Linux** puts the ink on `Layer::Top` while the capture overlays stay on
+  `Layer::Overlay`, so the compositor orders them correctly by construction.
+  Input is per-rect: the ink surface's region is the output MINUS the toolbar
+  (`ink::rect_subtract`). A layer-shell input region is fixed at creation, so
+  arming, disarming and a toolbar DRAG each re-mint the ink surface, and only
+  it, so the toolbar never flickers for a change to the drawing.
+* **macOS** places the ink window one level BELOW the overlays' shielding level
+  (`platform::mac::window::place_ink_overlay`).
+* **Windows** has one topmost band with no sub-levels, so the ink is placed
+  topmost and the capture overlays are then re-asserted topmost above it.
+
+macOS and Windows have no per-rect input region, so both extend the existing
+60ms hover poll (`App::passthrough_poll`) by one window: the pointer over the
+toolbar makes the ink click-through and the toolbar solid, anywhere else does
+the reverse. The consequence is that while a tool is armed the user cannot click
+the application being recorded on those two platforms. That is accepted, not
+overlooked: it is a mode the user turned on and one press of the same button
+turns it off.
+
+The Magic Marker's clock is WALL CLOCK, not painted frames, and that is not
+DRAGON-644 in reverse. The dim fade counts frames because a ramp spent during a
+stall is an animation nobody sees, and being watched is that fade's whole job.
+The ink's deadline is a promise to the FILE: the video runs in real time and the
+user is talking over it, so "gone three seconds after I stopped drawing" has to
+be true in the recording. A frame-counted clock would stretch that deadline by
+however long the app stalled.
+
+The tick has two cadences (`sub_ink_fade`), and the reason is the hold: through
+it every frame draws the identical scene while rebuilding every stroke's ribbon,
+on a machine that is already encoding video. It idles at `INK_HOLD_TICK_MS` and
+goes to one frame's cadence one tick before the sweep. It cannot simply arm
+itself late, because a subscription is only re-evaluated when a message arrives.
+
+### Tiered support: gold, silver, bronze (DRAGON-693)
+
+Not every session can host an always-present click-through ink surface, and the
+one that cannot is a Linux session with no `zwlr_layer_shell_v1`: a GNOME
+session, or a Flatpak build cosmic-comp hides the global from. Those record
+through the desktop portal, and `recreate_active_overlays` tears every surface of
+ours down (and clears `App::outputs`) the moment recording starts, because the
+selection UI would otherwise be baked into the video and would swallow every
+click meant for the app being recorded.
+
+DRAGON-691 answered that by hiding the tools there. DRAGON-693 grades the session
+instead. The probe is pure and unit-tested (`ink::tier`), fed by three facts that
+are known before the first stroke. The third is DRAGON-738's:
+
+| `portal_fallback` | `window_mode` | `window_unlocated` | tier |
+| --- | --- | --- | --- |
+| false (macOS, Windows, layer-shell Wayland) | false | false | Gold |
+| false | true | false | Gold |
+| false | true | **true** | **Bronze** |
+| true | false (region / monitor) | either | Silver |
+| true | true (window cast) | either | Bronze |
+
+`window_unlocated` means "this is a portal WINDOW cast and we could not find out
+where the recorded window is". It is the DRAGON-738 row, and it exists because a
+window cast delivers the toplevel's OWN buffer, so the ink has to be composited
+in by us and the map into that buffer needs the window's origin. On Linux only
+`zcosmic_toplevel_info_v1` carries a toplevel's geometry (the portal names a
+PipeWire node and never a window; `ext_foreign_toplevel_list_v1` carries identity
+alone; core Wayland tells a client nothing about position), so KDE and wlroots
+can NEVER answer, and COSMIC may not either when two windows share a size and
+DRAGON-737's pixel tie-break cannot separate them. Those sessions have layer
+shell, so they used to grade Gold: the ink drew perfectly on screen, the user
+watched it, and the file got none of it with nothing to say so.
+
+Three rows deliberately do NOT move. macOS and Windows never report the term
+(`platform::window_rect` answers from the window server all session long). A
+native Linux window recording never reports it either, because that path crops a
+screen RECTANGLE and the compositor captures the ink with everything else. And a
+region or monitor cast is untouched whatever the term says, because its ink is on
+the screen being cast.
+
+The UX is IDENTICAL across all three: the same selector, the same fade clocks,
+the same Clear Marks. Only two things differ, and both hang off the tier rather
+than off scattered `if`s (`InkTier::persists_after_disarm` /
+`arms_own_window` / `shows_snapshot`):
+
+* **GOLD** keeps today's behaviour byte for byte. The ink is on its own surface
+  (a `Layer::Top` layer surface on Linux, an own window on macOS and Windows),
+  the recording controls stay clickable above it, and going back to Pointer
+  leaves the ink up, display-only, until Clear Marks or a dissolve takes it.
+* **SILVER** presents ONE ordinary fullscreen transparent toplevel on the
+  recorded output when a tool is armed (`shell::ink_armed_window`, the twin of
+  the fallback capture overlay's `overlay_fallback_window`). It is focused and
+  opaque to input, so the tier is "annotate OR control": the window hosts both
+  the canvas and the same tool selector the toolbar shows. The portal's monitor
+  or region cast carries the ink live, so NO bake is involved. It is a deliberate
+  exception to the record-start teardown above, and it goes again on disarm.
+* **BRONZE** is a WINDOW cast we cannot place on screen: the no-layer-shell
+  session recording a window, and, since DRAGON-738, any session at all whose
+  portal window cast could not be matched to a toplevel. Its cast streams that
+  window's own pixels and tells us nothing about where the window is. Arming
+  freezes the latest captured frame (`record::FramePeek`, a one-shot request
+  served by the CPU PipeWire worker) and shows it fitted in the armed window;
+  strokes are born in STREAM pixels (`ink::fit_rect` / `ink::to_stream`), so no
+  window position is ever needed. The ink reaches the file through the EXISTING
+  finalize bake with a single rect sample covering the frame, which is the
+  identity when the encode kept the stream's size and the right rescale when the
+  resolution cap shrank it.
+
+**The disarm SWEEP is why Silver and Bronze do not just hide the window.** The
+recording is running, so a hide is one frame with ink and the next without, which
+reads as a glitch rather than as the user putting the pen down. A disarm appends
+a FINAL SWEEP to the log instead (`InkLog::wipe`, `FINAL_SWEEP_MS` = 400ms) and
+everything on screen lifts in draw order, over the same curve the Magic Marker
+uses with a zero hold and a much shorter travel (`ink::sweep_front` /
+`ink::sweep_alpha`, ONE curve called with two sets of durations). It is RECORDED
+rather than applied, like every other clearing action, so the Bronze bake replays
+the lift. `ink_bake_e2e_tests::a_final_sweep_lifts_the_baked_ink_over_its_own_span_e2e`
+pins it against decoded pixels, in three states: solid, part gone, absent.
+
+Gold records no sweep at all. Its ink stays, which is the whole of what the medal
+buys, and encoding that difference in `InkTier` is what keeps the Gold paths
+untouched.
+
+**Bronze's honest caveats**, both stated in the README as footnotes: the ink is
+placed against the FROZEN moment while the window keeps recording live
+underneath, and a zero-copy recording (GPU DMA-BUFs the CPU never maps) serves no
+snapshot at all, so the armed window falls back to a plain scrim. A third rides
+on the DRAGON-738 rows: Bronze composites through the RETAINED `record::ink_bake`
+finalize pass rather than DRAGON-724's live painter (its strokes are already in
+stream coordinates, which the painter's window-rect mapping would place wrongly),
+so an inked take there re-encodes its video once at stop. None of the three is
+hidden: `ink::armed_note` prints the mode and its cause under the armed window's
+selector, and `begin_ink_session` logs the same split. The ink still
+works and still lands in the file in either case, because the strokes are in
+stream coordinates and the stream's size comes from `RecordHandle::dims` when no
+snapshot arrived. A GPU readback for the peek is the obvious follow-up.
+
+**The tray is the arming surface on Silver and Bronze**, because those sessions
+have no toolbar on screen at all. That is also what let `ink::tools_available`
+drop its `toolbar_hidden` term: a hidden toolbar is no longer a feature with no
+door. The block is portable data like every other tray row
+(`recording_ui::ink_items`, `RadioSubmenu::Ink`), rendered by the two Linux ksni
+trays, the two macOS `NSMenu`s and the Windows `HMENU`; a resident's pick is
+relayed to the recording child as a new `daemon_ipc::Command` word, and the
+mark rides back on `RecordingState`'s fifth wire field.
+
+**Every tray renders the block FLAT** (DRAGON-757): the same four rows, in the
+same place, at the TOP level of the recording menu, each carrying the glyph the
+recording toolbar's button for that tool already draws. The owner asked for it
+because the tools are what a user reaches for repeatedly mid-take and a submenu
+put a hover and a second click in front of every one of them. The two Linux
+trays went first and the two macOS menus and the Windows popup followed in the
+same ticket. It stays ONE model entry rather than four, because the RENDERING
+changed and not the control: the block still appears and disappears together and
+is still recording-only. What the flat walkers need on top of the shared rows is
+additive and lives in `recording_ui` so the five surfaces cannot drift:
+`InkItem::icon` and `ink_row_label`. `INK_SUBMENU_LABEL` went with the last
+submenu that rendered it.
+
+**Where the armed mark lives, which is a per-renderer answer.** Three of the five
+surfaces put it in the LABEL (`recording_ui::ink_row_label`, a trailing check
+character) and the two macOS ones mark the item itself. The split is about
+whether a mark and an icon compete for one slot.
+
+* **Linux, the X11 half.** A ksni `CheckmarkItem` is the idiomatic way to show
+  which of a set is armed. But dbusmenu carries `toggle-type`, `toggle-state` and
+  `icon-data` as three independent properties and says nothing about one row
+  rendering an indicator AND an icon; whether it does is the HOST's choice, and
+  this project already recorded that the two fight for the same slot on several
+  hosts (`recording_ui::MenuIcon`), which is why no radio row here has ever
+  carried an icon. Those hosts are the GTK / libdbusmenu ones on X11, not the
+  COSMIC applet, and the icon is exactly what was asked for. So the rows are
+  plain `StandardItem`s and the icon slot is unambiguously theirs.
+* **Windows, the same shape of problem.** Win32 draws a selected item's mark in
+  the item's CHECK-MARK AREA, which is the same leading column an `hbmpItem`
+  bitmap occupies: "About Menus" describes the selected-state bitmap as the one
+  displayed next to a selected item and requires an application-supplied one to
+  be exactly the size of the default check mark, and `SM_CXMENUCHECK` is the
+  metric `attach_menu_icon` already rasterizes our bitmaps at. What is drawn for
+  a row that is both checked and carries an `hbmpItem` is documented nowhere, so
+  `MF_CHECKED` would put the icon at the renderer's discretion. The bitmap is
+  unconditional and the mark is text.
+* **macOS is the exception**: AppKit gives an `NSMenuItem`'s state its own column
+  BESIDE the image, so `setState:` gives a native check mark and keeps the glyph.
+  The two mac walkers read `InkItem::selected` directly and never call
+  `ink_row_label`.
+
+The armed tool then still reads on a host that renders no menu icons at all,
+which an icon-based or tint-based mark could not promise. A pick also cannot arm
+the wrong tool any more, and not by a range check: `recording_ui::ink_choice_at`
+is gone, because each flat row holds its own `InkAction` (its own ksni closure,
+its own `NSMenuItem` selector, its own Win32 command id) and there is no index
+space left to shift. The Windows `CMD_INK_FIRST..=CMD_INK_LAST` ids stayed
+contiguous, because `command_action` still resolves a chosen id back to a tool by
+offset, but they are an id space now and no longer a `CheckMenuRadioItem` span.
+
+### Window mode: the ink is data, and it is composited in (DRAGON-691 amendment 2, DRAGON-724)
+
+Window recording used to be the one mode with no ink. It now has it everywhere,
+by two different routes, and which route a SESSION takes is
+`platform::window_capture_excludes_overlays`, fed the one runtime fact only the
+app knows:
+
+* **A rectangle of the SCREEN.** That is the Linux NATIVE screencopy path, where
+  window mode funnels through `spawn_screencopy_worker`'s region crop, so the
+  overlay is captured live exactly as it is for a region. Nothing extra runs.
+* **The target window's OWN buffer**, which no floating surface is part of. That
+  is macOS SCK, Windows WGC, and a Linux PORTAL window cast (an xdg ScreenCast
+  WINDOW stream). It is why window recording never carried our toolbar, and
+  equally why it never carried our ink. There the strokes are ALSO kept as data
+  and composited in by the app.
+
+**DRAGON-736 is where that stopped being a per-platform answer**, and the reason
+matters for anything added here later. The predicate was `cfg!(any(macos,
+windows))`, which is a question about the operating system; the real question is
+what THIS session's capture saw. macOS and Windows have one window-capture
+implementation each, so there the two questions coincide. Linux has two backends
+and they answer opposite ways in the same build on the same desktop, so a portal
+window recording drew the marker on screen and delivered a video with none of it.
+The decision is pure now (`platform::window_capture_excludes_overlays_with` and
+`ink::needs_composite`, both unit-tested across the whole matrix) and the session
+fact is read where the backend is known (`App::portal_window_cast`).
+
+The chain, end to end: a stroke is stamped in MEDIA time as it is drawn
+(`App::ink_media_ms`, which is `recording_started` plus the same pause accounting
+`MediaClock` applies, so a pause contributes none of it); the recorded window's
+on-screen rect is sampled into a timeline on the existing 100ms recording poll,
+keeping a sample only when it changed; and the pair is handed to the recording
+worker, either live or at stop.
+
+#### Live on the captured frame, the normal path (DRAGON-724)
+
+`src/record/ink_live.rs`. `App::publish_live_ink` republishes the whole scene into
+`RecordHandle::live_ink` after every ink message and on the 100ms recording poll;
+the capture worker's `LiveInkPainter` paints it onto each frame on its way to
+ffmpeg's stdin, just before `owned::make_frame_writer`. The finalize pass then
+stream-copies its video exactly as an un-inked recording does.
+
+Three things keep that off the throughput-critical capture path, and none of them
+may go without re-measuring:
+
+* **A SIZE GATE**, `ink_live::live_ink_affordable`, pure and unit-tested in the
+  shared tree so the Linux gate proves it. The budget is pixels per SECOND, so
+  the frame rate counts: 4K UHD at 30fps is admitted, 4K at 60 and a 6400x3600
+  native Studio Display frame are refused. Above it, the bake below still runs.
+* **The raster is cached per PUBLISHED SCENE, not per frame**, so ink sitting
+  still costs one `Arc::ptr_eq` per tick and no rasterization.
+* **The layer is only as big as the ink** (`ink_live::layer_bounds`), so the blend
+  is proportional to the drawing rather than to the frame. A tick with nothing on
+  screen returns the captured bytes untouched, which is what keeps a recording
+  with no ink byte-identical.
+
+The painter NEVER mutates the frame it was handed: the capture loop re-feeds the
+freshest frame whenever a tick has nothing newer of its own, so painting in place
+would stack one tick of ink per repeat.
+
+**Which workers build a painter** (DRAGON-736): the macOS SCK worker, the Windows
+WGC worker, and the Linux CPU PORTAL worker. The Linux NATIVE screencopy worker
+takes neither ink slot, because compositing there would draw every stroke twice.
+The Linux ZERO-COPY pipewire worker refuses the painter on purpose and takes the
+bake: its frames are GPU dmabufs the CPU never maps, so a per-tick composite
+would mean a readback, which is the cost that path exists to avoid. And the CPU
+portal worker drops its fallback bake on `painted()` where the other two use
+`active()`, because it is also the worker a BRONZE session runs on and the app
+publishes no live scene for that tier, so "the gate admitted this session" and
+"the ink is in the frames" are different statements there.
+
+**It also sidestepped a clock defect the bake could not, and that property is
+worth keeping now the defect is gone.** When DRAGON-724 was written,
+`recording_started` latched on `settled_at`, the end of the worker's opening
+phase, while the file's media 0 is `owned::media_zero`, taken before the pump
+spawns. Everything `ink_media_ms` stamped was therefore early by the opening's
+length (489.8ms measured, against a 500ms measured lead in the delivered file,
+median of 21 samples), and DRAGON-717 had made that opening much longer than it
+used to be. DRAGON-725 fixed the anchor in the same batch, so
+`recording_started` is now `RecordHandle::media_zero_at` and the bake below
+counts the same file its indices do. The live path is unaffected either way: it
+only ever compares two values from the app's own clock, so any offset in that
+clock cancels exactly, and `ink_live::offset_invariance_tests` pins it. Keep it
+that way rather than resolving the ink instant from the worker's tick; the
+anchor has been wrong twice.
+
+#### The POINTER, drawn on the same path (DRAGON-739)
+
+An armed annotation tool takes the cursor OUT of a window recording, and the
+mechanism is a compositor rule we cannot reach: cosmic-comp composites the
+embedded cursor into a toplevel capture only while pointer FOCUS is on that
+toplevel, and the ink layer surface's input region is the output minus the
+toolbar for exactly as long as a drawing tool is armed. niri has the identical
+rule and the identical symptom, and KDE has been focus-based deliberately since
+2024, so drawing the pointer yourself is the settled answer rather than a
+workaround.
+
+`App::publish_live_cursor` publishes the pointer's surface-LOCAL position into a
+SECOND slot on `LiveInk`, and the painter blends a small pointer sprite over the
+ink layer. Four things make that safe:
+
+* **It is not part of the published scene.** The raster cache is keyed on the
+  scene `Arc`, and the pointer moves on every mouse sample, so a pointer carried
+  inside `LiveInkFrame` would re-rasterize the whole drawing on every frame
+  written. Its own slot costs a lock and two floats.
+* **Both blends land on ONE scratch copy**, so a re-fed frame draws the same
+  picture rather than a TRAIL of cursors down the screen.
+* **`ink_live::live_cursor_needed`** is the pure five-term gate: the session
+  records one window whose capture is that window's own buffer, our surface draws
+  on the LIVE screen over it (BRONZE fails this and must, since it draws on a
+  frozen still inside a window of ours and the recorded window never had a
+  pointer to lose; `ink::needs_composite` is true there by its other disjunct,
+  which is exactly why this is a separate term), the user's "Preserve mouse
+  cursor" extra is on (read through `app::cursor_wanted` over
+  `effective_capture_extras`, the same pair the portal's own `CursorRequest` came
+  from), a drawing tool is armed, and `platform::window_cursor_source()` says the
+  platform composites the pointer by FOCUS. Windows Graphics Capture composites
+  it by GEOMETRY and already over-includes it, so a second one there would be a
+  doubled cursor; macOS is assumed geometric on the safe side, because no mac was
+  reachable to settle it and `Geometry` is the arm that changes nothing.
+* **`painted()` counts INK ticks only** and `pointed()` is a separate counter.
+  The Linux CPU portal worker drops its fallback bake on `painted()`, so a
+  cursor-only tick joining that count would silently cost a Bronze user their
+  whole drawing. Do not recombine them.
+
+The byte-identity contract gained a second row and both are pinned in
+`ink_live::painter_tests`. No tool armed and no strokes still hands the CAPTURED
+buffer back by pointer identity, with no copy and no allocation. A tool ARMED with
+no strokes yet DOES paint, and that is the feature: the compositor drops the
+cursor at arm time, well before the first stroke, so waiting for one would blank
+the pointer for exactly the span the user is deciding where to draw. The window
+rect timeline and the live scene therefore start at arm time too.
+
+What is drawn is our own vector ARROW, not a captured bitmap. It was a CROSSHAIR
+until DRAGON-744, justified by "`widgets::ink_canvas` asks for
+`mouse::Interaction::Crosshair` while armed, so we know the shape by
+construction". The owner tested it and reported "i dont see a crosshair when im
+drawing mid recording", so the file was showing a shape the screen never did, and
+they set the bar at a guarantee. There is none to be had, for a structural reason
+before any timing one: the recording toolbar is iced UI inside the per-output
+CAPTURE OVERLAY, a separate layer surface with its own iced `Window`, and
+`iced_winit`'s `Window::update_mouse` issues a cursor only when THAT window's
+stored interaction changes. Cross to the toolbar and the overlay sets the arrow;
+cross back and the ink window's stored value is unchanged, so it issues nothing
+and the arrow stands for the rest of the session. The DRAGON-331 re-assert dance
+does not rescue it either: `app::color_picker` already runs it and already carries
+the resulting defect, logged and declined, where a live grab in its 24ms dip
+photographs the arrow the picker exists to hide, and a recording photographs
+everything, roughly one frame of dip plus six of settle per crossing at 30fps. And
+`wl_pointer.set_cursor` has no reply, no error and no event, so nothing here can
+ever learn what the user is looking at: a guarantee that is unobservable by
+construction is not one.
+
+So the canvas asks for the DEFAULT (`ink_canvas::requested_interaction`, pure,
+with the tombstone) and the painter draws the arrow that answers to. That arrow is
+the right guess mechanically rather than by taste: the ink window issues no
+request at all, since `Interaction::default()` IS its initial stored value; the
+last of our windows to have issued one is the capture overlay, whose resolved
+interaction with nothing hovered is `Interaction::None`, i.e. `CursorIcon::Default`;
+and libcosmic's `pointer_frame` re-asserts that seat icon on every enter. Honoured
+or dropped, both roads end at the arrow.
+`ink_live::recorded_shape_agreement_tests` pins the two modules together.
+
+Dead ends recorded rather than re-run. **Hide the system cursor and draw our own
+crosshair in the canvas** is the obvious next idea and does not work: the fork's
+`hidden` is a field on `SctkSeat` and therefore SEAT-global, so it would blank the
+pointer over the recording toolbar too, and nothing would put it back
+(`update_mouse` calls `set_cursor_visible(true)` only when leaving
+`Interaction::Hidden`, which that window never held). `App::frozen_cursor` holds a
+real sprite but it is the LAUNCH-time pointer, an arrow most of the time and an
+I-beam or a resize handle the rest, so it trades a known approximation for an
+unknown one. `screenshot::capture_cursor()` would open a whole Wayland capture
+session on the capture thread, race the arm-time focus change and need rescaling
+into video pixels. Loading the XCursor theme means a theme lookup, a size
+negotiation and an animated-cursor format in the record worker.
+
+#### Baked at finalize, the fallback above the gate
+
+**The bake joins the finalize pass rather than adding one**, and that is the
+design's whole point. The ink is a second ffmpeg input, `rawvideo` RGBA on the
+child's stdin, `overlay`ed onto the video in the same `-filter_complex` the audio
+already uses. So:
+
+* the AUDIO chain, its two mute gates and its `amix` are byte-identical whether
+  or not there is ink, and the audio is still encoded exactly once;
+* the only change is that the VIDEO is encoded instead of stream-copied, and only
+  when there is ink.
+
+The obvious alternative, baking only the inked spans and stream-copying the rest,
+would have to CUT AND CONCAT, and a concat splices the AUDIO too, where the
+mixer's continuity guarantee is load-bearing (a mid-file PTS gap in one audio
+stream desyncs under `amix`, see the recording invariants). Folding the overlay
+into the existing pass buys most of the saving with none of that risk. Measured
+on an M-series Mac, a 30-second 1080p30 recording: 0.79s to finalize with no ink,
+3.48s with the full overlay, so about 0.09s of extra finalize per second of inked
+recording. A recording with no ink pays nothing, which
+`finalize_ink_args_tests::a_recording_with_no_ink_still_stream_copies_its_video`
+pins at the argument level and
+`ink_bake_e2e_tests::a_recording_with_no_ink_keeps_its_stream_copy_e2e` pins
+against a decoded frame count.
+
+The bake feeds frames from media 0 to `ink::last_visible_ms`, then closes the
+pipe and lets `overlay`'s `eof_action=pass` carry the rest of the recording
+through untouched, so the work is bounded by the INKED span rather than by the
+recording's length. It starts at 0 rather than offsetting the overlay input,
+which trades some transparent frames for not having to trust `overlay`'s
+framesync to hold the main input before its second stream begins.
+
+**Occlusion and out-of-window ink.** A window recording shows the window
+unoccluded, so there is nothing to reason about there. Ink drawn OUTSIDE the
+window is clipped away rather than squeezed in (`ink_bake::touches_video` plus
+the rasterizer's own clip): the recording is of the window, so the parts of a
+stroke that were not over it were never over anything the file contains. A stroke
+that crosses the edge keeps the part that was inside, which is the same rule the
+live region clamp follows. A window that MOVES or RESIZES mid-recording is why
+the plan carries a rect TIMELINE: the mapping is re-derived per frame, so ink
+stays where the user put it on the window. A window that hops displays needs
+nothing special, because the mapping is a ratio of two rects in one global
+capture space.
+
+**The Linux PORTAL route's timeline is one sample, and that is a ceiling rather
+than an oversight** (DRAGON-736). The xdg ScreenCast interface names a PipeWire
+node and never a window, so there is no id to key `platform::window_rect` with;
+the rect comes from DRAGON-735's grant-time size match instead, and re-resolving
+it would mean `compositor::list_toplevels`, a blocking Wayland settle loop
+measured at 167ms on the dev box, which cannot ride a 100ms poll during a live
+recording. When several toplevels share the granted size, that match ties, and
+DRAGON-737 settles it by looking at the pictures: one bounded frame from the
+granted PipeWire node (a SECOND `OpenPipeWireRemote`, never a `dup` of the
+recording's fd, which is one stateful socket) against one `screenshot::windows`
+grab per tied candidate, compared as 64-bit difference hashes with a maximum
+distance and a margin over the runner-up. It runs once, at grant time, only on a
+tie, and every failure refuses back to the size-and-activation ladder. Two routes
+are closed and tombstoned in `app/portal.rs`: compositor geometry off COSMIC
+(only `zcosmic_toplevel_info_v1` carries it) and the pointer out of PipeWire
+cursor metadata (COSMIC, GNOME and KDE all gate a window stream's cursor metadata
+on pointer FOCUS, so it is blank exactly while the user draws, and the portal
+spec restricts a stream's `position` to monitor streams). So ink drawn after the user MOVED the recorded window is placed by
+where the window started. It costs the video nothing, since a window cast
+delivers the toplevel's own buffer wherever it sits; only the screen-to-video
+mapping goes stale.
+
+**The whole thing is verified against decoded pixels**, not against file shape
+(`src/record/ink_bake_e2e_tests.rs`, CLAUDE.md's DRAGON-417 rule): the ink is in
+the video at the position the mapping puts it, absent before it was drawn, gone
+after a dissolve or an erase, following a window that moved, and the audio comes
+out the same length and the same RMS either way.
+
+`stop_recording` publishes this plan through `RecordHandle::ink` BEFORE raising
+the stop flag, on EVERY inked window session, including the ones the live painter
+took. The worker drains the slot after its stop tail and simply drops it when it
+painted live: the gate needs the encode size and the frame rate, which only the
+worker knows, so having the app publish either way is what lets the fallback need
+no coordination at all.
 
 ## How the capture backend is chosen (DRAGON-595)
 
@@ -612,10 +1205,11 @@ The flow, all in `app/portal.rs` unless noted:
 1. `on_output` (`app/surfaces.rs`) registers each output's GEOMETRY but mints no
    layer surface and notes no failure, then kicks ONE seed request
    (`fallback_seed_kicked`, the `immediate_kicked` shape). The kick honors the
-   LAUNCH MODE: a Window or Monitor launch (the daemon's `--window` /
-   `--monitor`) goes straight to the portal picker of the matching source and
-   delivers through the normal held-stream path, no region overlay at all; only
-   a Region launch takes the frozen-overlay seed below. A dismissed launch
+   LAUNCH MODE: a Window or Monitor launch (the daemon's `capture --window` /
+   `capture --monitor`, and their `record` twins) goes straight to the portal
+   picker of the matching source and delivers through the normal held-stream
+   path, no region overlay at all; only a Region launch takes the
+   frozen-overlay seed below. A dismissed launch
    dialog ends the session as Cancelled (there is no selector to return to).
 2. `request_fallback_cast` asks the portal for a monitor with the persisted
    restore token. The portal's own picker IS the monitor selection. Tokens live
@@ -721,7 +1315,8 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   DRAGON-559 / — / Settings… / Manage Permissions / — / Quit), and the
   process-wide PrintScreen
   (+ F13) `global-hotkey`. The record entries (DRAGON-559) spawn the capture
-  twins' children plus `--video` (`CaptureAction::spawn_args`), show wherever
+  twins' children under `record` instead of `capture`
+  (`CaptureAction::spawn_args`), show wherever
   the capture trio shows, and are idle-only (the recording-time Capture Menu
   submenu drops them: one recording at a time). The audio submenu is on EVERY
   tray/menu-bar surface: its title carries the current arm state, one radio pick
@@ -735,16 +1330,25 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   the main thread for the daemon's life; menu callbacks act DIRECTLY (spawn a
   child / terminate) — no drain queue. A background thread drains the hotkey
   receiver + a SIGUSR1 flag, spawning detached one-shot capture children.
-- **Early branch** (`main.rs`, `cfg(macos)`) — BEFORE any GUI init: a BARE launch
-  (no capture-mode / `--settings` / `--preview` / worker flag) with `resident`
-  on runs `daemon::run()` and never returns. Every other launch (capture flags,
-  `--settings`, `--preview`, or non-resident) falls through to `app::run` exactly
-  as on Linux.
+- **Early branch** (`main.rs`, `cfg(macos)`) — BEFORE any GUI init: the `tray`
+  command runs `daemon::run()` and never returns, whatever the setting says, and
+  so does a BARE GUI launch (a login item, Finder, the Dock) while the
+  `resident` setting is on. Every other launch falls through to `app::run`
+  exactly as on Linux.
+  DRAGON-695 changed what the bare cases MEAN, not the branch. A bare GUI launch
+  with the setting off now opens the settings window, and a bare launch from a
+  terminal prints the help and exits. Neither captures. "Bare means capture" is
+  dead, and that is what makes the app safe as a login item: the old rule turned
+  every login into a screenshot of the desktop.
+  The SETTING keeps its name, `resident` in the config; only the argv word
+  became `tray`. A Linux autostart entry written with the old word is migrated
+  on first run.
 - **Menu/hotkey/signal actions** — each spawns the full app as a DETACHED
-  (`setsid`) one-shot child with the matching CLI flag (Scanner→`--scan`,
-  Region→`--region`, …, Settings→`--settings`; hotkey/SIGUSR1→`--region`, the
-  bare default). Detached so a child crash never touches the daemon and there's
-  no SIGCHLD to reap. Each child captures and EXITS at finish — same as Linux.
+  (`setsid`) one-shot child with the matching command (Scanner→`scan`,
+  Region→`capture --region`, …, Settings→`settings`; hotkey and SIGUSR1 both
+  give `capture --region`, the default). Detached so a child crash never touches the
+  daemon and there's no SIGCHLD to reap. Each child captures and EXITS at
+  finish, same as Linux.
 - **Lifecycle** (`src/instance.rs`) — the daemon takes its own single-instance
   DAEMON lock (`acquire_daemon_lock`; the one-shot capture children it spawns
   take no lock at all) and installs the SIGUSR1 handler first thing (no boot
@@ -784,13 +1388,19 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
 
 ## Controlling a live recording from another process (DRAGON-583)
 
-Five verbs act on a recording that is already running: pause, finish, cancel,
-toggle mic, toggle system audio. They arrive from three places and converge
-immediately: a resident menu click, a recording-tray click, and the CLI flags
-(`--pause-recording`, `--finish-recording`, `--cancel-recording`,
-`--toggle-mic`, `--toggle-system-audio`). All three become the SAME `TrayEvent`,
+The verbs that act on a recording already running are pause, finish, cancel, the
+audio channels and the live annotation tool. They arrive from three places and
+converge immediately: a resident menu click, a recording-tray click, and the
+CONTROL form of the `record` command (`record --action pause|save|cancel`,
+`record --sound <channels>`, `record --tool <tool>`, which is `record` with no
+target option, DRAGON-695). All three become the SAME `TrayEvent`,
 drained by the same `RecordingMsg::TrayPoll`, so there is one code path to
 reason about and no verb can work on one surface but not another.
+
+The control options combine in one invocation and are applied in a FIXED order,
+`--sound`, then `--tool`, then `--action`, so `record --sound none --action save`
+can only mean "mute the rest, then save". Anything else would make the outcome
+depend on argv order, which a keybinding cannot see.
 
 The transport is `platform/daemon_ipc.rs`'s existing `Command` vocabulary,
 unchanged. What DRAGON-583 added was an ADDRESS, not a protocol: normally the
@@ -1012,9 +1622,9 @@ machines, encoder preset/resolution policy, shortcut matching, zoom/pan
 clamping, and so on — anything exercisable without a compositor, D-Bus, or
 `ffmpeg`. `rstest` is available for table-driven cases. The 5 CLI-level tests
 in `tests/cli.rs` drive the compiled binary (via `assert_cmd`) for
-`--help`/unknown-flag/`--inspect` behavior and for a recording-control flag
+`--help`, unknown-input and metadata-dump behavior and for a `record` control
 with no recording running; `tests/ocr/` holds a small labeled image corpus used
-by the `--ocr-bench` harness, not `cargo test`.
+by the OCR benchmark harness, not `cargo test`.
 
 **Never run the two feature configs at once.** `cargo test` and `cargo test
 --no-default-features` must go SEQUENTIALLY even in separate

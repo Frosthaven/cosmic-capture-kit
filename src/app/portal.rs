@@ -256,6 +256,410 @@ fn output_for_grant_position(
     })
 }
 
+/// **Pure**, unit-tested: WHERE the window a portal grant just handed us actually sits, found
+/// by matching the granted stream's SIZE against the toplevels the compositor lists
+/// (DRAGON-735).
+///
+/// # Why this is needed at all
+///
+/// The xdg ScreenCast portal names a PipeWire node and never a window, and COSMIC's
+/// implementation goes further: it hard-codes `position: None` for every window stream. That is
+/// read off the portal's own source, not inferred, and the portal notes its own limitation
+/// there ("XXX: No way to get size of whole toplevel?"). So a window grant reaches us with no
+/// on-screen anchor of any kind, and the placeholder `Selection` standing in for it carries a
+/// 1x1 rectangle at the origin. Anything that wants to place UI clear of the recorded window,
+/// which today is the toolbar and tomorrow may be the ink bake (DRAGON-736), has nothing.
+///
+/// # Why the SIZE is a sound key and not a guess
+///
+/// The portal builds a window stream's `size` from `info.geometry`, the cosmic toplevel-info
+/// protocol's per-output geometry, taking the entry with the greatest area. Our own
+/// `platform::compositor::list_toplevels` reads THE SAME FIELD for the same toplevels. So the
+/// two numbers are the same protocol value carried by two routes rather than two measurements
+/// that happen to agree, and the match is exact by construction. Confirmed on the dev box:
+/// three toplevels listed at 1689x1384, 1694x1384 and 1689x1384, and the portal window
+/// recording of the middle one negotiated 1694x1384.
+///
+/// # The rules, and what each is protecting
+///
+/// * A size of `None`, or a zero extent, resolves NOTHING. The portal writes `(0, 0)` when it
+///   could not find the toplevel's info at all, and a zero-extent rect would anchor UI against
+///   a rectangle nobody can see.
+/// * ONE candidate of that exact size wins.
+/// * SEVERAL candidates of that size fall to the one that is ACTIVATED, and only when exactly
+///   one of them is. Identical window sizes are ordinary rather than exotic: the dev box's own
+///   desktop has two toplevels at 1689x1384 side by side. The activation term is a prior and
+///   not a proof, so it is deliberately last and deliberately requires uniqueness too. Its
+///   worst case is anchoring beside a same-sized neighbour, which is no worse than the
+///   centred fallback that anchoring replaces.
+/// * Anything else resolves NOTHING, and the caller keeps whatever it did before. **A miss is
+///   a first-class outcome here**, not a degraded one: the honest answer to "which of these
+///   two identical windows did the user pick" is that we do not know.
+///
+/// This is deliberately NOT the move `PortalWindowDeco::apply` makes for a wallpaper crop,
+/// where a synthetic anchor centred on the largest output stands in for a position. That crop
+/// has no truth to preserve and says so. A place-the-UI-clear-of-the-window anchor does, and
+/// inventing one would put the toolbar somewhere the user cannot account for.
+// Its production caller is the Linux portal grant handler; compiled into every test build so
+// the decision is proven on any host (the house pattern).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn toplevel_for_grant_size(
+    candidates: &[(crate::platform::compositor::WinRect, bool)],
+    size: Option<(i32, i32)>,
+) -> Option<crate::platform::compositor::WinRect> {
+    let same = same_size_candidates(candidates, size);
+    if same.len() == 1 {
+        return Some(candidates[same[0]].0);
+    }
+    unique_activated(candidates, &same).map(|i| candidates[i].0)
+}
+
+/// **Pure**, unit-tested: the INDICES of the candidates whose size is exactly the granted
+/// stream's, in list order (DRAGON-737).
+///
+/// The first rung of [`toplevel_for_grant_size`], split out because DRAGON-737 needed the
+/// TIE as a value rather than as a refusal: two toplevels of one size is the case the pixel
+/// evidence exists to settle, and it has to be handed the list of who tied.
+///
+/// A size of `None`, or a zero or negative extent, matches NOTHING. The portal writes
+/// `(0, 0)` when it could not find the toplevel's info at all.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn same_size_candidates(
+    candidates: &[(crate::platform::compositor::WinRect, bool)],
+    size: Option<(i32, i32)>,
+) -> Vec<usize> {
+    let Some((sw, sh)) = size else { return Vec::new() };
+    if sw <= 0 || sh <= 0 {
+        return Vec::new();
+    }
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, ((_, _, w, h), _))| *w == sw && *h == sh)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// **Pure**, unit-tested: the one ACTIVATED candidate among `same`, when exactly one of them
+/// is (DRAGON-737, split out of [`toplevel_for_grant_size`] unchanged).
+///
+/// The last rung of the ladder, and a PRIOR rather than a proof, which is why it insists on
+/// uniqueness: two activated candidates say no more than none do. It stays LAST, now behind
+/// the pixel evidence as well, because a picture of the window is a fact and "this one had
+/// focus a moment ago" is a guess.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unique_activated(
+    candidates: &[(crate::platform::compositor::WinRect, bool)],
+    same: &[usize],
+) -> Option<usize> {
+    let mut it = same.iter().copied().filter(|i| candidates[*i].1);
+    let first = it.next()?;
+    it.next().is_none().then_some(first)
+}
+
+// -- The pixel tie-break (DRAGON-737) -----------------------------------------------------
+//
+// TWO ROUTES ARE CLOSED HERE, and both were investigated to a primary source. Do not
+// reopen either.
+//
+// * COMPOSITOR GEOMETRY off COSMIC. `zcosmic_toplevel_info_v1` is the only protocol that
+//   carries a toplevel's geometry, which `platform::backend::WaylandProtocols` already says
+//   in its own docs; `ext_foreign_toplevel_list_v1` carries identity and nothing else, and
+//   core Wayland never tells a client where a window is. That is why
+//   `platform::window_rect` answers `None` on Linux.
+// * THE POINTER OUT OF PIPEWIRE CURSOR METADATA. COSMIC, GNOME and KDE all gate a WINDOW
+//   stream's cursor metadata on pointer FOCUS, so it goes blank exactly while the user is
+//   drawing on our own surface. KDE made that deliberate in 2024 (commit `b452a5a5fb`,
+//   `BUG: 487294`). And the obvious alternative is closed by the interface itself: the
+//   ScreenCast spec says the stream `position` key is "Only available for monitor streams"
+//   (`/usr/share/dbus-1/interfaces/org.freedesktop.portal.ScreenCast.xml`).
+//
+// What IS available is the picture. The portal hands us a node whose frames are the
+// recorded window's own buffer, and `screenshot::windows` can grab any toplevel by
+// identifier. Comparing those two answers "which window did the user pick" with evidence.
+
+/// The downscale a frame fingerprint is taken at: nine columns by eight rows, so the 64 bits
+/// below are exactly one per horizontal neighbour pair.
+#[cfg(any(target_os = "linux", test))]
+const HASH_W: usize = 9;
+/// See [`HASH_W`].
+#[cfg(any(target_os = "linux", test))]
+const HASH_H: usize = 8;
+
+/// The most a granted frame may differ from the toplevel grab it names, in differing bits of
+/// 64. Deliberately tight: this guards the case where the frame corresponds to NONE of the
+/// candidates (a window that repainted between the two grabs, a route that letterboxes), and
+/// a refusal there is the honest answer.
+#[cfg(any(target_os = "linux", test))]
+const MATCH_MAX_BITS: u32 = 16;
+
+/// How much CLEARER the winner has to be than the runner-up, in bits of 64. Two genuinely
+/// different windows sit tens of bits apart and one window seen twice sits a handful apart,
+/// so this separates "obvious" from "arguable" with room to spare, and refuses the arguable.
+#[cfg(any(target_os = "linux", test))]
+const MATCH_MARGIN_BITS: u32 = 8;
+
+/// **Pure**, unit-tested: a 64-bit DIFFERENCE hash of one frame (DRAGON-737).
+///
+/// A difference hash rather than pixel equality, because the two pictures being compared come
+/// from two different capture routes: the PipeWire node delivers the portal's negotiated
+/// buffer and `screenshot::windows` runs its own screencopy, so they can differ in scale, in
+/// how alpha is carried, in whether the pointer is baked in, and by whatever the window
+/// repainted in between. Equality would fail on every real pair. What survives all of that is
+/// the coarse ARRANGEMENT of light and dark, which is what this measures.
+///
+/// The image is reduced to a [`HASH_W`] by [`HASH_H`] grid of average luminance and one bit
+/// is set per cell that is brighter than its right-hand neighbour. Comparing NEIGHBOURS
+/// rather than an overall mean is what makes it survive a whole-frame brightness or gamma
+/// difference between the routes: a constant offset moves both cells and changes no bit.
+///
+/// Each cell samples at most 8 by 8 source pixels on a fixed stride rather than averaging
+/// every pixel it covers. That bounds the whole hash at about 4600 samples whatever the frame
+/// size, which matters because this runs on the UI thread between the portal dialog closing
+/// and the countdown starting, and a 4K frame has eight million pixels. The stride is fixed,
+/// so the function stays deterministic.
+///
+/// A zero-extent image hashes to 0, which no real frame can be within [`MATCH_MAX_BITS`] of
+/// unless it is nearly uniform, and a uniform window cannot be told from another one anyway.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn frame_hash(img: &image::RgbaImage) -> u64 {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let buf = img.as_raw();
+    let stride = w as usize * 4;
+    let mut cell = [[0f32; HASH_W]; HASH_H];
+    for (cy, row) in cell.iter_mut().enumerate() {
+        let y0 = (cy as u32 * h) / HASH_H as u32;
+        let y1 = ((((cy + 1) as u32 * h) / HASH_H as u32).max(y0 + 1)).min(h);
+        let ystep = ((y1 - y0).div_ceil(8)).max(1) as usize;
+        for (cx, out) in row.iter_mut().enumerate() {
+            let x0 = (cx as u32 * w) / HASH_W as u32;
+            let x1 = ((((cx + 1) as u32 * w) / HASH_W as u32).max(x0 + 1)).min(w);
+            let xstep = ((x1 - x0).div_ceil(8)).max(1) as usize;
+            let mut sum = 0f32;
+            let mut n = 0u32;
+            for y in (y0 as usize..y1 as usize).step_by(ystep) {
+                let base = y * stride;
+                for x in (x0 as usize..x1 as usize).step_by(xstep) {
+                    let i = base + x * 4;
+                    // Rec. 601 luma. The alpha channel is deliberately ignored: for an opaque
+                    // pixel the two routes agree whether or not either premultiplied, and a
+                    // translucent one is a small minority of any real window.
+                    sum += 0.299 * buf[i] as f32
+                        + 0.587 * buf[i + 1] as f32
+                        + 0.114 * buf[i + 2] as f32;
+                    n += 1;
+                }
+            }
+            *out = if n == 0 { 0.0 } else { sum / n as f32 };
+        }
+    }
+    let mut bits = 0u64;
+    for (cy, row) in cell.iter().enumerate() {
+        for cx in 0..HASH_W - 1 {
+            if row[cx] > row[cx + 1] {
+                bits |= 1u64 << (cy * (HASH_W - 1) + cx);
+            }
+        }
+    }
+    bits
+}
+
+/// **Pure**, unit-tested: which candidate fingerprint the granted frame names, when it names
+/// one at all (DRAGON-737).
+///
+/// Two conditions, and BOTH have to hold:
+///
+/// * the winner is within [`MATCH_MAX_BITS`] of the target, so a frame that looks like none
+///   of the candidates picks none of them;
+/// * every other candidate is at least [`MATCH_MARGIN_BITS`] further away, so two windows
+///   showing the same thing pick neither.
+///
+/// **A refusal is a first-class outcome**, exactly as it is for [`toplevel_for_grant_size`].
+/// The caller falls back to the size and activation ladder, and a session that cannot resolve
+/// its window at all is a defined mode rather than a wrong answer (DRAGON-738).
+///
+/// A single candidate has no runner-up, so only the first condition applies. The caller never
+/// asks with one, but the rule has to be total.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn closest_frame(target: u64, candidates: &[u64]) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    let mut runner_up: Option<u32> = None;
+    for (i, c) in candidates.iter().enumerate() {
+        let d = (target ^ *c).count_ones();
+        match best {
+            Some((_, bd)) if d < bd => {
+                runner_up = Some(bd);
+                best = Some((i, d));
+            }
+            Some(_) => {
+                if runner_up.is_none_or(|r| d < r) {
+                    runner_up = Some(d);
+                }
+            }
+            None => best = Some((i, d)),
+        }
+    }
+    let (i, d) = best?;
+    if d > MATCH_MAX_BITS {
+        return None;
+    }
+    match runner_up {
+        Some(r) if r < d + MATCH_MARGIN_BITS => None,
+        _ => Some(i),
+    }
+}
+
+/// How long the granted node gets to deliver ONE frame for the tie-break.
+///
+/// Short on purpose. This runs on the UI thread between the portal dialog closing and the
+/// countdown starting, so the whole of it is time the user spends looking at nothing; the
+/// five second default `pipewire::grab_frame` carries would read as a hang. It still has to
+/// cover a format negotiation and a frame, so it is a WEDGE detector rather than a race.
+/// Expiring costs nothing but the fallback.
+///
+/// The debug line below prints the elapsed time on every run, so the first real tie on a real
+/// desktop says whether this number is right. Move it on that measurement, not on a guess.
+#[cfg(target_os = "linux")]
+const TIE_BREAK_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// The most tied candidates worth grabbing, because each one is a full-resolution screencopy.
+///
+/// Beyond a handful of identically sized windows the margin rule is unlikely to find a clear
+/// winner anyway, so the cost would be paid for a refusal. Two is the case this exists for.
+#[cfg(target_os = "linux")]
+const TIE_BREAK_MAX_CANDIDATES: usize = 6;
+
+/// Settle a SIZE tie by looking at the pictures (DRAGON-737): the index into `ids` of the
+/// toplevel the granted stream is actually showing, or `None`.
+///
+/// The effectful half of the tie-break. The DECISIONS are [`frame_hash`] and
+/// [`closest_frame`], both pure and both proven by the Linux gate; this only collects the two
+/// pictures they compare and reports what happened.
+///
+/// It runs ONCE, at grant time, and only when the size key tied. Never on a unique match,
+/// never per frame, and never during a recording: everything it calls blocks.
+///
+/// # What it costs, and where that is affordable
+///
+/// One bounded PipeWire frame ([`TIE_BREAK_FRAME_BUDGET`]) plus one `screenshot::windows`
+/// connection and one full-resolution screencopy per tied candidate. On the dev box the
+/// enumeration this sits beside was measured at 167ms and each window grab is of the same
+/// order, so a two-way tie should cost a few hundred milliseconds and the worst case is
+/// bounded near one and a half seconds. It is affordable HERE for exactly the reason
+/// `on_pipewire_cast_ready`'s existing `list_toplevels` call is: the user has just dismissed
+/// the portal dialog and what follows is a countdown or a multi-second worker warmup.
+///
+/// # Every failure is a refusal, and refusing is free
+///
+/// No probe fd, too many candidates, no frame inside the budget, or ANY candidate that did
+/// not grab: all answer `None` and the caller keeps the size-and-activation ladder it always
+/// had. A missing grab has to refuse rather than compare the rest, because dropping a
+/// candidate from the field would let the margin rule pass on a runner-up that was never
+/// measured.
+///
+/// # The one thing to watch on a real desktop
+///
+/// This connects a consumer to the granted node and then disconnects it, BEFORE the recording
+/// worker connects its own. That is meant to be a non-event: the node belongs to the portal
+/// SESSION, which stays open (we still hold its first fd), and consumers coming and going is
+/// how every screen-share client reconnects. If a compositor ever tore the node down with its
+/// last consumer, the symptom would be a recording with no video that only ever happens on a
+/// tie, and the "pixel tie-break over N same-size toplevels" line below is what says the
+/// tie-break ran at all.
+#[cfg(target_os = "linux")]
+fn resolve_grant_by_pixels(
+    probe_fd: Option<std::os::fd::OwnedFd>,
+    node_id: u32,
+    ids: &[String],
+    tied: &[usize],
+) -> Option<usize> {
+    let Some(probe_fd) = probe_fd else {
+        log::debug!(
+            "portal window rect: {} toplevels tie on the granted size and this grant carries \
+             no second PipeWire remote, so there is no frame to compare them against",
+            tied.len()
+        );
+        return None;
+    };
+    if tied.len() > TIE_BREAK_MAX_CANDIDATES {
+        log::debug!(
+            "portal window rect: {} toplevels tie on the granted size, past the {} the pixel \
+             tie-break will grab; keeping the size and activation keys",
+            tied.len(),
+            TIE_BREAK_MAX_CANDIDATES
+        );
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let Some(frame) = crate::platform::pipewire::grab_frame_within(
+        probe_fd,
+        node_id,
+        None,
+        TIE_BREAK_FRAME_BUDGET,
+    ) else {
+        log::debug!(
+            "portal window rect: the granted node delivered no frame within {:?}, so the {} \
+             tied toplevels cannot be told apart by pixels",
+            TIE_BREAK_FRAME_BUDGET,
+            tied.len()
+        );
+        return None;
+    };
+    let target = frame_hash(&frame);
+    // Titles never reach the log (`diag`'s privacy rule) and neither does the picture. What
+    // is recorded below is counts, geometry and Hamming distances.
+    let want: Vec<String> = tied.iter().map(|i| ids[*i].clone()).collect();
+    // ONE toplevel can appear in the enumeration more than once: `list_toplevels` emits an
+    // entry per OUTPUT a window has geometry on, all carrying the same identifier. Two tied
+    // entries that are the same window would grab the same pixels twice and refuse on the
+    // margin anyway, so refuse first and skip the screencopies.
+    if want.iter().collect::<std::collections::HashSet<_>>().len() != want.len() {
+        log::debug!(
+            "portal window rect: the {} tied entries are not {} distinct toplevels (a window \
+             with geometry on more than one output is listed once per output), so the pixel \
+             tie-break has nothing to separate",
+            want.len(),
+            want.len()
+        );
+        return None;
+    }
+    let grabs = crate::screenshot::windows(&want);
+    let mut hashes: Vec<u64> = Vec::with_capacity(want.len());
+    for id in &want {
+        let Some(img) = grabs.get(id) else {
+            log::debug!(
+                "portal window rect: {} of {} tied toplevels answered a screencopy, so the \
+                 pixel tie-break has an incomplete field and refuses",
+                grabs.len(),
+                want.len()
+            );
+            return None;
+        };
+        hashes.push(frame_hash(img));
+    }
+    let picked = closest_frame(target, &hashes);
+    let dists: Vec<u32> = hashes.iter().map(|h| (target ^ *h).count_ones()).collect();
+    log::debug!(
+        "portal window rect: pixel tie-break over {} same-size toplevels took {:?}; \
+         distances {:?} of 64 (accept at most {}, margin {}), picked {:?}",
+        want.len(),
+        started.elapsed(),
+        dists,
+        MATCH_MAX_BITS,
+        MATCH_MARGIN_BITS,
+        picked
+    );
+    picked.map(|k| tied[k])
+}
+
 /// The stable source-type key stored beside the restore token. Linux-only like the
 /// request paths that feed it (ashpd is a Linux dependency).
 #[cfg(target_os = "linux")]
@@ -293,6 +697,18 @@ impl App {
     pub(super) fn screenshot_uses_portal(&self) -> bool {
         self.screenshot_backend == crate::platform::backend::PORTAL_ID
             || !self.native_capture_available()
+    }
+
+    /// DRAGON-718: the ScreenCast probe as a THREE-valued answer — `None` until it lands,
+    /// then whether the portal is reachable.
+    ///
+    /// `pipewire_available` alone cannot express "not yet", and its initial `false` reads
+    /// as a decided no. Every other caller genuinely wants "can we use the portal right
+    /// now", which is what that bool means; only the launch seed has to tell the two apart,
+    /// and conflating them is what made a pinned `--monitor` launch ignore the setting.
+    #[cfg(target_os = "linux")]
+    pub(super) fn pipewire_probe(&self) -> Option<bool> {
+        self.pipewire_probed.then_some(self.pipewire_available)
     }
 
     /// The saved recording-method choice, clamped the same way.
@@ -459,9 +875,19 @@ impl App {
 
     /// Launch the portal picker for a monitor/window mode (PipeWire source), so it
     /// replaces the native picker. `None` for region (which keeps its draw + the
-    /// at-commit portal request). Used by the mode/kind toggles (`InSession`) and
-    /// by a pinned `--monitor` / `--window` launch's seed dispatch (`LaunchSeed`);
-    /// the caller says which, and the token-replay policy follows from it.
+    /// at-commit portal request). The caller says which origin it is, and the
+    /// token-replay policy follows from it. Three kinds of caller:
+    ///
+    /// * the mode/kind toggles (`InSession`);
+    /// * the lab/flatpak fallback seed (`LaunchSeed`, in `surfaces.rs`);
+    /// * a pinned `--monitor` / `--window` launch, once the ScreenCast probe has answered
+    ///   (`LaunchSeed`, from `App::resolve_portal_seed_hold`).
+    ///
+    /// That third caller is DRAGON-718 and it is NEW. This doc claimed it for a year
+    /// before it existed: a pinned launch writes `mode` straight into the struct at init
+    /// and never runs `SetMode`, so outside the fallback path nothing dispatched here at
+    /// startup at all, and `record_backend = "portal"` was silently ignored for exactly
+    /// those launches.
     #[cfg(target_os = "linux")]
     pub(super) fn portal_for_mode(
         &mut self,
@@ -961,6 +1387,16 @@ impl App {
     /// unavailable, or — on cancel / a region wrong-monitor pick — return to the
     /// selector (with a toast for the wrong monitor).
     pub(super) fn on_pipewire_cast_ready(&mut self) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-732: the portal request is OVER, whichever way it went, so the launch seed
+        // hands picking back to the ordinary overlay lifecycle. It matters on the cancel
+        // arms below: those set `Mode::Region` and restore the interactive overlays, and a
+        // monitor hotplugged after that must still get one. Leaving the seed on `Portal`
+        // would silently withhold it. Every path from here on behaves exactly as it did
+        // before DRAGON-718.
+        #[cfg(target_os = "linux")]
+        {
+            self.portal_seed = crate::app::capture_flow::PortalSeed::Native;
+        }
         let result = self.pw_slot.lock().ok().and_then(|mut g| g.take());
         let Some(pending) = self.pw_pending.take() else {
             return self.restore_interactive_overlays();
@@ -1063,6 +1499,64 @@ impl App {
                 }
             })
         };
+
+        // DRAGON-735: ask the COMPOSITOR where that window is, since the portal will not say.
+        // Only for a window grant, and only here, because this is the one moment that holds
+        // the granted size. `toplevel_for_grant_size` carries the whole argument for why the
+        // size is a sound key; what this half owes is the enumeration and an honest log line.
+        //
+        // It is an inline blocking call on the UI thread, measured at 167ms on the dev box
+        // (`list_toplevels` runs a settle loop over its own throwaway Wayland connection).
+        // That is affordable HERE and nowhere else on this path: the user has just dismissed
+        // the portal dialog and what follows is a countdown or a multi-second worker warmup,
+        // so the wait is covered. `capture_flow::resolve_immediate_target` already calls the
+        // same function the same way. Do not move it into the per-frame or per-view path.
+        #[cfg(target_os = "linux")]
+        if pending.source_key == "window" {
+            let listed = crate::platform::compositor::list_toplevels();
+            let mut candidates: Vec<(crate::platform::compositor::WinRect, bool)> = Vec::new();
+            let mut ids: Vec<String> = Vec::new();
+            for t in listed.values().flatten() {
+                candidates.push((t.rect, t.active));
+                ids.push(t.id.clone());
+            }
+            // DRAGON-737: when the size key TIES, look at the pictures before falling back to
+            // the activation prior. The pixel evidence is deliberately ahead of activation in
+            // the ladder: a frame of the window is a fact, and "this one had focus a moment
+            // ago" is a guess that the owner's two same-size windows defeat every time. The
+            // probe fd is consumed either way, and dropping it unused only closes a socket.
+            let tied = same_size_candidates(&candidates, stream.size);
+            let by_pixels = if tied.len() > 1 {
+                resolve_grant_by_pixels(session.probe_fd, stream.node_id, &ids, &tied)
+            } else {
+                None
+            };
+            self.portal_window_rect = match by_pixels {
+                Some(i) => Some(candidates[i].0),
+                None => toplevel_for_grant_size(&candidates, stream.size),
+            };
+            // Geometry and counts only: a toplevel's TITLE is the user's content and never
+            // reaches the log (`diag`'s privacy rule).
+            match self.portal_window_rect {
+                Some(r) => log::debug!(
+                    "portal window rect: resolved to {r:?} from the granted size {:?} \
+                     ({} toplevel(s) listed, {} of them that size, {})",
+                    stream.size,
+                    candidates.len(),
+                    tied.len(),
+                    if by_pixels.is_some() { "settled by pixels" } else { "settled by the size and activation keys" }
+                ),
+                None => log::debug!(
+                    "portal window rect: unresolved for the granted size {:?} \
+                     ({} toplevel(s) listed, {} of them that size, and the pixels did not \
+                     separate them); UI that would move clear of the window keeps its \
+                     centred placement, and the ink session falls to its snapshot tier",
+                    stream.size,
+                    candidates.len(),
+                    tied.len()
+                ),
+            }
+        }
 
         // Region: the granted monitor must be the one the region was clamped to;
         // otherwise return to draw with a message. Then crop to the region.
@@ -1212,6 +1706,357 @@ mod grant_origin_tests {
         assert_eq!(output_for_grant_position(&outs, Some((100, 0))), Some(1));
         assert_eq!(output_for_grant_position(&outs, Some((100, 50))), Some(1));
         assert_eq!(output_for_grant_position(&outs, Some((200, 50))), None);
+    }
+}
+
+/// DRAGON-735: recovering a portal window grant's on-screen rectangle from the compositor's
+/// own toplevel list. Its own module because it pins ONE function and one bug, the recording
+/// toolbar parking itself on top of the window it is recording.
+#[cfg(test)]
+mod grant_window_rect_tests {
+    use super::toplevel_for_grant_size;
+    use crate::platform::compositor::WinRect;
+
+    /// The dev box's actual desktop, read out of `debug test selftest` on 2026-08-20: three
+    /// toplevels tiled across the 5120x1440 ultrawide, TWO OF THEM THE SAME SIZE. That is the
+    /// ordinary case, not the awkward one, and it is why uniqueness is a rule rather than an
+    /// afterthought. The middle one is the window the owner recorded, and the portal's stream
+    /// reported exactly its 1694x1384.
+    const DESKTOP: [(WinRect, bool); 3] = [
+        ((12, 44, 1689, 1384), false),
+        ((1713, 44, 1694, 1384), true),
+        ((3419, 44, 1689, 1384), false),
+    ];
+
+    #[test]
+    fn a_uniquely_sized_window_resolves_exactly() {
+        assert_eq!(
+            toplevel_for_grant_size(&DESKTOP, Some((1694, 1384))),
+            Some((1713, 44, 1694, 1384))
+        );
+    }
+
+    /// Two windows of the same size, one of them focused: the activation prior breaks the tie.
+    /// It is a prior and not a proof, so its worst case is anchoring beside a same-sized
+    /// neighbour, which is no worse than the centred placement it replaces.
+    #[test]
+    fn equal_sizes_fall_to_the_one_that_is_activated() {
+        let tied: [(WinRect, bool); 3] = [
+            ((12, 44, 1689, 1384), false),
+            ((1713, 44, 1694, 1384), false),
+            ((3419, 44, 1689, 1384), true),
+        ];
+        assert_eq!(
+            toplevel_for_grant_size(&tied, Some((1689, 1384))),
+            Some((3419, 44, 1689, 1384))
+        );
+    }
+
+    /// Two of a size and NEITHER activated, or BOTH: we genuinely do not know which the user
+    /// picked, and saying so is the answer. The caller keeps its centred placement.
+    #[test]
+    fn an_ambiguous_size_resolves_nothing() {
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, Some((1689, 1384))), None);
+        let both: [(WinRect, bool); 2] =
+            [((0, 0, 800, 600), true), ((900, 0, 800, 600), true)];
+        assert_eq!(toplevel_for_grant_size(&both, Some((800, 600))), None);
+    }
+
+    /// A size nothing on screen carries: the window moved to another workspace, closed, or
+    /// resized between the grant and the enumeration.
+    #[test]
+    fn a_size_matching_no_toplevel_resolves_nothing() {
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, Some((640, 480))), None);
+        assert_eq!(toplevel_for_grant_size(&[], Some((1694, 1384))), None);
+    }
+
+    /// The portal writes `(0, 0)` when it could not find the toplevel's info at all, and a
+    /// MONITOR grant reaches this function never. Neither may anchor anything.
+    #[test]
+    fn an_absent_or_zero_size_resolves_nothing() {
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, None), None);
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, Some((0, 0))), None);
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, Some((1694, 0))), None);
+        assert_eq!(toplevel_for_grant_size(&DESKTOP, Some((-1694, -1384))), None);
+        // A zero-sized toplevel can never be matched either, not even by a zero size.
+        let degenerate: [(WinRect, bool); 1] = [((0, 0, 0, 0), true)];
+        assert_eq!(toplevel_for_grant_size(&degenerate, Some((0, 0))), None);
+    }
+
+    /// The match is on SIZE alone, so where the window sits never influences which one is
+    /// chosen. Pinned because "prefer the one nearest the origin" is the tempting tiebreak and
+    /// it would be a fiction: the portal tells us nothing about position at all.
+    #[test]
+    fn position_never_participates_in_the_match() {
+        let moved: [(WinRect, bool); 2] =
+            [((-4000, -900, 1694, 1384), false), ((12, 44, 1689, 1384), false)];
+        assert_eq!(
+            toplevel_for_grant_size(&moved, Some((1694, 1384))),
+            Some((-4000, -900, 1694, 1384))
+        );
+    }
+}
+
+/// DRAGON-737's two new rungs, pinned separately from the ladder they came out of.
+///
+/// `same_size_candidates` is the one that had to change shape: DRAGON-735 threw the TIE away
+/// and DRAGON-737 needs it as a value, because the tie is exactly the case the pixel evidence
+/// exists to settle. `unique_activated` came out unchanged and is pinned here so a future
+/// reader can see that the ladder's last rung really is the same rule it always was.
+#[cfg(test)]
+mod grant_tie_rung_tests {
+    use super::{same_size_candidates, unique_activated};
+    use crate::platform::compositor::WinRect;
+
+    const DESKTOP: [(WinRect, bool); 3] = [
+        ((12, 44, 1689, 1384), false),
+        ((1713, 44, 1694, 1384), true),
+        ((3419, 44, 1689, 1384), false),
+    ];
+
+    /// The owner's actual desktop: two toplevels of one size, which is the whole ticket.
+    #[test]
+    fn the_tie_is_reported_as_a_list_in_enumeration_order() {
+        assert_eq!(same_size_candidates(&DESKTOP, Some((1689, 1384))), vec![0, 2]);
+        assert_eq!(same_size_candidates(&DESKTOP, Some((1694, 1384))), vec![1]);
+    }
+
+    /// The same refusals `toplevel_for_grant_size` has always made, now stated one rung down:
+    /// no size, a zero or negative extent, or a size nothing on screen carries.
+    #[test]
+    fn an_absent_zero_or_unmatched_size_ties_nothing() {
+        assert!(same_size_candidates(&DESKTOP, None).is_empty());
+        assert!(same_size_candidates(&DESKTOP, Some((0, 0))).is_empty());
+        assert!(same_size_candidates(&DESKTOP, Some((1694, 0))).is_empty());
+        assert!(same_size_candidates(&DESKTOP, Some((-1694, -1384))).is_empty());
+        assert!(same_size_candidates(&DESKTOP, Some((640, 480))).is_empty());
+        assert!(same_size_candidates(&[], Some((1694, 1384))).is_empty());
+    }
+
+    /// The activation prior is a PRIOR: exactly one activated candidate resolves, none or
+    /// several resolve nothing. Two activated windows say no more than zero do.
+    #[test]
+    fn activation_resolves_only_when_exactly_one_is_activated() {
+        assert_eq!(unique_activated(&DESKTOP, &[0, 1, 2]), Some(1));
+        assert_eq!(unique_activated(&DESKTOP, &[0, 2]), None);
+        let both: [(WinRect, bool); 2] = [((0, 0, 800, 600), true), ((900, 0, 800, 600), true)];
+        assert_eq!(unique_activated(&both, &[0, 1]), None);
+        assert_eq!(unique_activated(&both, &[]), None);
+    }
+}
+
+/// DRAGON-737's frame fingerprint. The properties pinned here are the ones the two capture
+/// routes actually differ by, so each test names a way the portal's buffer and our own
+/// screencopy of the same window can disagree without being different windows.
+#[cfg(test)]
+mod frame_hash_tests {
+    use super::frame_hash;
+
+    /// A blocky greyscale pattern defined in RELATIVE coordinates, so the same `seed` gives
+    /// the same picture at any size. Blocky rather than noisy on purpose: per-pixel noise
+    /// averages to flat under the downscale and would prove nothing.
+    fn synth(w: u32, h: u32, seed: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(w, h, |x, y| {
+            let bx = (x * 12) / w.max(1);
+            let by = (y * 8) / h.max(1);
+            let v = ((bx * 37 + by * 91 + seed * 53) % 251) as u8;
+            image::Rgba([v, v, v, 255])
+        })
+    }
+
+    fn dist(a: u64, b: u64) -> u32 {
+        (a ^ b).count_ones()
+    }
+
+    /// A flat frame has no cell brighter than its neighbour, so no bit is set. Two flat
+    /// windows are genuinely indistinguishable, which is the honest answer.
+    #[test]
+    fn a_uniform_frame_sets_no_bits() {
+        let flat = image::RgbaImage::from_pixel(64, 48, image::Rgba([90, 90, 90, 255]));
+        assert_eq!(frame_hash(&flat), 0);
+    }
+
+    /// The two ends of the axis this hash measures: brightness falling to the right sets
+    /// every bit, rising to the right sets none.
+    #[test]
+    fn a_horizontal_ramp_sets_every_bit_or_none() {
+        let w = 90u32;
+        let rising = image::RgbaImage::from_fn(w, 32, |x, _| {
+            let v = ((x * 250) / w) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        let falling = image::RgbaImage::from_fn(w, 32, |x, _| {
+            let v = (250 - (x * 250) / w) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        assert_eq!(frame_hash(&rising), 0);
+        assert_eq!(frame_hash(&falling), u64::MAX);
+    }
+
+    /// SCALE invariance. The portal negotiates its own buffer size and `screenshot::windows`
+    /// runs a full-resolution screencopy, so the same window routinely arrives at two sizes.
+    /// Comparing a downscale is what makes that a non-event.
+    #[test]
+    fn the_same_picture_at_two_sizes_hashes_the_same() {
+        assert_eq!(frame_hash(&synth(300, 200, 3)), frame_hash(&synth(1500, 1000, 3)));
+    }
+
+    /// BRIGHTNESS invariance. A difference hash compares neighbours, so a constant offset
+    /// across the whole frame, which is what a gamma or alpha-handling difference between two
+    /// routes looks like, moves both cells and changes no bit.
+    #[test]
+    fn a_whole_frame_brightness_shift_changes_nothing() {
+        let base = synth(300, 200, 5);
+        let lifted = image::RgbaImage::from_fn(300, 200, |x, y| {
+            let p = base.get_pixel(x, y).0;
+            image::Rgba([
+                p[0].saturating_add(20),
+                p[1].saturating_add(20),
+                p[2].saturating_add(20),
+                255,
+            ])
+        });
+        assert_eq!(frame_hash(&base), frame_hash(&lifted));
+    }
+
+    /// And the property that makes the whole thing worth doing: two different windows are far
+    /// apart, well past the acceptance threshold, so the tie-break can tell them apart.
+    #[test]
+    fn two_different_pictures_are_far_apart() {
+        let a = frame_hash(&synth(300, 200, 1));
+        let b = frame_hash(&synth(300, 200, 2));
+        assert!(
+            dist(a, b) > super::MATCH_MAX_BITS,
+            "two different windows hashed {} bits apart, inside the {} acceptance window",
+            dist(a, b),
+            super::MATCH_MAX_BITS
+        );
+    }
+
+    /// Degenerate input answers rather than panicking or dividing by zero: a frame smaller
+    /// than the grid still hashes, and a zero-extent one is 0.
+    #[test]
+    fn degenerate_sizes_answer_instead_of_panicking() {
+        assert_eq!(frame_hash(&image::RgbaImage::new(0, 0)), 0);
+        assert_eq!(frame_hash(&image::RgbaImage::new(0, 10)), 0);
+        assert_eq!(frame_hash(&image::RgbaImage::new(10, 0)), 0);
+        // 3x2 is narrower and shorter than the 9x8 grid: every cell collapses onto the same
+        // few pixels, which must still produce a hash.
+        let _ = frame_hash(&synth(3, 2, 7));
+    }
+}
+
+/// DRAGON-737's match rule. The two thresholds are what stop the pixel evidence from being a
+/// louder guess than the activation prior it overtakes, so both refusals are pinned.
+#[cfg(test)]
+mod closest_frame_tests {
+    use super::{MATCH_MARGIN_BITS, MATCH_MAX_BITS, closest_frame};
+
+    /// A hash `bits` away from zero, for building a field by distance.
+    fn at(bits: u32) -> u64 {
+        if bits == 0 { 0 } else { u64::MAX >> (64 - bits) }
+    }
+
+    #[test]
+    fn a_clear_winner_is_named() {
+        assert_eq!(closest_frame(0, &[at(30), at(4), at(28)]), Some(1));
+    }
+
+    /// The margin refusal: two windows showing much the same thing. This is the case that
+    /// feeds DRAGON-738, where the session falls to the snapshot tier rather than guessing.
+    #[test]
+    fn two_similar_candidates_name_neither() {
+        let near = MATCH_MARGIN_BITS - 1;
+        assert_eq!(closest_frame(0, &[at(2), at(2 + near)]), None);
+        assert_eq!(closest_frame(0, &[at(5), at(5)]), None);
+    }
+
+    /// The distance refusal: the frame looks like NONE of them, so it names none of them. A
+    /// window that repainted between the two grabs, or a route that letterboxed, lands here.
+    #[test]
+    fn a_frame_matching_nothing_names_nothing() {
+        assert_eq!(closest_frame(0, &[at(MATCH_MAX_BITS + 1), at(60)]), None);
+    }
+
+    /// Totality. The caller only ever asks with a real tie, but the rule answers anyway.
+    #[test]
+    fn an_empty_or_single_field_answers_honestly() {
+        assert_eq!(closest_frame(0, &[]), None);
+        assert_eq!(closest_frame(0, &[at(3)]), Some(0));
+        assert_eq!(closest_frame(0, &[at(MATCH_MAX_BITS + 1)]), None);
+    }
+
+    /// The winner is the CLOSEST, whatever order the field arrives in: the enumeration order
+    /// of `list_toplevels` is not a preference.
+    #[test]
+    fn enumeration_order_never_decides() {
+        assert_eq!(closest_frame(0, &[at(3), at(40)]), Some(0));
+        assert_eq!(closest_frame(0, &[at(40), at(3)]), Some(1));
+    }
+}
+
+/// The mechanism end to end, over the pure half: two windows of the SAME SIZE, a granted
+/// frame that is one of them seen through the other capture route, and the right answer.
+///
+/// This is the test that would have caught DRAGON-737 in the first place. The frame is
+/// deliberately not a copy: it is rescaled and brightness-shifted, which is what the portal's
+/// buffer and our own screencopy of one window really differ by.
+#[cfg(test)]
+mod grant_tie_pixel_tests {
+    use super::{closest_frame, frame_hash, same_size_candidates};
+    use crate::platform::compositor::WinRect;
+
+    fn synth(w: u32, h: u32, seed: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(w, h, |x, y| {
+            let bx = (x * 12) / w.max(1);
+            let by = (y * 8) / h.max(1);
+            let v = ((bx * 37 + by * 91 + seed * 53) % 251) as u8;
+            image::Rgba([v, v, v, 255])
+        })
+    }
+
+    #[test]
+    fn the_pixels_pick_the_window_the_size_key_could_not() {
+        // The owner's desktop: two 1689x1384 toplevels, neither activated.
+        let desktop: [(WinRect, bool); 3] = [
+            ((12, 44, 1689, 1384), false),
+            ((1713, 44, 1694, 1384), false),
+            ((3419, 44, 1689, 1384), false),
+        ];
+        let tied = same_size_candidates(&desktop, Some((1689, 1384)));
+        assert_eq!(tied, vec![0, 2]);
+
+        // Our own screencopy of each tied candidate, full resolution.
+        let grabs = [synth(1689, 1384, 1), synth(1689, 1384, 2)];
+        let hashes: Vec<u64> = grabs.iter().map(frame_hash).collect();
+
+        // The portal's own buffer of the SECOND one: a different size, and lifted 25 levels.
+        // Built ONCE outside the closure: `from_fn` calls it per pixel, and rebuilding a
+        // 584k-pixel image inside it turns a test into a hang (this cost a run).
+        let base = synth(844, 692, 2);
+        let granted = image::RgbaImage::from_fn(844, 692, |x, y| {
+            let p = base.get_pixel(x, y).0;
+            image::Rgba([
+                p[0].saturating_add(25),
+                p[1].saturating_add(25),
+                p[2].saturating_add(25),
+                255,
+            ])
+        });
+
+        let picked = closest_frame(frame_hash(&granted), &hashes).expect("a clear winner");
+        assert_eq!(tied[picked], 2, "the pixels must name the toplevel at x=3419");
+    }
+
+    /// Two windows showing the same thing: the pixels refuse too, and the session is left
+    /// with no window origin at all. DRAGON-738 is what turns that into a defined mode
+    /// instead of ink that silently never arrives.
+    #[test]
+    fn two_identical_windows_still_resolve_nothing() {
+        let grabs = [synth(1689, 1384, 4), synth(1689, 1384, 4)];
+        let hashes: Vec<u64> = grabs.iter().map(frame_hash).collect();
+        let granted = synth(844, 692, 4);
+        assert_eq!(closest_frame(frame_hash(&granted), &hashes), None);
     }
 }
 

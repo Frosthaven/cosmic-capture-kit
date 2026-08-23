@@ -83,6 +83,12 @@ impl App {
                     // kind, so pin the mode here.
                     self.mode = Mode::Region;
                 }
+                // DRAGON-695: the scanner is reachable from another process while it is the
+                // live kind, and only then. Bound here rather than at launch because the kind
+                // can be switched into and out of freely, and a marker that outlived the
+                // scanner would send `scan --action refresh` to a session with nothing to
+                // refresh.
+                self.sync_scan_control(k == Kind::Scanner);
                 // Meters are only armed in video mode; (de)activate accordingly.
                 self.sync_meters();
                 // Switching kind while in monitor/window mode re-arms the portal for
@@ -253,6 +259,24 @@ impl App {
                 self.busy_spin = (self.busy_spin + STEP) % std::f32::consts::TAU;
                 Task::none()
             }
+            // DRAGON-695: a `scan --action refresh` from another process. It runs exactly what
+            // the scan button runs, so the CLI cannot refresh in a way the button does not,
+            // and `begin_scan_shot`'s own `!= Idle` guard makes a burst of keypresses harmless.
+            CaptureMsg::ScanControlPoll => {
+                #[cfg(target_os = "linux")]
+                {
+                    let asked = self
+                        .scan_control
+                        .as_ref()
+                        .map(|inlet| !inlet.drain().is_empty())
+                        .unwrap_or(false);
+                    if asked {
+                        log::info!("scanner control: rescanning at a command's request");
+                        self.begin_scan_shot();
+                    }
+                }
+                Task::none()
+            }
             // DRAGON-460: the frame without the marks is on screen, so take the region shot.
             CaptureMsg::ScanShotTick => {
                 self.run_scan_shot();
@@ -371,7 +395,7 @@ impl App {
                 // preview spinner NOW (after the grab, so its focus steal can't clobber the
                 // DRAGON-194 focus the grab depended on) to cover the remaining compose/
                 // save/decode; `None` means it was already pre-opened as the defocus sink.
-                // DRAGON-428: no editor is coming on a `--no-editor` launch, so raise no
+                // DRAGON-428: no editor is coming on a `--skip-editor` launch, so raise no
                 // spinner to cover its arrival — the capture goes straight to
                 // save + clipboard + notify from `present_capture`.
                 match dims {
@@ -412,7 +436,10 @@ impl App {
             }
             CaptureMsg::PickDelay(i) => {
                 self.delay_idx = i.min(DELAYS.len() - 1);
-                // Choosing a preset from the UI takes over from any CLI `--countdown`.
+                // DRAGON-695: the chip writes the SECONDS it stands for, because seconds are
+                // what persists now. The index is only which chip is lit.
+                self.countdown_secs.set_value(DELAYS[self.delay_idx].1);
+                // Choosing a preset from the UI takes over from any CLI `--timer`.
                 self.countdown_override = None;
                 self.delay_menu_open = false;
                 self.save_state();
@@ -445,6 +472,14 @@ impl App {
                     // overlay delay chip, a tray radio row) ever changes it.
                     match self.pending.take() {
                         Some(sel) => self.begin(sel),
+                        // DRAGON-698: a DEFERRED immediate capture parked its intent, not a
+                        // `Selection` — resolving the target is exactly what this fire is
+                        // for. Checked before the picker arm only because it is the more
+                        // specific state; the two cannot coexist (immediate targets are
+                        // capture launches, the picker is its own launch shape).
+                        None if self.pending_immediate.is_some() => {
+                            self.fire_deferred_immediate()
+                        }
                         // DRAGON-663: a COLOUR PICKER countdown carries no `Selection` (a
                         // pick has no rectangle), so an empty `pending` here is what tells
                         // the two countdowns apart rather than a flag that could disagree
@@ -470,6 +505,9 @@ impl App {
                     self.countdown_tray = None;
                     self.countdown = None;
                     self.pending = None;
+                    // DRAGON-698: a deferred immediate capture's parked intent goes with
+                    // the countdown it was waiting on.
+                    self.pending_immediate = None;
                     crate::diag::note_failure(
                         crate::diag::Failure::Cancelled,
                         "the user cancelled the pre-capture countdown from the tray",
@@ -503,6 +541,17 @@ impl App {
                     );
                     return self.teardown();
                 }
+                // DRAGON-698: a deferred immediate capture has nothing to step back to
+                // either — the launch minted no picker overlay, so "return to region
+                // select" would restore a selector this session never had. Cancel means
+                // END, the same answer the colour picker's countdown gives.
+                if self.pending_immediate.take().is_some() {
+                    crate::diag::note_failure(
+                        crate::diag::Failure::Cancelled,
+                        "the user cancelled a deferred immediate capture's countdown",
+                    );
+                    return self.teardown();
+                }
                 self.pending = None;
                 self.capture_live = false;
                 // Drop any granted-but-unused portal stream (closes the fd).
@@ -528,7 +577,13 @@ impl App {
                 // The chip moved; while active the overlay is click-through except
                 // the toolbar's region, so rebuild that region at the new spot.
                 if self.countdown.is_some() || self.recording.is_some() {
-                    self.recreate_active_overlays()
+                    // DRAGON-691: the ink surface cuts the SAME hole for the toolbar, so a
+                    // drag moves that too. Only its own surface is re-issued (Linux) or
+                    // nothing at all (macOS and Windows, where the hover poll reads the live
+                    // rect on its next tick), so this adds no extra flicker to the drag the
+                    // recreate above already costs.
+                    let ink = self.sync_ink_surface();
+                    Task::batch([self.recreate_active_overlays(), ink])
                 } else {
                     Task::none()
                 }
@@ -561,6 +616,17 @@ impl App {
             CaptureMsg::PipewireProbed(ok, types) => {
                 self.pipewire_available = ok;
                 self.pipewire_source_types = types;
+                // DRAGON-718: the pinned launch that has been holding its pickers now has
+                // its answer. This is the whole fix: before it, nothing re-dispatched when
+                // the probe landed, so a launch that read the initial `false` stayed on
+                // native capture for the rest of the session.
+                #[cfg(target_os = "linux")]
+                {
+                    self.pipewire_probed = true;
+                    if let Some(task) = self.resolve_portal_seed_hold() {
+                        return task;
+                    }
+                }
                 // Portal reachability feeds the health check → refresh the nav icon,
                 // and changes which backends the method dropdowns list.
                 self.update_health_nav_icon();
@@ -628,6 +694,11 @@ impl App {
                 if self.mode != Mode::Region || self.normalized_region().is_none() {
                     return Task::none();
                 }
+                // DRAGON-756: and never underneath a colour pick, which mints the same
+                // overlays and carries the same remembered region without ever showing it.
+                if self.color_picking() {
+                    return Task::none();
+                }
                 // Route through the SAME capture plumbing as a normal region commit — nothing
                 // about the grab, the compose or the save changes. The one-shot flag below is
                 // read at the very top of `present_capture`, where it overrides the
@@ -656,6 +727,16 @@ impl App {
                 self.run_capture(sel)
             }
             CaptureMsg::DoPixelCapture => self.do_pixel_capture(),
+            // DRAGON-718: the hold's outer bound. Fires whether or not the probe answered;
+            // `resolve_portal_seed_hold` is a no-op once the pick is already decided, so a
+            // probe that landed first costs this nothing.
+            #[cfg(target_os = "linux")]
+            CaptureMsg::PortalSeedDeadline => {
+                if let Some(task) = self.resolve_portal_seed_hold() {
+                    return task;
+                }
+                Task::none()
+            }
             CaptureMsg::RunImmediate => {
                 // Linux: the deferred overlay-less immediate capture, now that
                 // the full output list has settled into `self.outputs`. Resolve + drive it;
@@ -732,6 +813,41 @@ impl App {
     ///
     /// A shot already in flight wins — re-pressing during the clear must not start a second
     /// one racing the first into the same slot.
+    /// DRAGON-695: bind or drop the scanner's control inlet and its discovery marker, so
+    /// `scan --action refresh` reaches exactly the sessions that can act on it.
+    ///
+    /// The marker is set AFTER a successful bind and cleared BEFORE the drop, so a marker a
+    /// sender discovers always implies a socket that already exists (the `start_control_inlet`
+    /// rule, stated there). A bind failure is not an error the user needs: the scanner is
+    /// unaffected, only the CLI command cannot reach it, so it logs and carries on.
+    ///
+    /// Idempotent: called on every kind switch, and does nothing when the state already
+    /// matches.
+    pub(in crate::app) fn sync_scan_control(&mut self, wanted: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            if wanted == self.scan_control.is_some() {
+                return;
+            }
+            if wanted {
+                match crate::daemon_ipc::start_scanner_inlet() {
+                    Ok(inlet) => {
+                        self.scan_control = Some(inlet);
+                        crate::instance::set_scanner_marker(true);
+                    }
+                    Err(e) => log::warn!("scanner control commands unavailable ({e})"),
+                }
+            } else {
+                crate::instance::set_scanner_marker(false);
+                // Dropping the inlet unlinks its socket, so a command sent after the scanner
+                // closed reports "no scanner is open" instead of vanishing.
+                self.scan_control = None;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = wanted;
+    }
+
     pub(in crate::app) fn begin_scan_shot(&mut self) {
         if self.scan_shot != ScanShot::Idle {
             return;
@@ -750,6 +866,78 @@ impl App {
         self.text_menu = None;
         self.code_menu = None;
         self.rebuild_marks();
+    }
+
+    /// DRAGON-718: settle the pinned-launch portal hold, if one is armed.
+    ///
+    /// Called from exactly two places, the probe result and the hold's own deadline, and it
+    /// is idempotent: once the pick is decided this returns `None` and the later of the two
+    /// callers does nothing. That is why the deadline can be armed unconditionally.
+    ///
+    /// `None` means "nothing to do here"; `Some(task)` is either the portal picker or the
+    /// native pickers this launch was holding.
+    ///
+    /// DRAGON-732: the outcome is WRITTEN BACK as a `PortalSeed`, through the pure
+    /// `seed_after_pick`, and is never a cleared `Option`. `Portal` has to keep answering
+    /// "not ours to mint" for `on_output` after the probe lands, because that is precisely
+    /// when the outputs qualify.
+    #[cfg(target_os = "linux")]
+    pub(in crate::app) fn resolve_portal_seed_hold(
+        &mut self,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        let armed = self.portal_seed.holding_since()?;
+        let pick = crate::app::capture_flow::launch_portal_pick(
+            crate::app::capture_flow::portal_pickable_mode(self.mode),
+            match self.kind {
+                crate::app::Kind::Video => self.recording_uses_portal(),
+                _ => self.screenshot_uses_portal(),
+            },
+            self.pipewire_probe(),
+            armed.elapsed().as_millis() as u64,
+        );
+        self.portal_seed = crate::app::capture_flow::seed_after_pick(pick, armed);
+        use crate::app::capture_flow::LaunchPick;
+        match pick {
+            // Still inside the budget with no answer: keep holding. The deadline message
+            // is already in flight, so nothing needs re-arming here.
+            LaunchPick::WaitForProbe => None,
+            LaunchPick::Portal => {
+                log::info!(
+                    "launch: picking the capture target through the portal (the saved \
+                     method is the portal and the ScreenCast probe answered); no native \
+                     picker is minted"
+                );
+                // `lab/flatpak`: `on_output`'s fallback branch runs BEFORE this state is
+                // consulted and kicks its OWN seed request. Whichever of the two fires
+                // first, the other must not raise a SECOND portal dialog, so both spend
+                // the same latch (DRAGON-732). On the ordinary layer-shell path the flag
+                // is always false here, so this reads exactly as it did.
+                if std::mem::replace(&mut self.fallback_seed_kicked, true) {
+                    return None;
+                }
+                // The same dispatch the toolbar's mode toggle makes, with the LaunchSeed
+                // origin: a launch pick IS the target choice, so the token is never
+                // replayed (`replay_allowed`).
+                self.portal_for_mode(self.mode, crate::app::portal::RequestOrigin::LaunchSeed)
+            }
+            LaunchPick::Native => {
+                // Only worth a line when the portal was WANTED and could not be had; the
+                // ordinary native launch says nothing, as before.
+                if self.pipewire_probe() == Some(false) {
+                    log::warn!(
+                        "launch: the saved capture method is the portal, but the ScreenCast \
+                         portal is not reachable in this session; picking natively"
+                    );
+                } else if self.pipewire_probe().is_none() {
+                    log::warn!(
+                        "launch: the ScreenCast portal probe did not answer within {}ms; \
+                         picking natively",
+                        crate::app::capture_flow::PORTAL_SEED_PROBE_BUDGET_MS
+                    );
+                }
+                Some(self.mint_startup_pickers())
+            }
+        }
     }
 
     /// DRAGON-600: one poll of the tray-dropdown hold on the frozen-flats grab.

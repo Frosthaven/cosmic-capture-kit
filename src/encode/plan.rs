@@ -1,6 +1,23 @@
 //! Encode plans: the per-backend ffmpeg argument recipe ([`EncodePlan`]) plus the
 //! builders that probe the machine (NVENC / VAAPI / software) and choose one. The
 //! command module turns a plan into the actual ffmpeg invocation.
+//!
+//! The ranked ladder is per platform ([`AUTO_LADDER`]). On Windows it reads
+//! `nvenc > amf > qsv > mf > software` since DRAGON-701. `mf` is the Media Foundation
+//! arm (`mf_plan_with`): it sits BELOW the three vendor tiers because on an x86 box it
+//! reaches the very same silicon through one more layer with less control, and ABOVE
+//! software because on an ARM64 Windows build there is no NVENC, no AMF and no QSV, so
+//! it is the only hardware encoder that exists there.
+//!
+//! **That arm is LIVE since the 9.0-cck2 pin.** It shipped dormant on purpose while no
+//! bundled ffmpeg carried `h264_mf`, so `mf_plan`'s build-list check answered no and the
+//! probe never fired. `scripts/ffmpeg-win/build.sh` has since been re-run with
+//! `--enable-mediafoundation` and both Windows archives in `scripts/pins.env` carry the
+//! encoders, so the arm now answers. Two tickets were needed to make it usable: DRAGON-708
+//! fixed a probe that asked a harder question than the recording asks (YUV420P against a
+//! hardware-forced MFT) and reported the tier missing on every machine, and DRAGON-710
+//! fixed the wedge that probe fix exposed, which turned out to be `-shortest` in the shared
+//! muxer command rather than anything about Media Foundation at all.
 
 use std::process::Stdio;
 
@@ -71,6 +88,12 @@ impl EncodePlan {
             "amf"
         } else if has("_qsv") {
             "qsv"
+        } else if has("_mf") {
+            // AFTER `_amf` (DRAGON-701), which is the ladder's own order and also the
+            // only thing keeping the two apart by name: `h264_amf` does not contain the
+            // substring `_mf`, but the reader who reorders these arms should not have to
+            // notice that to stay correct.
+            "mf"
         } else {
             "software"
         }
@@ -86,6 +109,8 @@ impl EncodePlan {
             "amf" => amf_plan(w, h, &presets.codec),
             #[cfg(windows)]
             "qsv" => qsv_plan(w, h, &presets.codec),
+            #[cfg(windows)]
+            "mf" => mf_plan(w, h, &presets.codec),
             #[cfg(target_os = "macos")]
             "videotoolbox" | "vt" => videotoolbox_plan(w, h, &presets.codec),
             "software" | "sw" | "x264" => Some(software_plan(&presets.x264)),
@@ -127,14 +152,18 @@ impl EncodePlan {
                 "amf" => amf_plan(w, h, &presets.codec),
                 #[cfg(windows)]
                 "qsv" => qsv_plan(w, h, &presets.codec),
+                #[cfg(windows)]
+                "mf" => mf_plan(w, h, &presets.codec),
                 #[cfg(target_os = "macos")]
                 "videotoolbox" => videotoolbox_plan(w, h, &presets.codec),
                 "software" => Some(software_plan(&presets.x264)),
                 _ => None,
             }
         };
-        let order: Vec<&str> = if AUTO_LADDER.contains(&requested) {
-            // A concrete pick: try it first, then the ranked ladder.
+        let order: Vec<&str> = if is_concrete_encoder_id(requested) {
+            // A concrete pick: try it first, then the ranked ladder. Asked-for-by-name is
+            // deliberately a WIDER test than the ladder since DRAGON-708: a quarantined id
+            // (`AUTO_EXCLUDED`) is still honoured here, it just never wins on its own.
             std::iter::once(requested).chain(AUTO_LADDER.iter().copied()).collect()
         } else {
             // "auto" / unknown: the hint-first ladder.
@@ -214,6 +243,7 @@ impl EncodePlan {
                 "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec).is_some(),
                 "amf" => amf_plan(w, h, &presets.codec).is_some(),
                 "qsv" => qsv_plan(w, h, &presets.codec).is_some(),
+                "mf" => mf_plan(w, h, &presets.codec).is_some(),
                 _ => false,
             };
             windows_resolve_encoder_id(requested, hint, &usable)
@@ -616,21 +646,56 @@ pub(crate) fn vaapi_device() -> Option<(String, String)> {
 /// fixes.
 #[cfg(windows)]
 pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
+    hw_encoder_probe_ok_with(encoder, &[])
+}
+
+/// [`hw_encoder_probe_ok`] with EXTRA encoder options on the probe's command line, placed
+/// straight after `-c:v <encoder>` exactly where a plan would put them. With an empty
+/// `extra` the argv, the cache key and the log line are byte-identical to what the probe
+/// has always sent, so every existing caller is unchanged.
+///
+/// It exists for Media Foundation (DRAGON-701). A bare `-c:v h264_mf` probe passes on EVERY
+/// Windows machine, because Media Foundation falls back to Microsoft's own software H.264
+/// MFT when no hardware encoder answers. The tier would then list itself, win its ladder
+/// slot, and encode on the CPU through an extra abstraction layer, slower than the libx264
+/// the ladder already falls back to. Probing with [`MF_HW_ENCODING`] asks the real question:
+/// with hardware forced, a machine without a hardware MFT fails to open the encoder, the
+/// probe says no, and the ladder degrades honestly. The result is cached under the FULL
+/// option string, so the forced-hardware answer can never be served from a cache entry a
+/// bare probe filled in.
+///
+/// **`extra` has to describe the whole feed, not just the encoder options** (DRAGON-708).
+/// The probe's clip comes from lavfi `color=`, which is YUV420P, and a caller that changes
+/// what the encoder will ACCEPT has to say so here or the probe fails for a reason that has
+/// nothing to do with the hardware. Media Foundation is exactly that case and got it wrong:
+/// `-hw_encoding true` alone made every machine fail with `format negotiation failed (1/0)`,
+/// because a hardware MFT takes NV12 and the probe was handing it YUV420P, while the real
+/// recording had been feeding NV12 all along. See [`MF_PROBE_PIX_FMT`]. A future tier whose
+/// plan constrains the input the same way owes its probe the same argument.
+#[cfg(windows)]
+pub(crate) fn hw_encoder_probe_ok_with(encoder: &str, extra: &[&str]) -> bool {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(&v) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(encoder) {
+    let key = if extra.is_empty() {
+        encoder.to_string()
+    } else {
+        format!("{encoder} {}", extra.join(" "))
+    };
+    if let Some(&v) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
         return v;
     }
+    let mut cmd = crate::util::ffmpeg_command();
+    cmd.args([
+        "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=1",
+        "-c:v", encoder,
+    ]);
+    cmd.args(extra);
+    cmd.args(["-frames:v", "2", "-f", "null", "-"]);
     // `.output()` rather than `.status()`, so stderr is captured instead of discarded.
     // `-loglevel error` is already set, so what comes back IS the reason and nothing else.
-    let ok = match crate::util::ffmpeg_command()
-        .args([
-            "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=1",
-            "-c:v", encoder,
-            "-frames:v", "2", "-f", "null", "-",
-        ])
+    let ok = match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -639,21 +704,18 @@ pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             log::warn!(
-                "hardware encoder probe failed for {encoder} (ffmpeg exit {}): {}",
+                "hardware encoder probe failed for {key} (ffmpeg exit {}): {}",
                 out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
                 probe_failure_reason(&String::from_utf8_lossy(&out.stderr)),
             );
             false
         }
         Err(e) => {
-            log::warn!("hardware encoder probe for {encoder} could not run ffmpeg at all: {e}");
+            log::warn!("hardware encoder probe for {key} could not run ffmpeg at all: {e}");
             false
         }
     };
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(encoder.to_string(), ok);
+    cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, ok);
     ok
 }
 
@@ -750,6 +812,193 @@ fn qsv_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
     })
 }
 
+/// Force Media Foundation to a HARDWARE encoder MFT. Carried by the `mf` plans, by
+/// every probe that decides whether the tier exists, AND by the ink finalize's `mf` arm
+/// (`record::finalize::ink_hw_video_args`), which is the point: Media Foundation silently
+/// falls back to Microsoft's software H.264 MFT, present on every Windows install, so without
+/// this the tier is never absent and never honest. See [`hw_encoder_probe_ok_with`].
+///
+/// It is compiled on EVERY host, unlike its probe-side siblings below (DRAGON-755). The
+/// finalize table that now reads it is portable and unit-tested on every host on purpose, so
+/// a Windows-only const would have made the one arm nobody can test locally the one arm the
+/// Linux gate cannot see. That is precisely how this argument came to be missing there.
+pub(crate) const MF_HW_ENCODING: [&str; 2] = ["-hw_encoding", "true"];
+
+/// What the Media Foundation probe adds ON TOP of [`MF_HW_ENCODING`]: the pixel format the
+/// real recording feeds. Probe-only, never part of a plan (DRAGON-708).
+///
+/// **A probe must ask the question the recording asks, and this one was asking a harder
+/// one.** [`hw_encoder_probe_ok_with`] builds its clip from lavfi `color=`, which is
+/// YUV420P. Microsoft's SOFTWARE H.264 MFT accepts that, so a bare `-c:v h264_mf` probe
+/// passes; a HARDWARE MFT does not, so adding `-hw_encoding true` alone made the probe fail
+/// with `format negotiation failed (1/0)` on every machine, including ones whose hardware
+/// encoder works perfectly. The tier could therefore never be selected anywhere.
+///
+/// The recording never sends YUV420P. [`mf_plan_with`] sets `nv12: true`, which
+/// `command::media_clock_args` turns into `-pix_fmt nv12` (pinned by
+/// `media_clock_command_emits_the_h264_mf_invocation`). Feeding the probe the same NV12 is
+/// what makes its answer mean anything: with it, a machine WITH a hardware MFT passes and a
+/// machine without one still fails, which is the honest split the forced-hardware flag was
+/// added for.
+///
+/// It is deliberately NOT folded into [`MF_HW_ENCODING`]. That constant is spread into the
+/// plan's own codec arguments, where a second `-pix_fmt` would collide with the one
+/// `media_clock_args` already emits from `nv12: true`. Probe-side and plan-side needs are
+/// different, so they are different constants.
+///
+/// Measured on the DRAGON-708 box (x86_64, NVIDIA, ffmpeg 9.0-cck2): `-hw_encoding true`
+/// alone fails, `-hw_encoding true -pix_fmt nv12` exits 0.
+//
+// ── Why the probe cache is per PROCESS and stays that way (DRAGON-754) ──────────────────
+//
+// The app is one-shot, so every launch re-derives every verdict it reads, and a probe-encode
+// costs a real ffmpeg spawn. The obvious fix is a verdict cached on disk, and it was
+// considered and declined: it would have to be invalidated by every event that can add or
+// remove a hardware encoder. A driver install, a driver rollback, a GPU added or removed, an
+// eGPU plugged in, a Windows feature update, an ffmpeg sidecar swapped under us, and a game
+// or capture overlay holding every NVENC session for the duration. Only the sidecar's
+// identity and the adapter set can be keyed honestly; the rest cannot, so a persisted cache
+// would be right most of the time and silently wrong exactly when a user's hardware situation
+// has just changed, which is the one moment they are looking at this answer.
+//
+// DRAGON-754 removed the COST rather than the question: nothing on the UI thread walks the
+// tiers any more (`App::recording_metadata`), a session probes only the tier it asked for
+// (`windows_resolve_encoder_id` short-circuits on a concrete request), and the enumeration
+// that genuinely has to walk them skips the ones whose vendor silicon is not in the machine
+// (`encode::device::vendor_silicon_present`). Do not reach for the disk cache without a key
+// that survives the list above.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const MF_PROBE_PIX_FMT: [&str; 2] = ["-pix_fmt", "nv12"];
+
+/// The full argument list the Media Foundation probe sends: forced hardware AND the NV12
+/// feed. One place builds it, so the probe and its tests cannot drift (DRAGON-708).
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn mf_probe_args() -> Vec<&'static str> {
+    MF_HW_ENCODING.iter().copied().chain(MF_PROBE_PIX_FMT.iter().copied()).collect()
+}
+
+/// Windows Media Foundation hardware encoder (`h264_mf` / `hevc_mf`), fed NV12. `None`
+/// unless the encoders are in the ffmpeg build AND a HARDWARE-forced probe-encode
+/// initialises AND the frame fits the codec's max side. The effectful wrapper around the
+/// pure [`mf_plan_with`]; see that function for what the arguments mean and why.
+///
+/// The two gates run in the opposite order to [`amf_plan`] / [`qsv_plan`], which probe
+/// first, and that is deliberate. It was written for the dormant period, when no bundled
+/// ffmpeg carried `h264_mf` and a probe-first arm would have spawned a doomed probe-encode,
+/// and written a failed-probe `warn` into the debug log, on every recording start that
+/// reached the ladder's tail. The bundled ffmpeg carries the encoders now (see the module
+/// doc), but the order still earns its place for the same reason on any build whose ffmpeg
+/// does not: those are exactly the software-tier machines this arm exists to help.
+#[cfg(windows)]
+fn mf_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
+    let plan = mf_plan_with(&ffmpeg_encoders(), w, h, codec_choice)?;
+    hw_encoder_probe_ok_with("h264_mf", &mf_probe_args()).then_some(plan)
+}
+
+/// The pure core of [`mf_plan`]: the encoder set is passed in (rather than probed) so the
+/// arg selection + size gating is unit-testable on every host, the same treatment
+/// [`videotoolbox_plan_with`] gets for macOS.
+///
+/// **Why this tier ranks where it does.** Media Foundation is not an encoder, it is
+/// Windows' WRAPPER over whatever encoder MFT the machine exposes. On an x86 box with a
+/// vendor tier available it reaches the SAME silicon as `h264_nvenc` / `h264_amf` /
+/// `h264_qsv` through one more layer and with less control: rate-control granularity and
+/// B-frame behaviour are per-vendor MFT properties, and ffmpeg's `mfenc` sets every knob
+/// through `ICodecAPI` and IGNORES a rejection in silence, so what we ask for is not
+/// necessarily what we get, and there is no error to catch when it is not. That is why the
+/// vendor arms stay ahead of it and why `usable` + the software fallback stay in front:
+/// this arm is the LAST hardware answer, never the first. It earns its slot on ARM64
+/// Windows, where NVENC, AMF and QSV do not exist at all and Media Foundation is the only
+/// hardware encoder there is.
+///
+/// **What the arguments are, and why each one is there.**
+///
+/// - [`MF_HW_ENCODING`] (`-hw_encoding true`) is load-bearing, not a hint. Without it the
+///   Microsoft software H.264 MFT answers for the whole tier on every Windows machine.
+/// - `-rate_control pc_vbr` (peak-constrained VBR) is the honest reading of what
+///   `spawn_ffmpeg` already sends: `-b:v K -maxrate K -bufsize 2K` becomes mean bitrate K
+///   with peak K, which is exactly peak-constrained VBR. CBR would pad a static screen to
+///   the cap for nothing, and this codebase pays for small files on static content
+///   everywhere else. An MFT that does not support the mode ignores it and keeps its own,
+///   with the mean bitrate still applied, so the failure mode is a fallback and not a
+///   broken recording.
+/// - `-scenario display_remoting` is the screen-content hint. It is the nearest thing MF
+///   has to the real-time tuning the siblings use, and it is NOT an equivalent: **Media
+///   Foundation has no zerolatency knob**, no `-tune zerolatency` (x264), no `-realtime`
+///   (VideoToolbox), no `-tune ll` (NVENC). The scenario is a hint an MFT may ignore, so
+///   nothing here depends on it; it is named rather than invented, and if the DRAGON-702
+///   hardware run shows `live_streaming` behaving better, that is a one-word change.
+/// - `-g 60` sets the keyframe distance. It has to be set: `mfenc`'s own codec defaults
+///   pin `g` to 0, and it only pushes `AVEncMPVGOPSize` when the value is positive, so
+///   leaving it alone hands the interval to the vendor MFT's default, which differs per
+///   vendor and is not written down anywhere. 60 FRAMES is 2s at the default 30fps and 1s
+///   at 60, the band a recording wants for the preview editor's seeking. It is a compromise
+///   at the edges of the app's 1..240 fps range, because a plan builder never sees the
+///   frame rate; making it rate-aware means threading fps through every `*_plan`, which is
+///   a wider change than this arm justifies.
+///
+/// **What is deliberately NOT set**, so the next reader does not add it back:
+///
+/// - `-quality`. Microsoft defines `AVEncCommonQuality` as authoritative only under the
+///   `quality` rate-control mode, and we do not use that mode: it targets a quality level
+///   instead of the bitrate, so the user's bitrate setting would stop meaning anything, and
+///   it needs a media type whose average bitrate is not the number we set. Emitting it
+///   under `pc_vbr` would be an argument the encoder is documented to ignore.
+/// - `-bf 0`. The other real-time arms disable B-frames explicitly; here it is already the
+///   answer. `mfenc` ALWAYS pushes `AVEncMPVDefaultBPictureCount` from `max_b_frames`,
+///   whose default is 0, so the pair would be a no-op.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn mf_plan_with(encoders: &str, w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
+    let side = w.max(h);
+    let want_hevc = match codec_choice {
+        "hevc" => true,
+        "h264" => false,
+        _ => side > 4096,
+    };
+    // ONE source for the shared options, so the h264 and hevc arms cannot drift apart and
+    // the forced-hardware pair stays the same one the probe asked with.
+    let args = |encoder: &str| -> Vec<String> {
+        let mut v = vstr(&["-c:v", encoder]);
+        v.extend(MF_HW_ENCODING.iter().map(|a| a.to_string()));
+        v.extend(vstr(&["-rate_control", "pc_vbr", "-scenario", "display_remoting", "-g", "60"]));
+        v
+    };
+    let h264 = || args("h264_mf");
+    // hvc1 tag so the HEVC mp4 plays in QuickTime/Apple players too.
+    let hevc = || {
+        let mut v = args("hevc_mf");
+        v.extend(vstr(&["-tag:v", "hvc1"]));
+        v
+    };
+    let h264_ok = side <= 4096 && encoders.contains("h264_mf");
+    let hevc_ok = side <= 8192 && encoders.contains("hevc_mf");
+    let codec = pick_h264_or_hevc(want_hevc, h264_ok, hevc_ok, h264, hevc)?;
+    Some(EncodePlan {
+        pre: Vec::new(),
+        codec,
+        env: Vec::new(),
+        vf: None,
+        // Left off for the same reason as the AMF/QSV siblings: an MFT that rejects the
+        // explicit tags rejects them silently, and it labels the stream itself.
+        color_tags: false,
+        // NV12 is what a HARDWARE MFT takes, so the hardware feed applies: our own threaded
+        // BT.709 conversion, half the bytes down the pipe. This said "accepts NV12 (and
+        // YUV420P)" until DRAGON-708, which is true only of Microsoft's SOFTWARE MFT: with
+        // `-hw_encoding true` set, YUV420P is refused outright with `format negotiation
+        // failed`. The probe believed the parenthesis, fed YUV420P, and so reported the tier
+        // missing on every machine. Whatever this line says, `MF_PROBE_PIX_FMT` must agree.
+        nv12: true,
+        input_pix_fmt: "rgba",
+        // Bitrate-based, so `spawn_ffmpeg` adds the `-b:v` target. It is not optional here:
+        // `mfenc` writes `avctx->bit_rate` into the output media type's `MF_MT_AVG_BITRATE`,
+        // and a zero there is a media type a hardware MFT can refuse outright.
+        quality_rc: false,
+    })
+}
+
 /// The ranked auto/fallback encoder ladder for THIS build's platform, best first,
 /// with "software" always last (it cannot fail to build). [`EncodePlan::resolve_hinted`]
 /// walks it for an "auto" request (through [`auto_probe_order`]) and after a concrete
@@ -760,10 +1009,45 @@ fn qsv_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
 /// probe sequence identical to the historical hand-chained fallback.
 #[cfg(not(any(windows, target_os = "macos")))]
 pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "software"];
+// `mf` sits last among the hardware tiers (DRAGON-701, its rank argued in `mf_plan_with`).
+// DRAGON-708 removed it while it wedged and DRAGON-710 put it back; see AUTO_EXCLUDED.
 #[cfg(windows)]
-pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "amf", "qsv", "software"];
+pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "amf", "qsv", "mf", "software"];
 #[cfg(target_os = "macos")]
 pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "videotoolbox", "software"];
+
+/// Encoder ids this build can USE when asked for BY NAME, but which "auto" must never
+/// select on its own. QUARANTINE, not deletion (DRAGON-708).
+///
+/// **It is EMPTY, and it stays here on purpose.** DRAGON-708 created it to hold `mf` on
+/// Windows: the tier fed ffmpeg frames and ffmpeg wrote no output, so the DRAGON-118 muxer
+/// watchdog killed the session at 12s and the recording was lost, 3 runs of 3 at 5120x1440.
+/// DRAGON-710 found the cause and it was never the encoder: `-shortest`'s sync queue held
+/// every stream back by its full 10s default, so the muxer ran a fixed ten seconds behind
+/// wall time, no matroska cluster limit was reached, and the file stayed at its header. The
+/// flag is gone from `command::build_media_clock_command`, `mf` is back in
+/// [`AUTO_LADDER`], and 30s and 60s Media Foundation recordings complete and verify.
+///
+/// The vocabulary survives because the reasoning it encodes does. "Can auto pick it" and
+/// "can the user ask for it" are genuinely different questions, [`is_concrete_encoder_id`]
+/// answers the second one correctly because this exists, and the next tier that has to be
+/// withheld while it is chased should be withheld the same way rather than deleted.
+///
+/// A stale `encoder_auto_hint` naming a quarantined id cannot resurrect it:
+/// [`auto_probe_order`] only hoists a hint that the ladder still contains.
+pub const AUTO_EXCLUDED: &[&str] = &[];
+
+/// Pure, unit-tested: whether `id` names a CONCRETE encoder this build can be asked for,
+/// as opposed to "auto" or a typo. The union of [`AUTO_LADDER`] and [`AUTO_EXCLUDED`].
+///
+/// It exists because "can auto pick it" and "can the user ask for it" stopped being the
+/// same question when [`AUTO_EXCLUDED`] appeared (DRAGON-708). [`EncodePlan::resolve_hinted`]
+/// used a bare `AUTO_LADDER.contains(requested)` for this, so simply dropping `mf` from the
+/// ladder would have made an EXPLICIT `mf` request fall down the auto branch and silently
+/// resolve to something else, which is the exact class of bug this ticket is about.
+pub fn is_concrete_encoder_id(id: &str) -> bool {
+    AUTO_LADDER.contains(&id) || AUTO_EXCLUDED.contains(&id)
+}
 
 /// Pure, unit-tested (DRAGON-571). The order an "auto" encoder resolution tries the
 /// ranked `ladder` in: the last-known-good `hint` is hoisted to the front, so the
@@ -829,8 +1113,9 @@ pub fn auto_resolution_outcome(
     }
 }
 
-/// The Windows hardware-encoder preference order (DRAGON-238): honour the user's
-/// `preferred` when it's usable, else fall back NVENC → AMF → QSV → software, with the
+/// The Windows hardware-encoder preference order (DRAGON-238, and Media Foundation added
+/// below QSV in DRAGON-701): honour the user's
+/// `preferred` when it's usable, else fall back NVENC → AMF → QSV → MF → software, with the
 /// DRAGON-571 auto hint hoisted to the front of that fallback (via [`auto_probe_order`],
 /// so the hoist-and-ignore rules cannot drift from the plan resolver's). Pure over a
 /// `usable` predicate so the ranking is unit-testable without spawning ffmpeg — the real
@@ -843,7 +1128,7 @@ fn windows_resolve_encoder_id<'a>(
     usable: &dyn Fn(&str) -> bool,
 ) -> &'a str {
     match preferred {
-        "nvenc" | "amf" | "qsv" if usable(preferred) => preferred,
+        "nvenc" | "amf" | "qsv" | "mf" if usable(preferred) => preferred,
         "software" => "software",
         // "auto" / an unavailable preference: the hint-first ranked order, then software.
         _ => auto_probe_order(AUTO_LADDER, hint)
@@ -911,6 +1196,10 @@ mod tests {
             (&["-c:v", "h264_videotoolbox"][..], "videotoolbox"),
             (&["-c:v", "h264_amf"][..], "amf"),
             (&["-c:v", "h264_qsv"][..], "qsv"),
+            // DRAGON-701. The `h264_amf` row above and this one are the pair that
+            // matters: `_mf` must never claim an AMF plan.
+            (&["-c:v", "h264_mf", "-hw_encoding", "true"][..], "mf"),
+            (&["-c:v", "hevc_mf", "-tag:v", "hvc1"][..], "mf"),
             (&["-c:v", "libx264", "-crf", "23"][..], "software"),
             (&["-c:v", "libx265", "-crf", "28"][..], "software"),
         ] {
@@ -1062,6 +1351,83 @@ mod tests {
             let u = only(&["nvenc", "amf", "qsv"]);
             assert_eq!(windows_resolve_encoder_id("amf", Some("qsv"), &u), "amf");
         }
+
+        // DRAGON-701: Media Foundation joins the ladder BELOW the three vendor tiers and
+        // ABOVE software, and is requestable like any of them.
+        #[test]
+        fn mf_is_a_requestable_concrete_preference() {
+            assert_eq!(windows_resolve_encoder_id("mf", None, &only(&["mf"])), "mf");
+            // Requested but unusable falls back like every other concrete pick.
+            assert_eq!(windows_resolve_encoder_id("mf", None, &only(&["qsv"])), "qsv");
+        }
+
+        /// DRAGON-710 REVERSES this back to what DRAGON-701 asserted, and the round trip is
+        /// worth recording. DRAGON-708 changed the first line to `software`, because MF
+        /// wedged the muxer past the 12s watchdog and a box with nothing but MF had to reach
+        /// a tier that could actually deliver a file. That wedge was never the encoder: it
+        /// was `-shortest` holding the whole muxer ten seconds behind wall time
+        /// (`command::build_media_clock_command`). With the flag gone, MF records, so the
+        /// ARM64 shape is once again "the one hardware tier ARM64 has" rather than software.
+        #[test]
+        fn mf_wins_only_when_no_vendor_tier_does() {
+            // The ARM64 Windows shape: nothing but Media Foundation answers.
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["mf"])), "mf");
+            // On an x86 box a vendor tier always outranks it.
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["qsv", "mf"])), "qsv");
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["amf", "mf"])), "amf");
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["nvenc", "mf"])), "nvenc");
+        }
+
+        // DRAGON-702: the ARM64 Windows build's own shapes. Neither is hypothetical, and
+        // they are the two states an ARM64 machine is actually in.
+        #[test]
+        fn an_arm64_box_before_the_mf_producer_rerun_lands_on_software() {
+            // The shipped ffmpeg carries no `h264_mf` yet (DRAGON-701's producer run is
+            // still pending), and NVENC / AMF / QSV do not exist on ARM64 Windows at all,
+            // so NOTHING is usable and every request must reach the software tier rather
+            // than a tier that cannot answer.
+            let none = only(&[]);
+            assert_eq!(windows_resolve_encoder_id("auto", None, &none), "software");
+            assert_eq!(windows_resolve_encoder_id("mf", None, &none), "software");
+            // Including a stale hint left by a machine that once had a vendor tier: a hint
+            // is a probe ORDER, never a promise.
+            assert_eq!(windows_resolve_encoder_id("auto", Some("qsv"), &none), "software");
+        }
+
+        /// DRAGON-710 REVERSES this back too, and it is the one that matters most, so both
+        /// sides of the round trip are worth stating. DRAGON-701 asserted that every request
+        /// on an ARM64 box degrades INTO `mf`, because it is the only hardware answer there.
+        /// DRAGON-708 flipped it to `software`, since a tier that loses every recording over
+        /// ~12s is worse than a slow one that keeps them. DRAGON-710 removed the `-shortest`
+        /// sync queue that was actually causing the loss, so degrading into MF is once again
+        /// the right answer on the platform with no vendor tier to fall back to.
+        #[test]
+        fn an_arm64_box_with_mf_never_resolves_a_vendor_tier() {
+            // With the MF-carrying ffmpeg shipped, `mf` is the ONLY hardware answer here, and
+            // asking for a vendor tier by name must degrade to it rather than to software.
+            let u = only(&["mf"]);
+            for requested in ["auto", "", "nvenc", "amf", "qsv", "mf"] {
+                assert_eq!(
+                    windows_resolve_encoder_id(requested, None, &u),
+                    "mf",
+                    "{requested} must reach the one hardware tier ARM64 has"
+                );
+            }
+            // "software" stays honoured, as on every other Windows machine.
+            assert_eq!(windows_resolve_encoder_id("software", None, &u), "software");
+        }
+
+        /// The ladder's hardware order. DRAGON-708 rewrote this to assert `mf` was ABSENT
+        /// while it was quarantined; DRAGON-710 restores DRAGON-701's rank, which is the
+        /// one `mf_plan_with`'s doc argues for: last among hardware, ahead of software.
+        #[test]
+        fn the_ladder_ranks_mf_last_among_hardware() {
+            let at = |id: &str| {
+                super::super::AUTO_LADDER.iter().position(|x| *x == id).expect("in the ladder")
+            };
+            assert!(at("nvenc") < at("mf") && at("amf") < at("mf") && at("qsv") < at("mf"));
+            assert!(at("mf") < at("software"));
+        }
     }
 
     // The VideoToolbox tests drive the pure `videotoolbox_plan_with` core (encoder set
@@ -1161,6 +1527,47 @@ mod tests {
         ffmpeg_encoders().contains(encoder)
     }
 
+    /// Is THIS test process running under Rosetta 2 translation? (DRAGON-700)
+    ///
+    /// It exists for one reason, and it is measured rather than assumed: VIDEOTOOLBOX
+    /// WILL NOT OPEN A 5K SESSION FOR A TRANSLATED PROCESS. Running the identical command,
+    /// from the identical ffmpeg build, on one Apple Silicon Mac: the arm64 binary encodes
+    /// 5120x2880 through `hevc_videotoolbox` and writes its frame, while the x86_64 binary
+    /// gets `Cannot create compression session: -12908` (kVTCouldNotFindVideoEncoderErr).
+    /// It is not a blanket absence, either: 1920x1080 `h264_videotoolbox` opens fine under
+    /// translation. So the ceiling is specific to the size, and it is a property of Rosetta,
+    /// not of the code under test or of a real Intel Mac.
+    ///
+    /// The Intel dmg's gate is RUN under Rosetta, because nobody on this project has Intel
+    /// hardware, so without this the two 5K tests below would fail on every Intel gate run
+    /// and a genuine regression would be indistinguishable from the standing noise.
+    ///
+    /// NARROW ON PURPOSE. It gates only the two tests that ask VideoToolbox for a 5K
+    /// session, it never fires on a native run of either architecture, and each skip says
+    /// out loud which proof did not run. A real Intel Mac executes these for real.
+    ///
+    /// `sysctl.proc_translated` is Apple's own answer: 1 under Rosetta, 0 native, and the
+    /// name does not exist at all on an Intel Mac running natively (ENOENT), which reads
+    /// the same as 0 here.
+    #[cfg(target_os = "macos")]
+    fn running_translated() -> bool {
+        let mut out: i32 = 0;
+        let mut size = std::mem::size_of::<i32>();
+        let name = c"sysctl.proc_translated";
+        // SAFETY: `name` is a NUL-terminated literal, and the out pointer and its size
+        // describe the same `i32`. A missing name returns -1 and leaves `out` untouched.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut out).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && out == 1
+    }
+
     /// The proven ROOT CAUSE: `h264_videotoolbox` cannot open a compression session at
     /// 5120x2880 (H.264's 4096 side limit is an Apple-Silicon hardware ceiling too), so a
     /// 5K recording forced onto it fails; `hevc_videotoolbox` at the SAME size succeeds.
@@ -1172,6 +1579,15 @@ mod tests {
             eprintln!(
                 "SKIPPED (loud): videotoolbox_h264_fails_at_5k_but_hevc_succeeds_real_ffmpeg \
                  needs ffmpeg with the VideoToolbox encoders — the DRAGON-162 root-cause \
+                 proof did not run"
+            );
+            return;
+        }
+        if running_translated() {
+            eprintln!(
+                "SKIPPED (loud): videotoolbox_h264_fails_at_5k_but_hevc_succeeds_real_ffmpeg \
+                 cannot run under Rosetta 2, where VideoToolbox refuses a 5K session for a \
+                 translated process (see running_translated). The DRAGON-162 root-cause \
                  proof did not run"
             );
             return;
@@ -1206,6 +1622,14 @@ mod tests {
             eprintln!(
                 "SKIPPED (loud): resolved_5k_videotoolbox_plan_initializes_real_ffmpeg needs \
                  ffmpeg with hevc_videotoolbox — the DRAGON-162 fix proof did not run"
+            );
+            return;
+        }
+        if running_translated() {
+            eprintln!(
+                "SKIPPED (loud): resolved_5k_videotoolbox_plan_initializes_real_ffmpeg cannot \
+                 run under Rosetta 2, where VideoToolbox refuses a 5K session for a translated \
+                 process (see running_translated). The DRAGON-162 fix proof did not run"
             );
             return;
         }
@@ -1398,5 +1822,202 @@ mod probe_failure_reason_tests {
         let out = probe_failure_reason("Unable to open C:\\Users\\Jane Smith\\Videos\\standup.mp4");
         assert!(!out.contains("Jane Smith"), "{out}");
         assert!(!out.contains("standup"), "{out}");
+    }
+}
+
+/// DRAGON-701: the Media Foundation arm's argument selection, pinned as its own island.
+/// The encoder list is INJECTED (`mf_plan_with`), so nothing here spawns ffmpeg and a
+/// Windows-only tier is provable from the Linux and macOS gates, the same treatment
+/// `videotoolbox_plan_with` gets for macOS.
+#[cfg(test)]
+mod mf_plan_tests {
+    use super::{MF_HW_ENCODING, mf_plan_with};
+    use rstest::rstest;
+
+    /// An ffmpeg build carrying both MF encoders (the shape the Windows producer re-run
+    /// will ship). The real probe reads `ffmpeg -encoders`; only the names matter.
+    const BOTH: &str = "h264_mf hevc_mf";
+
+    #[test]
+    fn forced_h264_is_the_hardware_only_screen_capture_plan() {
+        let p = mf_plan_with(BOTH, 1920, 1080, "h264").expect("mf h264 plan");
+        assert_eq!(
+            p.codec,
+            [
+                "-c:v", "h264_mf", "-hw_encoding", "true",
+                "-rate_control", "pc_vbr", "-scenario", "display_remoting", "-g", "60",
+            ]
+        );
+        assert!(!p.is_hevc());
+        assert!(p.nv12, "MF takes NV12, so we keep our own threaded conversion");
+        assert!(!p.color_tags);
+        assert!(!p.quality_rc, "bitrate-based: spawn_ffmpeg adds -b:v, and MF needs it");
+        assert!(p.pre.is_empty() && p.env.is_empty() && p.vf.is_none());
+    }
+
+    #[test]
+    fn forced_hevc_adds_the_hvc1_tag_and_nothing_else() {
+        let p = mf_plan_with(BOTH, 1920, 1080, "hevc").expect("mf hevc plan");
+        assert_eq!(
+            p.codec,
+            [
+                "-c:v", "hevc_mf", "-hw_encoding", "true",
+                "-rate_control", "pc_vbr", "-scenario", "display_remoting", "-g", "60",
+                "-tag:v", "hvc1",
+            ]
+        );
+        assert!(p.is_hevc());
+        assert!(p.nv12 && !p.quality_rc);
+    }
+
+    /// The one argument that must never be dropped: without it Microsoft's SOFTWARE H.264
+    /// MFT answers for the tier, and a CPU encoder slower than libx264 wins a hardware
+    /// ladder slot. Checked on BOTH codec arms, since they are built separately.
+    #[test]
+    fn every_arm_forces_hardware_encoding() {
+        for codec in ["h264", "hevc", "auto"] {
+            let p = mf_plan_with(BOTH, 1920, 1080, codec).expect("plan");
+            assert!(
+                p.codec.windows(2).any(|w| w == MF_HW_ENCODING),
+                "codec={codec} lost the forced-hardware pair: {:?}",
+                p.codec
+            );
+        }
+    }
+
+    /// DRAGON-708, the bug this arm shipped with: the probe must ask what the RECORDING
+    /// asks. It forced hardware but let the probe clip stay lavfi's YUV420P, which a
+    /// hardware MFT refuses outright (`format negotiation failed (1/0)`), so the tier
+    /// reported itself missing on every machine, including ones whose hardware works.
+    ///
+    /// Pinned as the RELATIONSHIP rather than a literal argv, because the failure was
+    /// precisely the two sides disagreeing: whatever the plan feeds is what the probe must
+    /// feed.
+    #[test]
+    fn the_probe_feeds_the_pixel_format_the_plan_feeds() {
+        let args = super::mf_probe_args();
+        // Forced hardware, still, and first: the reason the probe exists at all.
+        assert_eq!(&args[..2], &MF_HW_ENCODING[..], "probe stopped forcing hardware: {args:?}");
+        // ...and the feed the plan actually sends. `nv12: true` becomes `-pix_fmt nv12` in
+        // `command::media_clock_args`, so the probe naming nv12 is what keeps them one
+        // question rather than two.
+        let p = mf_plan_with(BOTH, 1920, 1080, "h264").expect("mf h264 plan");
+        assert!(p.nv12, "the plan stopped feeding NV12; the probe below now lies");
+        assert!(
+            args.windows(2).any(|w| w == ["-pix_fmt", "nv12"]),
+            "probe does not feed the plan's NV12: {args:?}"
+        );
+    }
+
+    /// DRAGON-710 REVERSES this DRAGON-708 test. It asserted that `mf` was OUT of the auto
+    /// ladder and in [`super::AUTO_EXCLUDED`], because the tier wedged the muxer past the
+    /// 12s watchdog and lost the recording. The wedge was `-shortest`, not the encoder (see
+    /// `command::build_media_clock_command`), so the quarantine is lifted and the tier is
+    /// back where DRAGON-701 put it: the LAST hardware answer, which on ARM64 Windows is
+    /// the only one there is.
+    #[test]
+    #[cfg(windows)]
+    fn auto_can_select_media_foundation_again() {
+        assert!(
+            super::AUTO_LADDER.contains(&"mf"),
+            "mf must be back in the auto ladder: {:?}",
+            super::AUTO_LADDER
+        );
+        assert!(
+            super::AUTO_EXCLUDED.is_empty(),
+            "nothing is quarantined now: {:?}",
+            super::AUTO_EXCLUDED
+        );
+    }
+
+    /// [`super::is_concrete_encoder_id`] outlives the quarantine that motivated it. "Can
+    /// auto pick it" and "can the user ask for it" are different questions whether or not
+    /// anything is currently excluded, and the answer must stay a union of both lists, so
+    /// a future [`super::AUTO_EXCLUDED`] entry is honoured by name the moment it is added.
+    #[test]
+    #[cfg(windows)]
+    fn asking_for_a_tier_by_name_spans_the_ladder_and_the_quarantine() {
+        assert!(super::is_concrete_encoder_id("mf"), "explicit mf stopped being concrete");
+        assert!(super::is_concrete_encoder_id("nvenc"));
+        assert!(!super::is_concrete_encoder_id("auto"), "auto is not a concrete pick");
+        assert!(!super::is_concrete_encoder_id("nvnec"), "a typo is not a concrete pick");
+        for id in super::AUTO_EXCLUDED {
+            assert!(super::is_concrete_encoder_id(id), "{id} is quarantined, not unaskable");
+        }
+    }
+
+    /// A persisted `encoder_auto_hint` of `mf` is honoured again (DRAGON-710). While the
+    /// tier was quarantined this asserted the opposite, that the hint could not resurrect
+    /// it, because `auto_probe_order` only hoists a hint the ladder still contains. That
+    /// rule is unchanged; what changed is that the ladder contains `mf` once more, so the
+    /// hint hoists it and a machine whose last good encoder was MF pays one probe, not five.
+    #[test]
+    #[cfg(windows)]
+    fn a_media_foundation_hint_is_hoisted_like_any_other() {
+        let order = super::auto_probe_order(super::AUTO_LADDER, Some("mf"));
+        assert_eq!(order.first(), Some(&"mf"), "the hint must lead: {order:?}");
+        assert_eq!(order.len(), super::AUTO_LADDER.len(), "hoisting must dedupe: {order:?}");
+        assert_eq!(order.last(), Some(&"software"), "software stays the tail: {order:?}");
+    }
+
+    /// The probe's arguments are probe-only. Folding them into the plan would emit a second
+    /// `-pix_fmt`, colliding with the one `media_clock_args` already writes from `nv12`.
+    #[test]
+    fn the_probes_pixel_format_never_reaches_the_plan() {
+        for codec in ["h264", "hevc", "auto"] {
+            let p = mf_plan_with(BOTH, 1920, 1080, codec).expect("plan");
+            assert!(
+                !p.codec.iter().any(|a| a == "-pix_fmt"),
+                "codec={codec} leaked the probe's pixel format into the plan: {:?}",
+                p.codec
+            );
+        }
+    }
+
+    /// The codec routing, which is the same policy every other hardware tier applies:
+    /// honour a forced pick where it fits, and let `auto` follow the resolution rule
+    /// (H.264 up to 4096 px, HEVC above). A forced pick that does NOT fit falls to the
+    /// other codec rather than failing the recording.
+    #[rstest]
+    #[case("auto", 1920, 1080, false)]
+    #[case("auto", 3840, 2160, false)]
+    #[case("auto", 5120, 2160, true)]
+    #[case("h264", 1920, 1080, false)]
+    #[case("h264", 5120, 2160, true)] // over H.264's side limit: HEVC or nothing
+    #[case("hevc", 1920, 1080, true)]
+    #[case("hevc", 7680, 4320, true)]
+    fn codec_routing_follows_the_resolution_rule(
+        #[case] codec: &str,
+        #[case] w: u32,
+        #[case] h: u32,
+        #[case] hevc: bool,
+    ) {
+        assert_eq!(mf_plan_with(BOTH, w, h, codec).expect("plan").is_hevc(), hevc);
+    }
+
+    /// The dormancy contract, and the ladder's precedence contract with it: an ffmpeg
+    /// without the MF encoders yields no plan at all, so `resolve` falls straight through
+    /// to the next tier. This is the state of every build we ship until the Windows
+    /// producer is re-run, which is why the tier can land now and change nothing.
+    #[test]
+    fn an_ffmpeg_without_media_foundation_yields_no_plan() {
+        for codec in ["auto", "h264", "hevc"] {
+            assert!(mf_plan_with("", 1920, 1080, codec).is_none(), "codec={codec}");
+        }
+        // A build with the vendor encoders but no MF is still no plan (the substring
+        // check must not be satisfied by `h264_amf` or anything else).
+        assert!(mf_plan_with("h264_nvenc h264_amf h264_qsv", 1920, 1080, "auto").is_none());
+    }
+
+    #[test]
+    fn a_partial_build_degrades_instead_of_failing() {
+        // H.264 only, forced HEVC: falls back to the encoder that exists.
+        assert!(!mf_plan_with("h264_mf", 1920, 1080, "hevc").expect("h264 fallback").is_hevc());
+        // H.264 only, past H.264's side limit: neither fits, so the ladder moves on.
+        assert!(mf_plan_with("h264_mf", 5120, 2160, "auto").is_none());
+        // HEVC only: auto below 4096 still resolves, on the encoder that is there.
+        assert!(mf_plan_with("hevc_mf", 1920, 1080, "auto").expect("hevc fallback").is_hevc());
+        // Nothing fits HEVC's 8192 side limit either.
+        assert!(mf_plan_with(BOTH, 8320, 4320, "auto").is_none());
     }
 }

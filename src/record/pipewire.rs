@@ -4,8 +4,9 @@
 use super::owned::{
     make_frame_writer, mark_first_frame, mark_settled, media_zero, run_video_stop_tail,
     try_start_owned_audio,
-    MuteIntervals, OwnedAudioStart,
+    MuteIntervals, OwnedAudioStart, SessionVideoSink,
 };
+use super::frame_queue::{self, CapturedFrame, FrameBound, FrameSource};
 use super::{ToggleEvent, median_offset_ms, monotonic_ns};
 use crate::audio::capture::MonitorCapture;
 use crate::audio::clean_mic::MicTapHandle;
@@ -23,12 +24,33 @@ use std::time::{Duration, Instant};
 /// also what the opening phase places each frame by (see [`frame_media_tick`]).
 type Frame = (u32, u32, Vec<u8>, i64, i64, i64);
 
-/// How many captured frames the bounded capture channel holds. Small on purpose: one
-/// frame is `w*h*4` bytes (tens of megabytes at 4K), and depth here buys latency, not
-/// smoothness: the media clock decides how many ticks are owed regardless of how much is
-/// queued. Also caps the opening phase's pending queue, which drains through the same
-/// frames.
-const FRAME_CHANNEL_DEPTH: usize = 8;
+/// What the shared frame queue (`record::frame_queue`, DRAGON-713) needs to know about a
+/// PipeWire frame. The queue evicts from the OLDEST end and coalesces arrivals that share a
+/// media tick, so both of those are answered here and nowhere else on this path.
+///
+/// A coalesced entry keeps its own `recv_ns` (the group's opening instant, which is what
+/// [`frame_media_tick`] places it by and what makes the grouping terminate) and takes the
+/// newer frame's pixels AND its `pts`/`pw_delay`. The timing state must travel with the
+/// pixels: [`frame_lag_ms`] measures how long THESE pixels took to reach the encoder, so
+/// pairing new pixels with a superseded frame's capture timestamp would report a lag that
+/// belongs to neither. The superseded frame contributes no lag sample, exactly as a frame
+/// the old bounded channel refused contributed none.
+impl CapturedFrame for Frame {
+    fn frame_bytes(&self) -> usize {
+        self.2.len()
+    }
+    fn since(&self, older: &Self) -> Duration {
+        Duration::from_nanos((self.5 - older.5).max(0) as u64)
+    }
+    fn absorb(&mut self, newer: Self) {
+        let (w, h, rgba, pts, pw_delay, _recv_ns) = newer;
+        self.0 = w;
+        self.1 = h;
+        self.2 = rgba;
+        self.3 = pts;
+        self.4 = pw_delay;
+    }
+}
 
 /// How long the opening phase may spend getting level with the media clock before it
 /// hands over to the steady-state loop. A BOUND, not a target (DRAGON-118: nothing in the
@@ -40,15 +62,41 @@ const FRAME_CHANNEL_DEPTH: usize = 8;
 /// shapes, and hoisting one shared number would tie their tuning together for nothing.
 const OPENING_COVER_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long the worker waits for the portal stream's FIRST frame before failing the
+/// recording. A BOUND, not a target (DRAGON-118). Paused waits do not count against it.
+///
+/// It is the OUTER of the two video bring-up bounds, and it can only ever report that
+/// nothing arrived. The INNER one is the negotiation watch inside the consumer
+/// (`platform::PW_STREAMING_BUDGET`), which can say WHY, so it has to expire first.
+const FIRST_FRAME_BUDGET_SECS: u32 = 10;
+
+// DRAGON-714: the two bring-up bounds nest, inner (named diagnosis) inside outer (generic
+// "nothing arrived"). Inverting them would not hang anything, which is exactly why it needs
+// an assert: it would silently cost the diagnosis and leave the old symptom in its place.
+const _: () = assert!(
+    crate::platform::PW_STREAMING_BUDGET.as_secs() < FIRST_FRAME_BUDGET_SECS as u64,
+    "DRAGON-714: the PipeWire negotiation watch must expire INSIDE the worker's \
+     first-frame wait, or a failed negotiation reports 'no frames' instead of its cause"
+);
+
 /// The A/V lag (ms) a single delivered PipeWire `frame` implies — how long it took to
 /// reach the encoder, measured EXACTLY as the in-loop path always has (the
 /// capture-timestamp form when the frame carried a monotonic `pts`, else PipeWire's
-/// reported source delay plus the channel transit since `recv_ns`). Factored out so the
+/// reported source delay plus the queue transit since `recv_ns`). Factored out so the
 /// drain below can sample EVERY frame it consumes, not just the one whose pixels it
 /// keeps: each arrived frame is an independent, equally-valid latency observation for
 /// the median (`median_offset_ms`), so draining stale frames must not silently drop
 /// their lag samples. Returns `None` for a sample outside the trusted `1..=2000` ms band
 /// (the same filter the loop applied inline).
+///
+/// DRAGON-713 costs this two small, bounded things, and both are worth naming. Arrivals that
+/// share a media tick COALESCE in the capture queue, so a tick yields one sample rather than
+/// several: still ~30 a second at 30fps, against the five the median needs, and the ones it
+/// loses were frames no tick would ever have shown. And a coalesced entry keeps the tick's
+/// OPENING recv stamp (it has to: that is what places it), so on the `pts == 0` form its
+/// transit term can read up to one tick long. Both sit well inside the residence time this
+/// measurement already includes by design, since a frame may legitimately wait in the queue
+/// for several ticks before the encoder takes it.
 fn frame_lag_ms(pts: i64, pw_delay: i64, recv_ns: i64) -> Option<i64> {
     let lag_ms = if pts > 0 {
         (monotonic_ns() - pts) / 1_000_000
@@ -58,22 +106,24 @@ fn frame_lag_ms(pts: i64, pw_delay: i64, recv_ns: i64) -> Option<i64> {
     (lag_ms > 0 && lag_ms <= 2000).then_some(lag_ms)
 }
 
-/// Drain `rx` to the FRESHEST currently-queued frame, updating `last` in place to its
+/// Drain `frames` to the FRESHEST currently-queued frame, updating `last` in place to its
 /// dimensions + pixels and pushing EVERY consumed frame's lag sample into `lag_samples`
 /// (see [`frame_lag_ms`]); report whether ANY frame was consumed (DRAGON-167). This is
 /// the CFR contract's "feed the freshest frame" made explicit and headlessly testable,
 /// generalizing the mac SCK `latch_freshest` (DRAGON-164) to the PipeWire tuple's
 /// per-frame timing state:
 ///
-/// The capture channel is bounded (8 deep). When a slow encoder backpressures the
-/// blocking video write, the loop parks IN that write while the PipeWire consumer thread
-/// keeps pushing — the channel fills and the consumer DROPS the newest frames
-/// (`try_send` fails), leaving only stale ones. Consuming a single frame per tick (the
-/// loop's bare `recv_timeout`) would then feed the OLDEST stale frame (the channel is
-/// FIFO), so the video shows seconds-old content while the newest changes are discarded
-/// upstream — the reported near-total freeze on a loaded capture (the Linux twin of the
-/// mac SCK bug). Draining to the freshest holds `last` current every tick and keeps the
-/// channel from staying full (so the consumer stops dropping fresh frames).
+/// The capture queue is bounded (8 deep in the steady state). When a slow encoder
+/// backpressures the video write, the loop parks IN that write while the PipeWire consumer
+/// thread keeps pushing. Consuming a single frame per tick (the loop's bare `recv_timeout`)
+/// would then feed the OLDEST queued frame (the queue is FIFO), so the video would show
+/// stale content while the newest changes sat behind it: the reported near-total freeze on
+/// a loaded capture (the Linux twin of the mac SCK bug). Draining to the freshest holds
+/// `last` current every tick.
+///
+/// DRAGON-713 fixed the producer's half of the same argument: a full queue used to REFUSE
+/// the incoming frame, so the eight it kept were the eight stalest. It now evicts from the
+/// oldest end instead, which is the end this function throws away anyway.
 ///
 /// pts/lag semantics are PRESERVED, not corrupted: the intermediate frames' PIXELS are
 /// the only thing discarded (they're stale by definition — a newer frame supersedes
@@ -82,22 +132,19 @@ fn frame_lag_ms(pts: i64, pw_delay: i64, recv_ns: i64) -> Option<i64> {
 /// robust — more samples). The media clock itself is index-stamped and never reads these
 /// timestamps, so dropping stale pixels cannot skew it.
 ///
-/// Returns `false` only when the channel was empty (nothing new / not yet delivered),
+/// Returns `false` only when the queue was empty (nothing new / not yet delivered),
 /// leaving `last` untouched so the caller re-feeds it to hold CFR.
 fn latch_freshest(
-    rx: &std::sync::mpsc::Receiver<Frame>,
+    frames: &FrameSource<Frame>,
     last: &mut (u32, u32, Vec<u8>),
     lag_samples: &mut Vec<i64>,
 ) -> bool {
-    let mut got = false;
-    while let Ok((w, h, rgba, pts, pw_delay, recv_ns)) = rx.try_recv() {
+    frames.drain_each(|(w, h, rgba, pts, pw_delay, recv_ns)| {
         if let Some(ms) = frame_lag_ms(pts, pw_delay, recv_ns) {
             lag_samples.push(ms);
         }
         *last = (w, h, rgba);
-        got = true;
-    }
-    got
+    }) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -167,27 +214,31 @@ fn advance_to_tick(
     moved
 }
 
-/// Drain every frame currently queued in `rx` into `pending`, crediting each one's lag
-/// sample exactly as [`latch_freshest`] does, and holding the queue to
-/// [`FRAME_CHANNEL_DEPTH`] by dropping from the OLDEST end (the most stale content).
+/// Drain every frame currently queued in `frames` into `pending`, crediting each one's lag
+/// sample exactly as [`latch_freshest`] does, and holding `pending` to `bound` through the
+/// shared rule (`frame_queue::stash_frame`: coalesce a tick, evict the OLDEST).
 ///
 /// The opening phase's counterpart to `latch_freshest`: it KEEPS the arrived frames
 /// instead of collapsing them onto the newest, because each of them belongs at a media
 /// tick of its own (see [`advance_to_tick`]).
+///
+/// DRAGON-713: the cap used to be a flat eight frames, which is a fifth of a second at
+/// 30fps, so an opening span longer than that arrived already thinned. `bound` is the
+/// opening bound (96MB / 2s, floored at the steady depth) while the phase runs, which is
+/// the same bound the capture queue itself is under, so the frames the phase holds and the
+/// frames still in flight obey one rule.
 fn drain_arrivals(
-    rx: &std::sync::mpsc::Receiver<Frame>,
+    frames: &FrameSource<Frame>,
     pending: &mut VecDeque<Frame>,
     lag_samples: &mut Vec<i64>,
+    bound: FrameBound,
 ) {
-    while let Ok(f) = rx.try_recv() {
+    frames.drain_each(|f| {
         if let Some(ms) = frame_lag_ms(f.3, f.4, f.5) {
             lag_samples.push(ms);
         }
-        pending.push_back(f);
-    }
-    while pending.len() > FRAME_CHANNEL_DEPTH {
-        pending.pop_front();
-    }
+        frame_queue::stash_frame(pending, f, bound);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -274,29 +325,53 @@ pub(crate) fn record_pipewire(
     measured: &Mutex<Option<i32>>,
     dims: &Mutex<Option<(u32, u32)>>,
     warm_at: &Mutex<Option<Instant>>,
+    media_zero_at: &Mutex<Option<Instant>>,
     settled_at: &Mutex<Option<Instant>>,
+    // DRAGON-736: the live annotation ink, in both of its forms, because a PORTAL WINDOW cast
+    // delivers the toplevel's OWN buffer and our ink surface is structurally not in it. The
+    // NATIVE screencopy worker next door takes neither, and must not: it crops the SCREEN, so
+    // the compositor already put the ink in the frame and compositing it again would draw
+    // every stroke twice. This slot is the FALLBACK bake, read once at finalize.
+    ink: &Mutex<Option<crate::record::ink_bake::InkBake>>,
+    // DRAGON-736: and the same ink published live, so it can be painted onto each captured
+    // frame on its way to the encoder (DRAGON-724's path, which this worker joins). When the
+    // size gate admits the session this is what puts the drawing in the file and `ink` above
+    // is dropped unread.
+    live_ink: &crate::record::ink_live::LiveInk,
     metadata: &str,
+    // DRAGON-693 (Bronze): the armed annotation window's one-shot request for the freshest
+    // captured frame. Nothing here waits on it and an unserved request costs nothing.
+    peek: &super::FramePeek,
 ) -> Result<PathBuf, String> {
-    // Same PipeWire consumer shape as ever: a small jitter-buffered channel, dropping
+    // Same PipeWire consumer shape as ever: a small jitter-buffered queue, dropping
     // (never blocking) when the encoder side is behind, discarding frames while
     // paused — nothing is captured then; the pump's video ticks independently freeze
     // for the same span (see `super::pump::VideoTicker`). It is the FIRST thing the
     // worker starts, and nothing audio-side exists until it has delivered a frame
     // (DRAGON-658).
-    let (ftx, frx) = std::sync::mpsc::sync_channel::<Frame>(FRAME_CHANNEL_DEPTH);
+    //
+    // DRAGON-713: the queue is the shared `record::frame_queue`, so what a full queue drops
+    // is its OLDEST frame and not the one just captured. It starts under the OPENING bound,
+    // because the audio pre-flight runs inline on the worker thread with nothing draining
+    // and every frame delivered during it belongs to a real opening tick; the worker retunes
+    // it to the steady depth the moment the opening phase hands over.
+    let (ftx, frx) = frame_queue::channel::<Frame>(FrameBound::opening(fps));
+    let evicted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pw_evicted = evicted.clone();
     let pw_stop = stop.clone();
     let pw_paused = paused.clone();
     let pw = std::thread::spawn(move || {
-        let mut dropped: u64 = 0;
         crate::platform::pipewire::consume_frames(fd, node_id, crop, pw_stop, move |rgba, w, h, pts, pw_delay| {
             if pw_paused.load(Ordering::Relaxed) {
                 return;
             }
-            if ftx.try_send((w, h, rgba, pts, pw_delay, monotonic_ns())).is_err() {
-                dropped += 1;
-                if dropped == 1 || dropped.is_multiple_of(60) {
+            let out = ftx.push((w, h, rgba, pts, pw_delay, monotonic_ns()));
+            if out.evicted > 0 {
+                let n = pw_evicted.fetch_add(u64::from(out.evicted), Ordering::Relaxed)
+                    + u64::from(out.evicted);
+                if n <= u64::from(out.evicted) || n.is_multiple_of(60) {
                     log::warn!(
-                        "pipewire capture (media-clock): encoder backlog — {dropped} frames \
+                        "pipewire capture (media-clock): encoder backlog, {n} stale frames \
                          dropped so far (video will look choppy if this keeps up)"
                     );
                 }
@@ -306,7 +381,8 @@ pub(crate) fn record_pipewire(
     record_pipewire_owned(
         fps, preferred_encoder, encoder_hint, presets, mic, system_audio, bitrate_kbps,
         audio_offset_ms, auto_device_compensation, max_res, start_gate, out_path, stop, paused,
-        events, measured, dims, warm_at, settled_at, metadata, frx, pw,
+        events, measured, dims, warm_at, media_zero_at, settled_at, ink, live_ink, metadata, peek,
+        frx, evicted, pw,
     )
 }
 
@@ -343,9 +419,18 @@ fn record_pipewire_owned(
     measured: &Mutex<Option<i32>>,
     dims: &Mutex<Option<(u32, u32)>>,
     warm_at: &Mutex<Option<Instant>>,
+    media_zero_at: &Mutex<Option<Instant>>,
     settled_at: &Mutex<Option<Instant>>,
+    // DRAGON-736: the fallback ink bake and the live ink scene; see `record_pipewire`.
+    ink: &Mutex<Option<crate::record::ink_bake::InkBake>>,
+    live_ink: &crate::record::ink_live::LiveInk,
     metadata: &str,
-    frx: std::sync::mpsc::Receiver<Frame>,
+    peek: &super::FramePeek,
+    frx: FrameSource<Frame>,
+    // How many frames the capture queue has evicted from its oldest end (DRAGON-713). Read
+    // once, where the opening phase begins, so the log can say ONCE that the opening span
+    // outran its budget.
+    evicted: Arc<std::sync::atomic::AtomicU64>,
     pw: std::thread::JoinHandle<Result<(), String>>,
 ) -> Result<PathBuf, String> {
     if let Some(parent) = out_path.parent() {
@@ -358,8 +443,22 @@ fn record_pipewire_owned(
     // exists yet (DRAGON-658), so a failure here just stops the consumer and returns.
     let no_frames = |stop: &Arc<AtomicBool>, pw: std::thread::JoinHandle<Result<(), String>>| {
         stop.store(true, Ordering::Relaxed);
-        let _ = pw.join();
-        "no frames from the PipeWire stream".to_string()
+        // DRAGON-714: the consumer thread's OWN reason wins when it has one. Its named
+        // diagnoses (above all "the stream never reached Streaming", which is what a failed
+        // format negotiation looks like from here, since no error is ever raised) say why;
+        // the generic line below only says that nothing arrived.
+        //
+        // Noted HERE rather than left to the app, so `diag::root_failure` — which reports
+        // the FIRST note of the session — names the negotiation rather than the symptom the
+        // app records a moment later. Same closed vocabulary, same variant: a recording that
+        // produced nothing is `RecordingFailed`, whose detail IS the user-facing copy.
+        match pw.join() {
+            Ok(Err(reason)) => {
+                crate::diag::note_failure(crate::diag::Failure::RecordingFailed, &reason);
+                reason
+            }
+            _ => "no frames from the PipeWire stream".to_string(),
+        }
     };
     let (w0, h0, first, _pts0, _delay0, recv0) = {
         let mut waited_s = 0u32;
@@ -370,7 +469,7 @@ fn record_pipewire_owned(
                     if paused.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     waited_s += 1;
-                    if waited_s >= 10 || stop.load(Ordering::Relaxed) {
+                    if waited_s >= FIRST_FRAME_BUDGET_SECS || stop.load(Ordering::Relaxed) {
                         return Err(no_frames(&stop, pw));
                     }
                 }
@@ -429,24 +528,45 @@ fn record_pipewire_owned(
             ));
         }
     };
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(raw_stdin) = child.stdin.take() else {
         let _ = child.kill();
         return Err(owned_start_failure(
             &stop, pw, mic_tap, monitor, &mic_fifo_path, &sys_fifo_path,
             "ffmpeg stdin unavailable".to_string(),
         ));
     };
+    // DRAGON-712: the capture loop's frames go through the ABANDONABLE sink, not the raw
+    // blocking pipe. A blocking write here parks in the kernel on a jammed ffmpeg, and the
+    // loop can then never reach the stdin EOF that is the only thing that unjams it. See
+    // `owned::SessionVideoSink`.
+    let mut stdin = SessionVideoSink::new(raw_stdin, &stop);
 
     let mut write_frame = make_frame_writer(w0, h0, nv12);
+    // DRAGON-736: the live annotation is painted onto each captured frame HERE, immediately
+    // before the frame writer, exactly where the macOS SCK and Windows WGC workers put it
+    // (DRAGON-724). This is the PORTAL worker, so a WINDOW cast's frames are the toplevel's own
+    // buffer and carry none of our surfaces. The gate inside decides ONCE whether this
+    // session's frames are small enough to afford the per-tick copy; a refused session paints
+    // nothing and the finalize bake runs instead. A session with no ink published pays one
+    // `Option` test per tick and writes the captured bytes untouched, which is what keeps every
+    // portal region and monitor recording byte-identical to before.
+    let mut ink_paint = crate::record::ink_live::LiveInkPainter::new(
+        live_ink.clone(),
+        w0,
+        h0,
+        fps.max(1),
+        plan.input_pix_fmt,
+    );
     let mut last: (u32, u32, Vec<u8>) = (w0, h0, first);
     // NOT drained to the freshest here (DRAGON-658). Whatever the consumer queued while
     // ffmpeg was starting up (encoder + FIFO opens, which do not read the video pipe) is
     // the session's OPENING, and the opening phase below places each of those frames at
     // the media tick it actually belongs to instead of throwing all but the newest away.
-    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
-    // the warming spinner clears, which is the same instant the user is told recording
-    // started. See `owned::media_zero` for the whole argument.
-    let session_start = media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672), and the slot below is how
+    // the UI learns it (DRAGON-725): the spinner does NOT clear here, the opening phase
+    // still follows. See `owned::media_zero` for the whole argument.
+    let session_start =
+        media_zero(media_zero_at, capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
     // The frames' arrival stamps live on `monotonic_ns`'s clock and the media clock on
     // `Instant`'s; pair them once, here, so the opening phase can ask which tick a frame
     // belongs to (see `frame_media_tick`).
@@ -469,7 +589,10 @@ fn record_pipewire_owned(
     // down must follow promptly, because those stdin bytes are what let ffmpeg get
     // past its input-0 probe and reach the FIFOs the pump is waiting to open (see
     // `pump::open_fifo_write_end`'s doc for the wedge this ordering prevents).
-    let scope_result: Result<(MuteIntervals, MuteIntervals), String> = std::thread::scope(|scope| {
+    // DRAGON-736: the third element is the video's own length in FRAMES, taken AFTER the stop
+    // tail's covering ticks, which is the ceiling the fallback ink bake feeds up to. The mac
+    // and Windows workers already carried it for the same reason.
+    let scope_result: Result<(MuteIntervals, MuteIntervals, u64), String> = std::thread::scope(|scope| {
         let (pump_handle, mut ticker) = match super::pump::spawn(
             scope, session_start, pump_cfg, mic_fifo_path.clone(), sys_fifo_path.clone(), mic_tap,
             mic_rx, monitor, sys_rx, &stop, &paused, events,
@@ -526,6 +649,12 @@ fn record_pipewire_owned(
         // The steady-state loop below is UNCHANGED and still drains to the freshest:
         // `frame_media_tick` reads arrival time, which stops being media time the moment
         // anything pauses. This phase ends there anyway, since a paused clock owes zero.
+        //
+        // DRAGON-713: the phase inherits whatever the capture queue kept while the pre-flight
+        // ran, which is now a real sliding window on the opening span rather than its first
+        // eight frames, and it holds its own queue to the SAME bound.
+        let opening_bound = FrameBound::opening(fps.max(1));
+        frame_queue::note_opening_evictions(evicted.load(Ordering::Relaxed));
         let mut pending: VecDeque<Frame> = VecDeque::new();
         let mut tick: u64 = 0;
         let mut ticks_from_capture = 0u32;
@@ -537,11 +666,16 @@ fn record_pipewire_owned(
         let mut opening_ok = true;
         'opening: loop {
             while owed > 0 {
-                drain_arrivals(&frx, &mut pending, &mut all_lag_samples);
+                drain_arrivals(&frx, &mut pending, &mut all_lag_samples, opening_bound);
                 if advance_to_tick(&mut pending, &mut last, tick, session_start_ns, fps.max(1)) {
                     ticks_from_capture += 1;
                 }
-                if !write_frame(last.0, last.1, &last.2, &mut stdin) {
+                if !write_frame(
+                    last.0,
+                    last.1,
+                    ink_paint.paint(last.0, last.1, &last.2),
+                    &mut stdin,
+                ) {
                     opening_ok = false;
                     break 'opening;
                 }
@@ -565,6 +699,11 @@ fn record_pipewire_owned(
             last = (w, h, rgba);
         }
         pending.clear(); // a queued frame is `w*h*4` bytes; do not hold them for the session
+        // The opening is over, so the capture queue goes back to the steady depth it has
+        // always had (DRAGON-713). The bigger opening bound exists only to cover the span
+        // where nothing was draining; carrying it for the session would hold up to two
+        // seconds of frames for no tick that will ever ask for them.
+        frx.retune(FrameBound::steady(fps.max(1)));
         if crate::util::timing_on() {
             crate::util::timing_mark(&format!(
                 "rec/pw: opening covered {tick} ticks, {ticks_from_capture} of them from a \
@@ -577,7 +716,14 @@ fn record_pipewire_owned(
             // the whole pipeline is steady, and it is what the UI's live declaration waits
             // for. Inside the `opening_ok` test on purpose: a failed write means ffmpeg is
             // not taking frames, so that session is dying rather than settling.
-            mark_settled(settled_at, Instant::now());
+            mark_settled(settled_at, Instant::now(), session_start);
+            // DRAGON-751: the stall clock measures wall time since the last REAL frame, not a
+            // count of wakeups times their length. The wait below is no longer a fixed 200ms
+            // when this session paints live ink, so the old `stalled_secs += 0.2` would have
+            // reported a stall six times too short. Seeded here rather than at the
+            // declaration above so the opening phase, which consumes frames of its own, can
+            // never be charged to the first steady-state timeout.
+            let mut last_frame_at = std::time::Instant::now();
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -605,7 +751,21 @@ fn record_pipewire_owned(
                         }
                     }
                 }
-                match frx.recv_timeout(std::time::Duration::from_millis(200)) {
+                // DRAGON-751: 200ms is the CEILING, and a session that paints live ink is also
+                // bounded by its next media tick, exactly as in the WGC and SCK loops. A
+                // portal WINDOW cast delivers the toplevel's own buffer and can be
+                // damage-driven, so this loop can park through a stroke's whole fade and then
+                // pay every owed tick off ONE read of the ink scene. This worker paints live
+                // for that route (DRAGON-736). `capture_wait` holds the whole rule, and
+                // `has_content()` (not `active()`, see its doc) is what keeps a session with
+                // nothing published on exactly the pacing it has always had. It also keeps
+                // BRONZE there, whose ink the app deliberately never publishes live.
+                let wait = ticker.capture_wait(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_millis(200),
+                    ink_paint.has_content(),
+                );
+                match frx.recv_timeout(wait) {
                     Ok((w, h, rgba, pts, pw_delay, recv_ns)) => {
                         if stall_logged {
                             log::warn!(
@@ -613,6 +773,7 @@ fn record_pipewire_owned(
                                  {stalled_secs:.0}s stall"
                             );
                         }
+                        last_frame_at = std::time::Instant::now();
                         stalled_secs = 0.0;
                         stall_logged = false;
                         // Same auto-cal lag measurement as before (now via the shared
@@ -626,7 +787,9 @@ fn record_pipewire_owned(
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        stalled_secs += 0.2;
+                        stalled_secs = std::time::Instant::now()
+                            .saturating_duration_since(last_frame_at)
+                            .as_secs_f32();
                         if stalled_secs >= STALL_WARN_SECS && !stall_logged {
                             stall_logged = true;
                             log::error!(
@@ -650,12 +813,25 @@ fn record_pipewire_owned(
                 // video tracks the screen and the auto-cal median is unchanged. A quiet
                 // channel leaves `last` alone (the CFR re-feed holds the timeline).
                 latch_freshest(&frx, &mut last, &mut all_lag_samples);
+                // DRAGON-693 (Bronze): serve the armed annotation window's snapshot request,
+                // if one is outstanding. Exactly here, and exactly once per ask: `last` is the
+                // freshest frame the recording has, and it is about to be written to the file,
+                // so what the user draws on is literally what the video is about to show. One
+                // frame copy per ARM, never per tick.
+                if peek.wanted() {
+                    peek.serve(last.0, last.1, &last.2);
+                }
                 // Feed however many video ticks the media clock owes since the
                 // last feed — 0 most cycles (paused, or not yet due), a small
                 // burst after a scheduling hiccup or a slow-arriving frame.
                 let due = ticker.due_video_ticks(std::time::Instant::now());
                 for _ in 0..due {
-                    if !write_frame(last.0, last.1, &last.2, &mut stdin) {
+                    if !write_frame(
+                        last.0,
+                        last.1,
+                        ink_paint.paint(last.0, last.1, &last.2),
+                        &mut stdin,
+                    ) {
                         stop.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -673,9 +849,8 @@ fn record_pipewire_owned(
         // drain-before-EOF, generalized) — join its control thread before
         // touching the video stdin, so the audio's true media end
         // (`final_media`) is known and every sample is queued to the writer
-        // (whose EOFs follow as it flushes; `-shortest` ends the mux at the
-        // shorter STREAM, so video EOF landing first is fine — both streams are
-        // fed to the same media end either way).
+        // (whose EOFs follow as it flushes; video EOF landing first is fine —
+        // both streams are fed to the same media end either way).
         stop.store(true, Ordering::Relaxed);
         let pump_out = pump_handle.join();
         log::info!(
@@ -694,41 +869,101 @@ fn record_pipewire_owned(
         // there, the video was extended PAST the drained audio so `-shortest`
         // couldn't cut it; here the audio (FIFOs) already closed with its own
         // true end, so the video must instead be extended to at least that same
-        // media position, so `-shortest` trims video down to audio's end rather
-        // than truncating audio.
+        // media position, and nothing may end short of it. (`-shortest` used to
+        // trim the surplus back off; DRAGON-710 removed the flag, so a tick or two
+        // of surplus video is kept instead. See `encode::command`.)
         //
         // Shared stop tail (DRAGON-161): the covering-tick writes are NON-BLOCKING
-        // now — an ffmpeg whose audio was the shorter `-shortest` stream stops
-        // draining the video pipe without closing it, so a plain blocking write of a
+        // now — with an ffmpeg that has stopped draining the video pipe without
+        // closing it (which `-shortest` used to cause, and any wedge still can), a
+        // plain blocking write of a
         // full-monitor frame could park in the kernel forever (the DRAGON-160 wedge,
-        // reproduced headlessly). A covering-write failure is BENIGN (the video is
-        // already long enough), so — unlike this path's OLD blocking loop, which set
-        // `muxer_wedged` on a covering-write failure and then DELETED the temp — it
-        // just stops the loop. Same reap + salvage decision the SCK and screencopy
-        // workers run, one implementation.
+        // reproduced headlessly). Non-blocking does NOT mean impatient: a full pipe is
+        // retried on a bounded deadline (DRAGON-711), because these writes are the only
+        // thing making the video as long as the audio. If they run out of that deadline
+        // the loop stops — unlike this path's OLD blocking loop, which set
+        // `muxer_wedged` on a covering-write failure and then DELETED the temp. Same
+        // reap + salvage decision the SCK and screencopy workers run, one implementation.
         let more = ticker.ticks_to_cover(pump_out.final_media);
-        let outcome = run_video_stop_tail(stdin, &mut child, &temp, muxer_wedged, more, |sd| {
-            write_frame(last.0, last.1, &last.2, sd)
+        let truncated = stdin.truncated();
+        let stdin = stdin.into_stdin();
+        let outcome = run_video_stop_tail(stdin, &mut child, &temp, muxer_wedged, truncated, more, |sd| {
+            write_frame(last.0, last.1, ink_paint.paint(last.0, last.1, &last.2), sd)
         });
         stop.store(true, Ordering::Relaxed); // release the PipeWire consumer thread
         let _ = pw.join();
-        outcome.map(|()| (pump_out.mic_off, pump_out.sys_off))
+        outcome.map(|()| (pump_out.mic_off, pump_out.sys_off, ticker.ticks_emitted()))
     });
 
-    let (mic_off, sys_off) = scope_result?;
+    let (mic_off, sys_off, frames_emitted) = scope_result?;
     if let Ok(mut g) = measured.lock() {
         *g = median_offset_ms(all_lag_samples);
     }
+    // DRAGON-736: a PORTAL WINDOW cast captures the toplevel's own buffer, so the ink the user
+    // drew on screen is not in the file. Read ONCE, after the stop tail, so the app has had the
+    // whole session to fill it.
+    let bake = ink.lock().ok().and_then(|mut g| g.take()).filter(|b| !b.is_empty());
+    // Unless the painter already put it there. The app publishes the plan either way and does
+    // not have to know which path ran, so the slot is drained above and simply dropped here:
+    // with the ink already in the frames, a bake would draw every stroke twice AND cost a whole
+    // re-encode.
+    //
+    // **This worker asks `painted()`, where the macOS and Windows workers ask `active()`, and
+    // the difference is load-bearing.** `active()` only says the SIZE GATE admitted the
+    // session. On those two platforms that is the same statement as "the ink is in the frames",
+    // because every session reaching their painter is also one the app publishes a live scene
+    // for. This worker also serves BRONZE (DRAGON-693), the tier for a portal window cast on a
+    // session with no layer shell, and `App::publish_live_ink` deliberately publishes NOTHING
+    // for it: its strokes are in the STREAM's own pixels, for the bake's identity mapping. So a
+    // Bronze session the gate admitted paints zero ticks, and dropping its bake on `active()`
+    // would silently cost the user the whole drawing.
+    let bake = if ink_paint.painted() > 0 {
+        if let Some(b) = &bake {
+            log::debug!(
+                "ink: {} strokes were composited onto {} captured frames, so finalize keeps \
+                 its stream copy (DRAGON-724)",
+                b.log.clips.len(),
+                ink_paint.painted()
+            );
+        }
+        None
+    } else {
+        bake
+    };
+    // DRAGON-739: the POINTER is a separate count on purpose. cosmic-comp only composites the
+    // cursor into a toplevel capture while pointer focus is on that toplevel, and an armed ink
+    // surface takes that focus, so this worker draws one itself. It has nothing to do with the
+    // bake decision above and must never join it: a session that showed only a cursor painted
+    // no ink, and dropping its bake would cost the user the drawing.
+    if ink_paint.pointed() > 0 {
+        log::debug!(
+            "ink: the pointer was drawn onto {} captured frames, because an armed annotation \
+             surface takes it out of the compositor's own window capture (DRAGON-739)",
+            ink_paint.pointed()
+        );
+    }
+    let job = bake.as_ref().map(|bake| super::finalize::InkJob {
+        bake,
+        video: (ew, eh),
+        fps: fps.max(1),
+        video_frames: frames_emitted,
+        encoder: plan.encoder_id(),
+        kbps: bitrate_kbps,
+    });
     // The intervals are already on the file's OWN media timeline (the pump's FIFO
     // output IS the final audio) — no delay shift, no segment-offset mapping.
-    super::finalize::finalize_with_intervals(&temp, out_path, &mic_off, &sys_off, is_hevc, metadata)
+    // With `job: None` this is byte-for-byte the command finalize has always built, which is
+    // what keeps an un-inked recording on this path unchanged.
+    super::finalize::finalize_with_ink(
+        &temp, out_path, &mic_off, &sys_off, is_hevc, metadata, job.as_ref(),
+    )
 }
 
 #[cfg(test)]
 mod opening_phase_tests {
-    use super::{advance_to_tick, drain_arrivals, frame_media_tick, Frame, FRAME_CHANNEL_DEPTH};
+    use super::frame_queue::{self, FrameBound, FRAME_CHANNEL_DEPTH};
+    use super::{advance_to_tick, drain_arrivals, frame_media_tick, Frame};
     use std::collections::VecDeque;
-    use std::sync::mpsc::sync_channel;
 
     /// One second in nanoseconds, so the media arithmetic below reads as media time.
     const SEC: i64 = 1_000_000_000;
@@ -822,84 +1057,123 @@ mod opening_phase_tests {
     }
 
     /// The opening's drain is a HAND-OFF, not a buffer: a frame is `w*h*4` bytes, so the
-    /// pending queue may never grow past what the capture channel itself would hold, and
-    /// what it drops is the OLDEST (most stale) content, never the newest.
+    /// pending queue is held to a bound, and what it drops is the OLDEST (most stale)
+    /// content, never the newest.
+    ///
+    /// DRAGON-713: the bound is now the phase's, not a flat eight. Under the OPENING bound a
+    /// 1s span is carried whole (which is the point: those frames are the opening ticks);
+    /// under the STEADY bound the same drain caps at the depth it always had.
     #[test]
-    fn drain_arrivals_holds_the_queue_to_the_channel_depth_and_drops_the_stalest() {
-        let (tx, rx) = sync_channel::<Frame>(64);
-        for i in 0u8..20 {
-            tx.try_send(frame_at(i, i as i64 * SEC / 30)).expect("room for 20");
-        }
-        let mut pending: VecDeque<Frame> = VecDeque::new();
-        let mut lag: Vec<i64> = Vec::new();
-        drain_arrivals(&rx, &mut pending, &mut lag);
-        assert_eq!(pending.len(), FRAME_CHANNEL_DEPTH, "capped at the channel's own depth");
-        assert_eq!(pending.front().expect("non-empty").2[0], 12, "the stalest went first");
-        assert_eq!(pending.back().expect("non-empty").2[0], 19, "the newest is always kept");
+    fn drain_arrivals_holds_the_queue_to_its_bound_and_drops_the_stalest() {
+        // 50ms apart, so every frame is its own 30fps tick and nothing coalesces.
+        let queued = |bound: FrameBound| {
+            let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::opening(30));
+            for i in 0u8..20 {
+                tx.push(frame_at(i, i as i64 * SEC / 20));
+            }
+            let mut pending: VecDeque<Frame> = VecDeque::new();
+            let mut lag: Vec<i64> = Vec::new();
+            drain_arrivals(&rx, &mut pending, &mut lag, bound);
+            pending
+        };
+        let opening = queued(FrameBound::opening(30));
+        assert_eq!(opening.len(), 20, "the opening bound carries the whole span");
+        assert_eq!(opening.back().expect("non-empty").2[0], 19);
+
+        let steady = queued(FrameBound::steady(30));
+        assert_eq!(steady.len(), FRAME_CHANNEL_DEPTH, "capped at the steady depth");
+        assert_eq!(steady.front().expect("non-empty").2[0], 12, "the stalest went first");
+        assert_eq!(steady.back().expect("non-empty").2[0], 19, "the newest is always kept");
     }
 
-    /// Every ARRIVED frame still contributes its own lag sample, exactly as `latch_freshest`
+    /// Every DRAINED frame contributes its own lag sample, exactly as `latch_freshest`
     /// credits them, including the ones the opening phase later drops for staleness. Each
     /// arrival is an independent latency observation, and `median_offset_ms` needs five of
     /// them before it will report anything at all.
     #[test]
-    fn drain_arrivals_credits_every_arrived_frames_lag_sample() {
-        let (tx, rx) = sync_channel::<Frame>(8);
+    fn drain_arrivals_credits_every_drained_frames_lag_sample() {
+        let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::opening(30));
         let now = super::monotonic_ns();
         for i in 0u8..6 {
-            // A pts ~100ms in the past gives a ~100ms sample, inside the trusted band.
-            tx.try_send((4, 4, vec![i; 4 * 4 * 4], now - 100_000_000, 0, 0)).expect("room");
+            // A pts ~100ms in the past gives a ~100ms sample, inside the trusted band. The
+            // recv stamps are 50ms apart, so these are six queue entries.
+            tx.push((4, 4, vec![i; 4 * 4 * 4], now - 100_000_000, 0, i as i64 * 50_000_000));
         }
         let mut pending: VecDeque<Frame> = VecDeque::new();
         let mut lag: Vec<i64> = Vec::new();
-        drain_arrivals(&rx, &mut pending, &mut lag);
-        assert_eq!(lag.len(), 6, "every arrival is a sample, not just the kept one");
+        drain_arrivals(&rx, &mut pending, &mut lag, FrameBound::opening(30));
+        assert_eq!(lag.len(), 6, "every drained frame is a sample, not just the kept one");
         assert!(lag.iter().all(|&m| (1..=2000).contains(&m)), "plausible latencies: {lag:?}");
+        assert_eq!(pending.len(), 6, "six distinct ticks, six entries");
+    }
+
+    /// What DRAGON-713's coalescing costs the lag measurement, stated so nobody has to
+    /// rediscover it: arrivals that share a media tick become ONE entry in the capture queue,
+    /// so the tick contributes ONE sample instead of several. That is a sample the recording
+    /// actually fed, and the ones it replaces were never going to be shown. A 30fps session
+    /// still yields ~30 samples a second against the five `median_offset_ms` needs.
+    #[test]
+    fn coalesced_arrivals_contribute_one_lag_sample_for_the_tick() {
+        let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::opening(30));
+        let now = super::monotonic_ns();
+        for i in 0u8..6 {
+            // All six inside one 30fps tick (4ms apart).
+            tx.push((4, 4, vec![i; 4 * 4 * 4], now - 100_000_000, 0, i as i64 * 4_000_000));
+        }
+        let mut pending: VecDeque<Frame> = VecDeque::new();
+        let mut lag: Vec<i64> = Vec::new();
+        drain_arrivals(&rx, &mut pending, &mut lag, FrameBound::opening(30));
+        assert_eq!(pending.len(), 1, "one media tick, one entry");
+        assert_eq!(pending[0].2[0], 5, "carrying the freshest pixels of that tick");
+        assert_eq!(lag.len(), 1, "and one sample, the kept frame's");
+        assert!(lag.iter().all(|&m| (1..=2000).contains(&m)), "plausible latency: {lag:?}");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::frame_queue::{self, FrameBound};
     use super::{latch_freshest, Frame};
-    use std::sync::mpsc::sync_channel;
 
     /// Build a PipeWire-shaped frame whose first pixel byte is `marker` (so we can tell
     /// which one was latched) and whose `pts` is 0 (so `frame_lag_ms` uses the
-    /// delay+transit form; here delay/recv are 0, giving no valid sample — kept out of the
-    /// way of the pixel-latch assertions).
+    /// delay+transit form; here delay is 0 and the recv stamp is a small number far in the
+    /// monotonic past, giving no valid sample, kept out of the way of the pixel-latch
+    /// assertions). The stamps are 50ms apart, so each frame is its own 30fps tick and the
+    /// queue holds them as separate entries rather than coalescing them.
     fn frame(marker: u8) -> Frame {
-        (4, 4, vec![marker; 4 * 4 * 4], 0, 0, 0)
+        (4, 4, vec![marker; 4 * 4 * 4], 0, 0, marker as i64 * 50_000_000)
     }
 
     /// The DRAGON-167 invariant, headless (the Linux twin of the mac SCK
     /// `latch_freshest_takes_the_newest_queued_frame`): given several frames already
-    /// queued in the bounded capture channel — as happens the moment a slow encoder
+    /// queued in the bounded capture queue, as happens the moment a slow encoder
     /// backpressures the video write and the PipeWire consumer keeps pushing — the worker
     /// MUST latch the FRESHEST one, not the oldest. A bare single-recv consumes the oldest
-    /// (the channel is FIFO), which is exactly the stale-frame feed that froze the
+    /// (the queue is FIFO), which is exactly the stale-frame feed that froze the
     /// recording. Pins the fix with no portal, PipeWire, or ffmpeg.
     #[test]
     fn latch_freshest_takes_the_newest_queued_frame() {
-        let (tx, rx) = sync_channel::<Frame>(8);
+        let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::steady(30));
         for i in 0u8..8 {
-            tx.try_send(frame(i)).expect("channel has room for 8");
+            tx.push(frame(i));
         }
         let mut last: (u32, u32, Vec<u8>) = (4, 4, vec![255u8; 4 * 4 * 4]);
         let mut lag: Vec<i64> = Vec::new();
         assert!(latch_freshest(&rx, &mut last, &mut lag), "consumed at least one frame");
         assert_eq!(last.2[0], 7, "must latch the FRESHEST (last-pushed) frame, not the oldest");
-        // Drained, so the consumer can push fresh frames again instead of hitting a full
-        // channel and dropping the newest.
-        assert!(!latch_freshest(&rx, &mut last, &mut lag), "empty channel leaves `last` untouched");
+        // Drained, so the queue is empty again rather than holding stale content the next
+        // push would have to evict.
+        assert!(!latch_freshest(&rx, &mut last, &mut lag), "an empty queue leaves `last` untouched");
         assert_eq!(last.2[0], 7, "an empty drain must not disturb the held frame");
     }
 
-    /// An empty channel (a static screen / not-yet-delivered: the PipeWire consumer sent
+    /// An empty queue (a static screen / not-yet-delivered: the PipeWire consumer sent
     /// nothing) must leave the held frame alone so the CFR loop re-feeds it — the "a tick
     /// with no fresh frame re-feeds the last" half of the contract.
     #[test]
     fn latch_freshest_holds_last_when_nothing_queued() {
-        let (_tx, rx) = sync_channel::<Frame>(8);
+        let (_tx, rx) = frame_queue::channel::<Frame>(FrameBound::steady(30));
         let mut last: (u32, u32, Vec<u8>) = (2, 2, vec![9u8; 2 * 2 * 4]);
         let mut lag: Vec<i64> = Vec::new();
         assert!(!latch_freshest(&rx, &mut last, &mut lag), "nothing to consume");
@@ -916,15 +1190,15 @@ mod tests {
     /// `frame_lag_ms` yields a valid (positive, ≤2000ms) sample for each.
     #[test]
     fn latch_freshest_credits_every_drained_frames_lag_sample() {
-        let (tx, rx) = sync_channel::<Frame>(8);
+        let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::steady(30));
         // A pts ~100ms in the past (relative to `monotonic_ns()` at drain time) yields a
         // ~100ms lag sample per frame; well inside the trusted 1..=2000ms band.
         let now = super::monotonic_ns();
         for i in 0u8..6 {
             // (w, h, rgba, pts, pw_delay, recv_ns): a valid past pts, so the lag form is
-            // `monotonic_ns() - pts` — positive and small.
-            tx.try_send((4, 4, vec![i; 4 * 4 * 4], now - 100_000_000, 0, 0))
-                .expect("room");
+            // `monotonic_ns() - pts`, positive and small. The recv stamps are 50ms apart,
+            // so these are six queue entries and not one coalesced tick.
+            tx.push((4, 4, vec![i; 4 * 4 * 4], now - 100_000_000, 0, i as i64 * 50_000_000));
         }
         let mut last: (u32, u32, Vec<u8>) = (4, 4, vec![0u8; 4 * 4 * 4]);
         let mut lag: Vec<i64> = Vec::new();
@@ -944,20 +1218,23 @@ mod tests {
 
     /// The freeze dynamic in miniature, deterministic and headless (the Linux twin of the
     /// mac SCK `draining_keeps_the_consumed_frame_recent_under_backpressure`): a producer
-    /// fills the bounded channel faster than a SLOW consumer drains it — the loaded-encoder
-    /// case where the blocking video write throttles the loop. The stale-feed bug consumed
-    /// ONE frame per iteration (the oldest), so the "video" lagged far behind the producer;
-    /// `latch_freshest` keeps the consumed frame close to the newest sent. Pins the exact
-    /// staleness the fix removes, with no portal/PipeWire/ffmpeg.
+    /// runs far ahead of a SLOW consumer: the loaded-encoder case where the video write
+    /// throttles the loop. The stale-feed bug consumed ONE frame per iteration (the oldest
+    /// surviving one), so the "video" lagged behind the producer by the whole queue depth;
+    /// `latch_freshest` consumes the newest instead. Pins the exact staleness the fix
+    /// removes, with no portal/PipeWire/ffmpeg.
+    ///
+    /// DRAGON-713 made this deterministic. It used to drive a real thread against a blocking
+    /// `SyncSender`, because the depth the consumer lagged by depended on how far a blocking
+    /// producer got. The sink never blocks now (a full queue evicts its oldest frame), so the
+    /// producer's whole burst can simply be pushed up front and the gap is exact.
     #[test]
     fn draining_keeps_the_consumed_frame_recent_under_backpressure() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
         fn seq_frame(seq: u32) -> Frame {
             let mut px = vec![0u8; 4 * 4 * 4];
             px[0..4].copy_from_slice(&seq.to_le_bytes());
-            (4, 4, px, 0, 0, 0)
+            // 50ms apart: one queue entry per frame, no coalescing.
+            (4, 4, px, 0, 0, seq as i64 * 50_000_000)
         }
         fn seq_of(f: &(u32, u32, Vec<u8>)) -> u32 {
             u32::from_le_bytes([f.2[0], f.2[1], f.2[2], f.2[3]])
@@ -965,44 +1242,37 @@ mod tests {
 
         // Run the SAME producer against two consumers: `drain=false` mimics the old
         // single-recv (consume one, oldest first); `drain=true` uses `latch_freshest`.
-        // Return the worst gap between what the producer had sent and what the consumer
-        // holds (staleness).
-        let worst_gap = |drain: bool| -> u32 {
-            let (tx, rx) = sync_channel::<Frame>(8);
-            let sent = Arc::new(AtomicU32::new(0));
-            let sent_p = sent.clone();
-            let prod = std::thread::spawn(move || {
-                for seq in 0..400u32 {
-                    if tx.send(seq_frame(seq)).is_err() {
-                        break;
-                    }
-                    sent_p.store(seq, Ordering::Relaxed);
-                }
-            });
+        // Return the gap between what the producer had sent and what the consumer holds.
+        let gap = |drain: bool| -> u32 {
+            let (tx, rx) = frame_queue::channel::<Frame>(FrameBound::steady(30));
+            for seq in 0..400u32 {
+                tx.push(seq_frame(seq));
+            }
             let mut last: (u32, u32, Vec<u8>) = (4, 4, vec![0u8; 4 * 4 * 4]);
             let mut lag: Vec<i64> = Vec::new();
-            let mut worst = 0u32;
-            for _ in 0..60 {
-                if let Ok((w, h, rgba, ..)) = rx.recv() {
-                    last = (w, h, rgba);
-                }
-                if drain {
-                    latch_freshest(&rx, &mut last, &mut lag);
-                }
-                let ahead = sent.load(Ordering::Relaxed).saturating_sub(seq_of(&last));
-                worst = worst.max(ahead);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Ok((w, h, rgba, ..)) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                last = (w, h, rgba);
             }
-            drop(rx);
-            let _ = prod.join();
-            worst
+            if drain {
+                latch_freshest(&rx, &mut last, &mut lag);
+            }
+            399 - seq_of(&last)
         };
 
-        let stale_gap = worst_gap(false);
-        let fresh_gap = worst_gap(true);
+        let stale_gap = gap(false);
+        let fresh_gap = gap(true);
+        assert_eq!(fresh_gap, 0, "draining lands on the newest frame the producer sent");
         assert!(
-            fresh_gap * 4 < stale_gap.max(1),
-            "draining should stay far fresher: fresh_gap={fresh_gap} stale_gap={stale_gap}"
+            stale_gap > 0,
+            "the single-recv consumer must be measurably behind: stale_gap={stale_gap}"
+        );
+        // And the DRAGON-713 half: even the STALE consumer is inside the queue depth of the
+        // newest frame, because the queue evicts its oldest end. The container this replaces
+        // refused the incoming frame instead, so a 400-frame burst left the consumer holding
+        // frame 0 and every later frame was discarded.
+        assert!(
+            stale_gap < super::frame_queue::FRAME_CHANNEL_DEPTH as u32,
+            "the queue holds the NEWEST eight: stale_gap={stale_gap}"
         );
     }
 }

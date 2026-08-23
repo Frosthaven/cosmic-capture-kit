@@ -87,7 +87,16 @@ pub(crate) fn record_pipewire_zero_copy(
     events: &Mutex<Vec<ToggleEvent>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     warm_at: &Mutex<Option<std::time::Instant>>,
+    media_zero_at: &Mutex<Option<std::time::Instant>>,
     settled_at: &Mutex<Option<std::time::Instant>>,
+    // DRAGON-736: the live annotation ink to composite into a PORTAL WINDOW cast, whose frames
+    // are the toplevel's own buffer and therefore carry none of our floating surfaces. This arm
+    // takes the FALLBACK BAKE and never the live painter, and that is a deliberate refusal
+    // rather than an omission: the whole point of this path is that a captured frame is a GPU
+    // dmabuf the CPU never maps, so painting onto it per tick would mean a readback, which is
+    // the very cost the path exists to avoid. See `record_pipewire_zero_copy_owned` for what
+    // the bake costs instead.
+    ink: &Mutex<Option<crate::record::ink_bake::InkBake>>,
     metadata: &str,
 ) -> ZcOutcome {
     // DRAGON-425 PRE-FLIGHT, before the stream, the audio pre-flight, the pump and media 0.
@@ -109,7 +118,7 @@ pub(crate) fn record_pipewire_zero_copy(
         PreflightNode::Use(node) => record_pipewire_zero_copy_owned(
             fd, node_id, fps, codec, max_res, start_gate, mic, system_audio, bitrate_kbps,
             audio_offset_ms, auto_device_compensation, out_path, stop, paused, events, dims,
-            warm_at, settled_at, metadata, node,
+            warm_at, media_zero_at, settled_at, ink, metadata, node,
         ),
         PreflightNode::Decline(reason) => ZcOutcome::Fallback(reason),
     }
@@ -228,18 +237,66 @@ fn set_libva_driver_for(nodes: &[(std::path::PathBuf, String)], node: &std::path
 /// same media-time invariant the pump's clock also converges to, with no extra
 /// reconciliation math needed.
 ///
-/// Residual A/V length mismatch: unlike the CPU owned paths (which can duplicate
-/// their last raw frame to cover any gap — see `pump::VideoTicker::ticks_to_cover`),
-/// a `DmabufFrame` is only valid for the duration of its callback (its planes
-/// reference a compositor-owned buffer that may be reused/recycled the instant the
-/// callback returns — see [`crate::platform::pipewire::consume_dmabuf`]'s doc), so
-/// it cannot be retained and re-submitted at stop to pad the video's end. The video
-/// elementary stream may therefore end up to one PipeWire frame-delivery interval
-/// short of the audio's measured media length; `-shortest` trims the mux to
-/// whichever stream is shorter, so this reads as an early cut of AT MOST one frame
-/// period, never a desync. (Contrast `record_screencopy_zero_copy_owned`, which
-/// keeps a small pool of its OWN dmabuf targets alive for the whole session and can
-/// re-submit the pool's last-used target to close this exact gap.)
+/// ## How this path covers its video (DRAGON-715)
+///
+/// Every worker satisfies the DRAGON-78 rule, video ends at or after the audio's media
+/// end, by covering the tail: the CPU owned paths duplicate their last raw frame
+/// (`pump::VideoTicker::ticks_to_cover`), and the screencopy zero-copy sibling
+/// ([`record_screencopy_zero_copy_owned`]) re-submits its own pool's last-used dmabuf
+/// target. This one could not, and was the ONE place in the tree where that rule was
+/// broken: a `DmabufFrame` is valid only for the duration of its callback, since its
+/// planes reference a compositor-owned buffer that may be reused the instant the
+/// callback returns (see [`crate::platform::pipewire::consume_dmabuf`]'s doc), so at
+/// stop there was nothing left to re-submit.
+///
+/// The encoder keeps one now. `Encoder::new` is opened with
+/// [`crate::encode::gpu::LastFrame::Retain`], which keeps an owned GPU-side copy of the
+/// last frame it encoded, and the stop tail re-encodes it for as many 1/fps ticks as the
+/// media clock says the video owes the audio ([`trailing_frames_needed`], the SAME
+/// arithmetic the sibling and the CPU workers use, plus [`may_cover_pipewire_tail`] for
+/// whether to run it at all). There is still no CPU readback anywhere: the copy is a GPU
+/// VPP pass, free when the session is already downscaling and a dedicated retain pass
+/// when it is not. Read `encode::gpu`'s module doc for how that surface is kept and what
+/// it costs, including what VAAPI VPP does to a pass that looks like a no-op.
+///
+/// Two of the three things that feed the gap are therefore closed, and the third is not:
+///
+/// 1. The warmup gap: frames delivered while the audio pre-flight and the encoder build
+///    are still running are dropped and counted (`dropped_warmup`, logged at stop). "Two
+///    threads" below names this as a constant lead. The covering ticks pay for its
+///    LENGTH at the end of the file.
+/// 2. Cumulative under-delivery: `consume_dmabuf` never requests a framerate, the
+///    compositor picks it, and this side has no video ticker, so `frames` counts only
+///    what actually arrived. The muxer index-stamps at `-r fps`, so the video's length IS
+///    `frames / fps`. The covering ticks make the TOTAL length right, and cannot make the
+///    PLACEMENT right: a session that under-delivered in the middle still has its middle
+///    time-compressed, with the repeats landing at the end. A video ticker on this path
+///    is what would fix that, and it is the honest next step here.
+/// 3. The stop residual proper, up to one PipeWire frame-delivery interval: closed.
+///
+/// The residual log at stop reports what actually happened, and WARNS when the video
+/// still ends short after covering. It said "informational only; `-shortest` already
+/// makes it safe" until DRAGON-715, which was wrong twice over, so do not restore it:
+///
+/// * The flag left THIS builder in DRAGON-457, which removed it because it was
+///   destroying audio rather than trimming video. On a `-c:v copy` input beside two AAC
+///   encoders, ffmpeg's sync queue discarded every audio packet and delivered a
+///   playable, correctly sized, MUTE file (the packet counts are kept at
+///   `encode::command`'s `build_media_clock_encoded_command`). It never trimmed video
+///   here at all. DRAGON-710 later removed it from the raw-frame builder too, for its
+///   own separate reason, so no builder in the tree carries it now.
+/// * "At most one frame period" was only ever contributor 3. Contributor 1 is unmeasured
+///   here but was 370ms (macOS) to 830ms (Windows) on the sibling platforms, and
+///   contributor 2 had no structural bound at all.
+///
+/// Dead ends already reasoned through, so nobody re-runs them. Re-sending the last
+/// ENCODED packet's bytes is not standards-clean: a duplicated coded picture repeats
+/// `frame_num` and POC, and a P picture re-applies its residual against a different
+/// reference. `dup()`ing the plane fds stops the buffer being FREED but not being
+/// RECYCLED and overwritten, which is the hazard above, so it buys nothing. Holding the
+/// PipeWire buffer itself instead of re-queueing it would work and needs no copy at all,
+/// but pipewire-rs ties the `Buffer` lifetime to the stream borrow inside the process
+/// callback, so it is a much larger change than retaining one encoder surface.
 ///
 /// ## Two threads, and why (DRAGON-658)
 ///
@@ -260,8 +317,12 @@ fn set_libva_driver_for(nodes: &[(std::path::PathBuf, String)], node: &std::path
 /// already had and already documents: the video stream carries nothing for the warmup
 /// span, so the content after it leads the audio by that much. Before the reordering the
 /// gap was the stream connect + negotiate + encoder build (which sat after media 0);
-/// now it is the audio pre-flight + encoder build. Same constant lead, different cause,
-/// and `-shortest` still keeps both streams the same length.
+/// now it is the audio pre-flight + encoder build. Same constant lead, different cause.
+/// It said "and `-shortest` still keeps both streams the same length" until DRAGON-715;
+/// that flag had already left this builder in DRAGON-457. This span is contributor 1 of
+/// the residual documented above: the stop tail's covering ticks now pay for its length,
+/// so the file is no longer SHORT because of it, but the lead is still real. The frames
+/// dropped here are frames the file does not contain.
 ///
 /// ## The muxer is spawned LAZILY, and what that costs (DRAGON-422)
 ///
@@ -297,7 +358,11 @@ fn record_pipewire_zero_copy_owned(
     events: &Mutex<Vec<ToggleEvent>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     warm_at: &Mutex<Option<std::time::Instant>>,
+    media_zero_at: &Mutex<Option<std::time::Instant>>,
     settled_at: &Mutex<Option<std::time::Instant>>,
+    // DRAGON-736: the fallback ink bake; see `record_pipewire_zero_copy` for why this arm
+    // takes only the bake and never the live painter.
+    ink: &Mutex<Option<crate::record::ink_bake::InkBake>>,
     metadata: &str,
     // DRAGON-425: chosen by `preflight_vaapi_node` before the stream was touched, so a box
     // where zero-copy cannot work never reaches this function at all.
@@ -325,8 +390,15 @@ fn record_pipewire_zero_copy_owned(
         child: Option<std::process::Child>,
         watchdog: Option<super::MuxerWatchdog>,
         tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
-        writer: Option<std::thread::JoinHandle<()>>,
+        /// The muxer-writer thread, which HANDS BACK ffmpeg's stdin when the channel
+        /// closes so the stop tail can write its covering ticks through the shared
+        /// patient writer (DRAGON-715).
+        writer: Option<std::thread::JoinHandle<std::process::ChildStdin>>,
         is_hevc: bool,
+        /// The ENCODE size, which is what the fallback ink bake rasterizes its overlay at
+        /// (DRAGON-736). Fixed once, in `start_encoding`, from the first frame and the
+        /// resolution cap; zero until then, which is exactly when there is no bake to feed.
+        enc_size: (u32, u32),
         frames: u64,
         /// Frames the stream delivered while the session was still warming up (the audio
         /// pre-flight and the encoder build), which there was nothing to encode with.
@@ -361,8 +433,20 @@ fn record_pipewire_zero_copy_owned(
         };
         // Cross-vendor import is exactly what the CPU readback path exists for, and
         // nothing has been encoded: a decline.
+        //
+        // `LastFrame::Retain` (DRAGON-715) is what lets the stop tail below cover the
+        // audio at all: a portal dmabuf dies with its callback, so the encoder keeping an
+        // owned copy of the last frame is the only thing left to re-encode by then.
         let enc = crate::encode::gpu::Encoder::new(
-            &z.node, hevc, first.width, first.height, dw, dh, z.fps, z.bitrate,
+            &z.node,
+            hevc,
+            first.width,
+            first.height,
+            dw,
+            dh,
+            z.fps,
+            z.bitrate,
+            crate::encode::gpu::LastFrame::Retain,
         )
         .map_err(|e| (true, format!("encoder init: {e}")))?;
         // ffmpeg itself, not the GPU path: the CPU path would meet the same failure
@@ -374,12 +458,18 @@ fn record_pipewire_zero_copy_owned(
             return Err((false, "muxer stdin unavailable".to_string()));
         };
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // Hands ffmpeg's stdin BACK when the channel closes (DRAGON-715). The stop tail
+        // needs it: its covering writes go through the shared non-blocking + patient
+        // `owned::CoveringWriter`, and this thread's plain blocking `write_all` is
+        // neither. Dropping this handle is still what delivers the muxer's EOF, it just
+        // happens one step later, on the session thread.
         let writer = std::thread::spawn(move || {
             while let Ok(bytes) = rx.recv() {
                 if stdin.write_all(&bytes).is_err() {
                     break;
                 }
             }
+            stdin
         });
         // Armed BEFORE the muxer can be handed any bytes: a startup scheduler wedge
         // (DRAGON-118/123) never reads stdin, and the pause gate matches the CPU owned
@@ -390,6 +480,7 @@ fn record_pipewire_zero_copy_owned(
         z.writer = Some(writer);
         z.child = Some(child);
         z.is_hevc = hevc;
+        z.enc_size = (dw, dh);
         z.enc = Some(enc); // LAST: this is the ready flag
         Ok(())
     }
@@ -413,6 +504,7 @@ fn record_pipewire_zero_copy_owned(
         tx: None,
         writer: None,
         is_hevc: false,
+        enc_size: (0, 0),
         frames: 0,
         dropped_warmup: 0,
         error: None,
@@ -646,11 +738,12 @@ fn record_pipewire_zero_copy_owned(
         sys_on0: system_audio,
         duck_system: crate::audio::config::recording_duck_system(),
     };
-    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
-    // the warming spinner clears, which is the same instant the user is told recording
-    // started. See `owned::media_zero` for the whole argument.
-    let session_start =
-        super::owned::media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672), and the slot below is how
+    // the UI learns it (DRAGON-725): the spinner does NOT clear here, the opening phase
+    // still follows. See `owned::media_zero` for the whole argument.
+    let session_start = super::owned::media_zero(
+        media_zero_at, capture_start, start_gate.as_deref(), &mic_rx, &sys_rx,
+    );
 
     // The pump thread borrows `events`/`stop`/`paused` for its own lifetime (see
     // `pump::spawn`'s doc) — `std::thread::scope` is what makes that sound, exactly
@@ -658,7 +751,7 @@ fn record_pipewire_zero_copy_owned(
     /// One channel's mute intervals plus the session's frame/codec facts — named
     /// so the `std::thread::scope` return type below doesn't trip clippy's
     /// `type_complexity` (mirrors `pipewire::MuteIntervals`'s same reason).
-    type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>, u64, bool);
+    type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>, u64, bool, (u32, u32));
     /// A failed session, and whether it is a zero-copy decline the caller may still
     /// cover with the CPU path (`true`) or this recording's own failure (`false`) —
     /// the scope's error half of the [`ZcOutcome`] split.
@@ -695,7 +788,7 @@ fn record_pipewire_zero_copy_owned(
                 // and the muxer exist, the session is READY, and the capture callback stops
                 // dropping what arrives. Everything the UI's live declaration is waiting on
                 // has happened, and nothing further is bring-up.
-                super::owned::mark_settled(settled_at, std::time::Instant::now());
+                super::owned::mark_settled(settled_at, std::time::Instant::now(), session_start);
             }
 
             // The capture thread runs the session from here; it returns once `zc_stop` is
@@ -721,19 +814,7 @@ fn record_pipewire_zero_copy_owned(
                 pump_out.sys_stats.gap_samples,
             );
 
-            // Log the residual A/V length gap this model can't close (see the fn
-            // doc) — informational only; `-shortest` already makes it safe.
             let mut z = lock(&sess);
-            let covered = z.frames as f64 / z.fps.max(1) as f64;
-            let residual = pump_out.final_media - covered;
-            if residual > 0.0 {
-                log::info!(
-                    "zero-copy owned session: video covers {covered:.3}s vs audio media \
-                     {:.3}s (residual {residual:.3}s, expected ≤ ~1/{} frame period plus the \
-                     warmup gap, see record_pipewire_zero_copy_owned's doc)",
-                    pump_out.final_media, z.fps.max(1),
-                );
-            }
             if z.dropped_warmup > 0 {
                 log::info!(
                     "zero-copy owned session: {} frame(s) arrived while the session was still \
@@ -743,22 +824,102 @@ fn record_pipewire_zero_copy_owned(
                 );
             }
 
-            // Drain the encoder's tail through the writer queue, close the
-            // channel (writer flushes + drops stdin → muxer EOF), join the
-            // writer, reap the muxer.
-            if let Some(mut enc) = z.enc.take()
-                && let (Ok(tail), Some(tx)) = (enc.finish(), z.tx.as_ref())
-            {
-                let _ = tx.send(tail);
-            }
+            // THE STOP TAIL (DRAGON-715). Until this ticket this path drained the encoder,
+            // closed the pipe and left the video wherever the compositor's last delivery
+            // had put it, which is the one place in the tree where the DRAGON-78 rule was
+            // broken. It now covers the gap the same way every other worker does: the
+            // media clock says how many 1/fps ticks the video still owes the audio
+            // (`trailing_frames_needed`, shared with the screencopy sibling), and the
+            // encoder re-encodes its RETAINED last frame that many times. The capture
+            // thread was joined above, so no real frame can interleave with these.
+            let fps = z.fps.max(1);
+            let owed = trailing_frames_needed(z.frames, fps, pump_out.final_media);
+            let wedged = z.watchdog.as_ref().is_some_and(|w| w.fired());
+            let mut enc = z.enc.take();
+            let cover = may_cover_pipewire_tail(
+                z.frames,
+                enc.as_ref().is_some_and(|e| e.can_repeat_last_frame()),
+                wedged,
+            );
+
+            // Take ffmpeg's stdin back off the writer thread: dropping the sender ends its
+            // `recv` loop and it returns the handle. From here the covering writes and the
+            // encoder flush are OURS, non-blocking and patient (DRAGON-711), instead of
+            // that thread's plain blocking `write_all`.
             z.tx = None;
-            if let Some(w) = z.writer.take() {
-                let _ = w.join();
+            let mut stdin = z.writer.take().and_then(|w| w.join().ok());
+
+            let mut written = 0u64;
+            if let (Some(enc), Some(pipe)) = (enc.as_mut(), stdin.as_mut()) {
+                // DRAGON-160/711, as the screencopy sibling states it: a blocking write
+                // into an ffmpeg that stopped draining without closing parks in the kernel
+                // forever, so the pipe goes non-blocking; and a FULL pipe is not a DEAD
+                // one, so a full pipe is retried against ONE deadline for the whole phase.
+                let _nb = super::owned::NonblockingStdin::new(pipe);
+                let deadline = std::time::Instant::now() + super::owned::COVERING_WRITE_BUDGET;
+                let mut sink = super::owned::CoveringWriter::new(pipe, deadline);
+                if cover {
+                    for _ in 0..owed {
+                        match enc.encode_retained() {
+                            Ok(bytes) => {
+                                if !bytes.is_empty() && sink.write_all(&bytes).is_err() {
+                                    log::warn!(
+                                        "zero-copy owned session: a covering write failed \
+                                         (full ffmpeg stdin past the {:?} deadline, or a \
+                                         closed pipe); the video stream may end slightly \
+                                         short of the audio",
+                                        super::owned::COVERING_WRITE_BUDGET
+                                    );
+                                    break;
+                                }
+                                written += 1;
+                            }
+                            Err(e) => {
+                                log::warn!("zero-copy owned session: covering encode failed ({e})");
+                                break;
+                            }
+                        }
+                    }
+                }
+                // The encoder's own tail, last, on the same patient writer.
+                if !wedged
+                    && let Ok(tail) = enc.finish()
+                {
+                    let _ = sink.write_all(&tail);
+                }
+            }
+            drop(enc);
+            drop(stdin); // EOF -> ffmpeg flushes and exits
+            z.frames += written;
+
+            // The honest residual, AFTER covering. It said "informational only;
+            // `-shortest` already makes it safe" until DRAGON-715, which was wrong twice
+            // over (no builder carries that flag, and nothing downstream trims). A gap
+            // that survives the covering ticks is a defect, not a note, so it warns.
+            let covered_s = z.frames as f64 / fps as f64;
+            let residual = pump_out.final_media - covered_s;
+            log::info!(
+                "zero-copy owned session: video covers {covered_s:.3}s vs audio media {:.3}s \
+                 (residual {residual:.3}s; {written} of {owed} owed covering tick(s) written)",
+                pump_out.final_media,
+            );
+            if residual > 1.0 / fps as f64 {
+                log::warn!(
+                    "zero-copy owned session: the video stream ends {residual:.3}s short of the \
+                     audio ({written} of {owed} covering tick(s) written{}); the DRAGON-78 rule \
+                     is not met for this recording",
+                    if cover { "" } else { ", covering was skipped" }
+                );
             }
             z.watchdog = None;
-            let wait_result = z.child.take().map(|mut c| super::wait_or_kill(&mut c, std::time::Duration::from_secs(30)));
+            // The NAMED reap, not a 30s literal: this path now spends a covering budget
+            // before it, and `owned`'s compile-time assert is what keeps their sum inside
+            // `progress::SESSION_STALL_SECS`. A literal here could drift out from under it.
+            let wait_result =
+                z.child.take().map(|mut c| super::wait_or_kill(&mut c, super::owned::STOP_TAIL_REAP));
             let frames = z.frames;
             let is_hevc = z.is_hevc;
+            let enc_size = z.enc_size;
             let error = z.error.take();
             drop(z);
 
@@ -804,17 +965,71 @@ fn record_pipewire_zero_copy_owned(
                     }
                 }
             }
-            Ok((pump_out.mic_off, pump_out.sys_off, frames, is_hevc))
+            Ok((pump_out.mic_off, pump_out.sys_off, frames, is_hevc, enc_size))
         });
 
-    let (mic_off, sys_off, frames, is_hevc) = match scope_result {
+    let (mic_off, sys_off, frames, is_hevc, enc_size) = match scope_result {
         Ok(v) => v,
-        Err((true, e)) => return ZcOutcome::Fallback(e),
+        // THE ONE fallback on this arm that can be reached AFTER `media_zero` filled the
+        // slot the UI counts from, and it is the mapping rather than any single `return`
+        // because FOUR of the scope's errors arrive here: the pump spawn failure, the
+        // capture thread dying with nothing encoded, a live encode error with nothing
+        // encoded, and a session that simply produced no frames. The last three ran the
+        // whole session first, so their over-count is the attempt's entire duration and not
+        // a bring-up. Retract this attempt's marks before the CPU worker publishes its own
+        // (DRAGON-730); `owned::retract_bring_up` carries the reasoning and names the half
+        // of the fix that lives in `app::recording::warm_adoption`.
+        Err((true, e)) => {
+            super::owned::retract_bring_up(media_zero_at, settled_at);
+            return ZcOutcome::Fallback(e);
+        }
         Err((false, e)) => return ZcOutcome::Done(Err(e)),
     };
-    let _ = frames;
-    ZcOutcome::Done(super::finalize::finalize_with_intervals(
-        &temp, out_path, &mic_off, &sys_off, is_hevc, metadata,
+    // DRAGON-736: a PORTAL WINDOW cast delivers the toplevel's OWN buffer, so the ink the user
+    // drew on screen is not in the file, and on THIS arm the only way to put it there is the
+    // retained finalize bake.
+    //
+    // **The live painter is refused here on purpose, and the refusal is the whole point of the
+    // arm.** Every captured frame on this path is a GPU dmabuf that goes straight into VAAPI;
+    // the CPU never maps one. `ink_live::LiveInkPainter` composites into CPU bytes, so putting
+    // it here would mean a per-tick readback, which is precisely the cost zero-copy exists to
+    // avoid. That would trade a working feature for a broken one, so the bake stays.
+    //
+    // What the bake costs instead is one whole video re-encode at finalize (a filtered stream
+    // cannot be stream-copied), which DRAGON-716 measured at 22.1s for a two minute 1080p take
+    // in software. It is paid only by a session that actually drew something: with `job: None`
+    // this is byte-for-byte the command this path has always built.
+    //
+    // The encoder id is `vaapi` because that is honestly what encoded the recording
+    // (`encode::gpu::Encoder` opens `h264_vaapi` / `hevc_vaapi`; NVENC lives on the SCREENCOPY
+    // zero-copy arm, not this one). `finalize::ink_hw_video_args` has no VAAPI arm by design,
+    // so this lands on the software re-encode, which is the documented safe fallback rather
+    // than an accident.
+    let bake = ink.lock().ok().and_then(|mut g| g.take()).filter(|b| !b.is_empty());
+    // A zero encode size means the encoder was never built, which by here also means no frame
+    // was ever encoded and the returns above have already fired. Belt and braces anyway: the
+    // overlay input's `-s WxH` would be nonsense and would fail the whole finalize, so a
+    // recording with a drawing is delivered without it rather than not delivered.
+    let job = bake
+        .as_ref()
+        .filter(|_| enc_size.0 > 0 && enc_size.1 > 0)
+        .map(|bake| super::finalize::InkJob {
+            bake,
+            video: enc_size,
+            fps: fps.max(1),
+            video_frames: frames,
+            encoder: "vaapi",
+            kbps: bitrate_kbps,
+        });
+    if job.is_some() {
+        log::info!(
+            "ink: this recording is GPU zero-copy, so its {} strokes are composited in the \
+             finalize pass rather than onto the captured frames (DRAGON-736)",
+            bake.as_ref().map_or(0, |b| b.log.clips.len())
+        );
+    }
+    ZcOutcome::Done(super::finalize::finalize_with_ink(
+        &temp, out_path, &mic_off, &sys_off, is_hevc, metadata, job.as_ref(),
     ))
 }
 
@@ -1043,8 +1258,20 @@ impl ZcEncoder {
             );
             return Ok(ZcEncoder::Nvenc { enc, imports: std::collections::HashMap::new(), ew, eh, seen: 0 });
         }
-        crate::encode::gpu::Encoder::new(node, hevc, cw, ch, ew, eh, fps, bitrate_kbps)
-            .map(ZcEncoder::Vaapi)
+        // `LastFrame::Discard`: this session covers its stop tail by re-submitting a
+        // target out of its OWN dmabuf pool, so a retained copy would be pure cost.
+        crate::encode::gpu::Encoder::new(
+            node,
+            hevc,
+            cw,
+            ch,
+            ew,
+            eh,
+            fps,
+            bitrate_kbps,
+            crate::encode::gpu::LastFrame::Discard,
+        )
+        .map(ZcEncoder::Vaapi)
     }
 
     /// Encode one captured frame from `target`, returning the compressed bytes.
@@ -1424,17 +1651,44 @@ const ZC_POOL: usize = 3;
 #[cfg(feature = "zero-copy")]
 const MIRROR_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How many extra `1/fps` frames [`record_screencopy_zero_copy_owned`] must
-/// re-submit so `frames_encoded` (at `fps`) covers AT LEAST `final_media` seconds —
-/// the dmabuf-frame analogue of `pump::VideoTicker::ticks_to_cover`, factored out
-/// as a pure function so the rounding (never fewer than needed, no over-counting
-/// what's already encoded) is unit-tested without a live GPU encoder. Rounds UP;
-/// never negative (already-sufficient coverage needs zero extra frames).
+/// How many extra `1/fps` frames a zero-copy stop tail must re-submit so
+/// `frames_encoded` (at `fps`) covers AT LEAST `final_media` seconds, the dmabuf-frame
+/// analogue of `pump::VideoTicker::ticks_to_cover`, factored out as a pure function so
+/// the rounding (never fewer than needed, no over-counting what's already encoded) is
+/// unit-tested without a live GPU encoder. Rounds UP; never negative
+/// (already-sufficient coverage needs zero extra frames).
+///
+/// Pure, unit-tested, and shared by BOTH zero-copy workers since DRAGON-715:
+/// [`record_screencopy_zero_copy_owned`] re-submits a target from its own dmabuf pool,
+/// [`record_pipewire_zero_copy_owned`] re-encodes the surface its encoder retained. The
+/// arithmetic is the same one every other worker uses, which is the point: what a
+/// recording owes its audio must not depend on which worker produced it.
 #[cfg(feature = "zero-copy")]
 fn trailing_frames_needed(frames_encoded: u64, fps: u32, final_media: f64) -> u64 {
     let covered = frames_encoded as f64 / fps.max(1) as f64;
     let needed = (final_media - covered).max(0.0);
     (needed * fps.max(1) as f64).ceil() as u64
+}
+
+/// Pure and unit-tested (DRAGON-715): may [`record_pipewire_zero_copy_owned`]'s stop tail
+/// emit covering video ticks at all?
+///
+/// Three conditions, and each one is a different kind of "no":
+///
+/// * `frames_encoded == 0`: nothing was ever encoded, so there is no session to pad and
+///   the caller is about to decline to the CPU path anyway. Padding an empty video stream
+///   with a frame that does not exist is not a recovery.
+/// * `can_repeat`: the encoder has an owned copy of its last frame
+///   (`gpu::Encoder::can_repeat_last_frame`). It says no when retention was never asked
+///   for, when the retain pass could not be built, or when the filter handed its own input
+///   back, all of which leave the ONLY thing we could re-encode owned by the compositor,
+///   whose buffer contents are gone.
+/// * `muxer_wedged`: the liveness watchdog already killed ffmpeg. Encoding frames for a
+///   dead muxer costs the whole covering budget and delivers nothing; the salvage path
+///   downstream is what saves that recording.
+#[cfg(feature = "zero-copy")]
+fn may_cover_pipewire_tail(frames_encoded: u64, can_repeat: bool, muxer_wedged: bool) -> bool {
+    frames_encoded > 0 && can_repeat && !muxer_wedged
 }
 
 /// Record a FULL output (monitor mode) with GPU zero-copy: the compositor copies
@@ -1494,6 +1748,7 @@ pub(crate) fn record_screencopy_zero_copy(
     events: &Mutex<Vec<ToggleEvent>>,
     dims: &Mutex<Option<(u32, u32)>>,
     warm_at: &Mutex<Option<std::time::Instant>>,
+    media_zero_at: &Mutex<Option<std::time::Instant>>,
     settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
 ) -> ZcOutcome {
@@ -1513,7 +1768,8 @@ pub(crate) fn record_screencopy_zero_copy(
             log::info!("screencopy zero-copy pipeline: media-clock owned path (DRAGON-127)");
             record_screencopy_zero_copy_owned(
                 conn, queue, data, qh, session, start_gate, mic, system_audio, audio_offset_ms,
-                auto_device_compensation, out_path, stop, paused, events, settled_at, metadata,
+                auto_device_compensation, out_path, stop, paused, events, media_zero_at,
+                settled_at, metadata,
                 confirmed, owned,
             )
         }
@@ -1639,11 +1895,15 @@ fn confirm_screencopy_zero_copy(
 /// BEFORE media 0 and the next one only after the pre-flight and the muxer spawn, so the
 /// video stream carries no frame for the pre-flight's span and the content after it leads
 /// the audio by that much. This is the same constant lead the path had before the
-/// reordering (where the whole GPU bring-up sat AFTER media 0 instead), not a new one, and
-/// `-shortest` plus the trailing coverage below still keep the two streams the same
-/// length. Covering the span properly would mean an opening burst of re-encoded copies of
-/// the confirmed frame, the dmabuf analogue of the RGBA workers' opening phase; that is
-/// deliberately NOT done here (DRAGON-658 kept its scope to the ordering).
+/// reordering (where the whole GPU bring-up sat AFTER media 0 instead), not a new one.
+/// The trailing coverage below is what keeps the two streams the same length at the END,
+/// and it has never depended on `-shortest`: that flag left this builder in DRAGON-457
+/// and this line credited it anyway until DRAGON-715 (see
+/// [`record_pipewire_zero_copy_owned`]'s doc for what it actually did here). The OPENING
+/// lead is a separate thing and is still not covered: covering the span properly would
+/// mean an opening burst of re-encoded copies of the confirmed frame, the dmabuf analogue
+/// of the RGBA workers' opening phase; that is deliberately NOT done here (DRAGON-658
+/// kept its scope to the ordering).
 ///
 /// With no such phase to end, DRAGON-661's `settled_at` reports at the first write below,
 /// where the confirmed frame reaches the muxer and the steady grab loop takes over. That is
@@ -1669,6 +1929,7 @@ fn record_screencopy_zero_copy_owned(
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
+    media_zero_at: &Mutex<Option<std::time::Instant>>,
     settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
     confirmed: ZcConfirmed,
@@ -1722,11 +1983,12 @@ fn record_screencopy_zero_copy_owned(
         sys_on0: system_audio,
         duck_system: crate::audio::config::recording_duck_system(),
     };
-    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
-    // the warming spinner clears, which is the same instant the user is told recording
-    // started. See `owned::media_zero` for the whole argument.
-    let session_start =
-        super::owned::media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672), and the slot below is how
+    // the UI learns it (DRAGON-725): the spinner does NOT clear here, the opening phase
+    // still follows. See `owned::media_zero` for the whole argument.
+    let session_start = super::owned::media_zero(
+        media_zero_at, capture_start, start_gate.as_deref(), &mic_rx, &sys_rx,
+    );
     // The confirm used pool index 0, so the steady loop picks up from the next one.
     let mut last_idx: usize = next_idx;
 
@@ -1764,7 +2026,7 @@ fn record_screencopy_zero_copy_owned(
             // UI's live declaration is waiting on has happened. Inside the `opening_ok` test
             // for the same reason as every other worker: a muxer that would not take the
             // first write is dying, not settling.
-            super::owned::mark_settled(settled_at, std::time::Instant::now());
+            super::owned::mark_settled(settled_at, std::time::Instant::now(), session_start);
             'grab: loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -1859,22 +2121,39 @@ fn record_screencopy_zero_copy_owned(
         //
         // The trailing-coverage + `enc.finish()` writes go through a scoped
         // NON-BLOCKING stdin (DRAGON-161, the shared `owned::NonblockingStdin`): an
-        // ffmpeg whose audio was the shorter `-shortest` stream stops draining the
-        // video pipe without closing it, so a blocking write here could park forever
-        // (the DRAGON-160 wedge — reachable here too, GPU-encoded packets and all).
-        // A covering-write failure is BENIGN (the video is already long enough), so
-        // it just stops the loop and NO LONGER marks the muxer wedged (matching the
-        // RGBA owned workers); the bounded reap + shared salvage decision below then
-        // finalize the sound temp instead of deleting the user's recording.
+        // ffmpeg that has stopped draining the video pipe without closing it leaves a
+        // blocking write here parked forever (the DRAGON-160 wedge, reachable here too,
+        // GPU-encoded packets and all). This named `-shortest` as the cause until
+        // DRAGON-715; that flag left this builder in DRAGON-457, and DRAGON-712 then
+        // measured the jam happening with the flag and without it alike, so the guard is
+        // needed for the wedge itself and never depended on the flag.
+        // A failure no longer marks the muxer wedged (matching the RGBA owned workers);
+        // the bounded reap + shared salvage decision below then finalize the sound temp
+        // instead of deleting the user's recording.
+        //
+        // DRAGON-711: on top of that guard, every one of these writes goes through the
+        // shared `owned::CoveringWriter`, which retries a FULL pipe until one deadline
+        // shared by the whole phase. Giving up on the first `EAGAIN` is what left the
+        // video short of the audio on the RGBA workers, and the same first-`EAGAIN`
+        // `break` was here — for smaller writes (encoded packets, not raw frames), so it
+        // took a busier pipe to hit, but for the same reason and with the same result.
         {
             let _nb = super::owned::NonblockingStdin::new(&stdin);
+            let deadline = std::time::Instant::now() + super::owned::COVERING_WRITE_BUDGET;
+            let mut sink = super::owned::CoveringWriter::new(&mut stdin, deadline);
             if !muxer_wedged && frames > 0 {
                 let extra = trailing_frames_needed(frames, fps, pump_out.final_media);
                 let last_target = &targets[last_idx.wrapping_sub(1) % ZC_POOL];
                 for _ in 0..extra {
                     match enc.encode(last_target) {
                         Ok(bytes) => {
-                            if !bytes.is_empty() && stdin.write_all(&bytes).is_err() {
+                            if !bytes.is_empty() && sink.write_all(&bytes).is_err() {
+                                log::warn!(
+                                    "zero-copy owned session: a trailing coverage write failed \
+                                     (full ffmpeg stdin past the {:?} deadline, or a closed \
+                                     pipe); the video stream may end slightly short of the audio",
+                                    super::owned::COVERING_WRITE_BUDGET
+                                );
                                 break;
                             }
                             frames += 1;
@@ -1892,14 +2171,14 @@ fn record_screencopy_zero_copy_owned(
             if !muxer_wedged
                 && let Ok(tail) = enc.finish()
             {
-                let _ = stdin.write_all(&tail);
+                let _ = sink.write_all(&tail);
             }
         }
         drop(stdin); // EOF -> ffmpeg flushes and exits
         if muxer_wedged {
             let _ = child.kill();
         }
-        let wait_result = super::wait_or_kill(&mut child, std::time::Duration::from_secs(30));
+        let wait_result = super::wait_or_kill(&mut child, super::owned::STOP_TAIL_REAP);
 
         if frames == 0 {
             let _ = std::fs::remove_file(&temp);
@@ -1960,5 +2239,34 @@ mod tests {
         // Nothing encoded yet, but the session still measured some media length —
         // covers the whole thing from frame 0.
         assert_eq!(trailing_frames_needed(0, 30, 1.0), 30);
+    }
+
+    /// The whole point of DRAGON-715: an ordinary PipeWire zero-copy session, with
+    /// frames encoded and a retained surface to repeat, covers its tail.
+    #[test]
+    fn a_healthy_pipewire_session_covers_its_tail() {
+        assert!(may_cover_pipewire_tail(900, true, false));
+    }
+
+    /// Nothing encoded means there is no session to pad: the caller declines to the
+    /// CPU path instead, and a video stream of nothing but repeats is not a recovery.
+    #[test]
+    fn no_frames_means_no_covering() {
+        assert!(!may_cover_pipewire_tail(0, true, false));
+    }
+
+    /// Without a retained surface the only thing left to re-encode belongs to the
+    /// compositor, whose buffer contents are gone. This is the pre-DRAGON-715 world,
+    /// and it stays reachable whenever the retain pass could not be built.
+    #[test]
+    fn no_retained_frame_means_no_covering() {
+        assert!(!may_cover_pipewire_tail(900, false, false));
+    }
+
+    /// A killed muxer takes nothing more: covering it would spend the whole write
+    /// budget for nothing, and the salvage path is what saves that recording.
+    #[test]
+    fn a_wedged_muxer_is_never_covered() {
+        assert!(!may_cover_pipewire_tail(900, true, true));
     }
 }
