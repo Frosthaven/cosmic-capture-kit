@@ -48,6 +48,80 @@ impl App {
         true
     }
 
+    /// macOS: keep the picker hotkeys in step with the session. The effectful half of
+    /// [`picker_key_phase`]: it reads the state, and `platform::mac::picker_keys::sync`
+    /// adds the activation gate's two terms and registers or releases. Called after every
+    /// message (`Application::update`).
+    #[cfg(target_os = "macos")]
+    pub(in crate::app) fn sync_picker_keys(&self) {
+        let phase = picker_key_phase(
+            /* overlay_up */ !self.outputs.is_empty(),
+            /* countdown */ self.countdown.is_some(),
+            /* recording_or_grab */ self.recording.is_some() || self.capturing.is_some(),
+            /* preview_open */ !self.previews.is_empty(),
+            /* own_window_open */
+            self.settings.window.is_some()
+                || self.permissions.window.is_some()
+                || self.color_picker.window.is_some(),
+            /* rebinding */ self.settings.rebinding.is_some(),
+        );
+        let color_picking = self.color_picking();
+        crate::platform::mac::picker_keys::sync(phase, color_picking, |phase| {
+            crate::shortcuts::picker_hotkeys(phase, &self.keymap, color_picking)
+        });
+        // The pinch has the same fault and the same cure (`platform::mac::pinch`): while
+        // this process is inactive the gesture goes to the active app, so a global monitor
+        // stands in for the recognizer. Its consumer is the colour picker's pinch poll, so
+        // the condition is that poll's own (`sub_color_picker_pinch`).
+        crate::platform::mac::pinch::sync_global_pinch(
+            color_picking && !self.outputs.is_empty() && self.countdown.is_none(),
+        );
+    }
+
+    /// Replay what the picker hotkeys did since the last poll: a press and a synthesized
+    /// repeat go through [`Self::handle_key`] as the press they stand for (a repeat with
+    /// `repeat = true`, so the DRAGON-601 hold rule still prices a held arrow), and a
+    /// release goes through the ordinary `KeyReleased` route, which is where a nudge is
+    /// persisted and the hold forgotten.
+    ///
+    /// The delivering surface is a capture overlay, because that is where the press would
+    /// have landed had this process been the active app, and it is what the bare-key lanes
+    /// test (`press_landed_on_overlay`). A countdown of a picker-free capture has no overlay;
+    /// its one live key (Close) does not read the surface, so a surface that matches nothing
+    /// stands in. A no-op off macOS, where nothing registers a hotkey set.
+    pub(in crate::app) fn drain_picker_keys(&mut self) -> Task<cosmic::Action<Msg>> {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::platform::mac::picker_keys::KeyEvent;
+            let surface =
+                self.outputs.first().map(|o| o.id).unwrap_or_else(window::Id::unique);
+            let mut tasks = Vec::new();
+            for event in crate::platform::mac::picker_keys::drain() {
+                match event {
+                    KeyEvent::Press(k) => {
+                        let (modifiers, key, location) = k.to_event();
+                        tasks.push(self.handle_key(surface, modifiers, key, location, None, false));
+                    }
+                    KeyEvent::Repeat(k) => {
+                        let (modifiers, key, location) = k.to_event();
+                        tasks.push(self.handle_key(surface, modifiers, key, location, None, true));
+                    }
+                    KeyEvent::Release(k) => {
+                        let (modifiers, key, _) = k.to_event();
+                        tasks.push(self.update(Msg::WindowChrome(
+                            WindowChromeMsg::KeyReleased(surface, modifiers, key),
+                        )));
+                    }
+                }
+            }
+            Task::batch(tasks)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Task::none()
+        }
+    }
+
     /// DRAGON-612: what an accept key means in THIS session, right now.
     ///
     /// The effectful half of [`accept_verdict`]: it reads the state and asks the pure rule.
@@ -1158,6 +1232,47 @@ impl App {
     }
 }
 
+/// Which keys the macOS picker hotkeys may hold for this session, as a
+/// [`crate::shortcuts::PickerKeyPhase`]. This is the app's half of the rule
+/// (`platform::mac::picker_keys::live_phase` adds the activation gate), and every answer
+/// short of `Full` releases keys that would otherwise be swallowed system-wide.
+///
+/// In order:
+/// * `preview_open`, `own_window_open`, `rebinding` -> `None`. The editor has the keyboard
+///   and the app is active by then; settings, the permission checker and the colour
+///   picker's result window carry text inputs, and a registered `h` would never reach them;
+///   a rebind row is waiting for the next real key.
+/// * `recording_or_grab` -> `None`. A recording must leave Escape and the arrows to the
+///   application being recorded, and a grab in flight answers nothing.
+/// * `countdown` -> `CancelOnly`, whether or not an overlay is up (a picker-free capture
+///   counts down with none). Close is the one key a countdown answers, and with this
+///   process inactive a registered key is the only way the keyboard can cancel the timer.
+/// * `overlay_up` -> `Full`: an idle picker.
+/// * otherwise `None`: nothing to press a key on.
+///
+/// Pure, and unit-tested.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn picker_key_phase(
+    overlay_up: bool,
+    countdown: bool,
+    recording_or_grab: bool,
+    preview_open: bool,
+    own_window_open: bool,
+    rebinding: bool,
+) -> crate::shortcuts::PickerKeyPhase {
+    use crate::shortcuts::PickerKeyPhase;
+    if preview_open || own_window_open || rebinding || recording_or_grab {
+        PickerKeyPhase::None
+    } else if countdown {
+        PickerKeyPhase::CancelOnly
+    } else if overlay_up {
+        PickerKeyPhase::Full
+    } else {
+        PickerKeyPhase::None
+    }
+}
+
 /// **Pure**, unit-tested: did this press land on one of our capture overlays?
 ///
 /// The rule [`App::press_landed_on_overlay`] applies, split out from the `self.outputs` read
@@ -2241,5 +2356,42 @@ mod accept_verdict_tests {
             !accept_wait_expired(worst),
             "a request held through the whole tray hold must still be alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod picker_key_phase_tests {
+    use super::picker_key_phase;
+    use crate::shortcuts::PickerKeyPhase;
+
+    #[test]
+    fn an_idle_picker_overlay_holds_the_full_set() {
+        assert_eq!(picker_key_phase(true, false, false, false, false, false), PickerKeyPhase::Full);
+    }
+
+    #[test]
+    fn a_countdown_holds_cancel_only_with_or_without_an_overlay() {
+        assert_eq!(
+            picker_key_phase(true, true, false, false, false, false),
+            PickerKeyPhase::CancelOnly
+        );
+        // A picker-free capture (active window, active monitor) counts down with no overlay.
+        assert_eq!(
+            picker_key_phase(false, true, false, false, false, false),
+            PickerKeyPhase::CancelOnly
+        );
+    }
+
+    #[test]
+    fn every_other_owner_of_the_session_holds_nothing() {
+        // No overlay and no countdown: nothing to press a key on.
+        assert_eq!(picker_key_phase(false, false, false, false, false, false), PickerKeyPhase::None);
+        // A recording or a grab in flight, even with a countdown flag still set.
+        assert_eq!(picker_key_phase(true, false, true, false, false, false), PickerKeyPhase::None);
+        assert_eq!(picker_key_phase(true, true, true, false, false, false), PickerKeyPhase::None);
+        // The editor, a window of ours with text inputs, a rebind row: each beats a countdown.
+        assert_eq!(picker_key_phase(true, true, false, true, false, false), PickerKeyPhase::None);
+        assert_eq!(picker_key_phase(true, true, false, false, true, false), PickerKeyPhase::None);
+        assert_eq!(picker_key_phase(true, true, false, false, false, true), PickerKeyPhase::None);
     }
 }

@@ -87,10 +87,46 @@ docs:
     echo "==> Serving on http://127.0.0.1:8000 (Ctrl-C to stop)"
     .venv-docs/bin/mkdocs serve
 
+# Run a gate in a worktree and a build directory of its own, and REMOVE BOTH
+# when it ends, pass or fail. This is the only sanctioned way to get either;
+# hand-rolling `git worktree add` plus a CARGO_TARGET_DIR is what filled three
+# machines with 509 GB of month-old build residue. scripts/gate-worktree.sh
+# carries the whole story.
+#
+#   just gate d401 cargo test
+#   just gate d401 cargo clippy --all-targets
+#
+# `just` splices the arguments as one flat string, so a command carrying quotes
+# or a shell operator goes to the script directly instead:
+#
+#   bash scripts/gate-worktree.sh d401 -- bash -c 'cargo build && cargo test'
+#
+# Unix only. Windows has never had this problem: that boot builds into
+# `target-win\` inside the checkout, git-excluded, and never creates a scratch
+# tree outside it.
+[unix]
+gate name *args:
+    bash scripts/gate-worktree.sh {{name}} -- {{args}}
+
+# Collect gate residue: any ~/.cck-worktrees entry that `git worktree list` no
+# longer registers, plus its `-target` sibling, plus anything a killed run left
+# a dead lock on. Every `just gate` and every `just build` already runs this, so
+# reach for it by hand only when you want to see what it would do:
+#
+#   just prune-worktrees --dry-run
+[unix]
+prune-worktrees *args:
+    bash scripts/prune-worktrees.sh {{args}}
+
 # macOS: build + bundle the .app (signed if a Developer ID identity is available).
 build-macos:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Collect gate residue first. `just build` is the one invocation every
+    # developer and `just dev` already passes through, so this is where the
+    # sweep stops being opt-in. It is quiet unless it actually frees something,
+    # and it never fails the build. See scripts/prune-worktrees.sh.
+    bash scripts/prune-worktrees.sh --quiet
     # Signs with a Developer ID identity if one is in the login keychain,
     # otherwise falls back to an unsigned local build. That is fine to run
     # directly: only Gatekeeper on ANOTHER machine cares about signing, and a
@@ -163,6 +199,11 @@ build-windows:
 build-linux:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Collect gate residue first. `just build` is the one invocation every
+    # developer and `just dev` already passes through, so this is where the
+    # sweep stops being opt-in. It is quiet unless it actually frees something,
+    # and it never fails the build. See scripts/prune-worktrees.sh.
+    bash scripts/prune-worktrees.sh --quiet
     # There is no packaged install yet (build from source per README). Tries
     # default features first (the zero-copy GPU encode path, needs ffmpeg 8
     # headers); on failure, most likely an older distro's ffmpeg, retries
@@ -734,6 +775,51 @@ dev-macos:
     # bundle it uses now) and neither is sandboxed, so the mac arm of the sweep
     # stays pgrep-based; there is no /proc to read.
     bash scripts/stop-all.sh
+    # STAGE the bundle onto the INTERNAL disk, and run the daemon from the copy
+    # (DRAGON-759). The repo lives on an external USB SSD, so before this the
+    # dev daemon executed straight out of the build tree on a hot-detachable
+    # volume. That is a trap, and it sprang on 2026-09-16.
+    #
+    # The mechanism: the volume detached and re-attached at 18:18:54, which
+    # fsck_apfs.log records (fsck ran on the volume, and no reboot sits between
+    # the two). The running daemon's executable pages were mapped from a vnode
+    # that the re-attach killed. Pages already resident kept working, so the
+    # process limped on for hours. At about 22:00 a FrontBoardServices
+    # scene-settings event drove it through code that was NOT resident. That
+    # page-in can never succeed. Every access faults, Rust's SIGBUS/SIGSEGV
+    # handler returns, the kernel retries the same instruction, forever.
+    # Measured: two threads at a combined ~190% CPU for ~18 hours, about 35 CPU
+    # hours, 94% of it system time. The OS filed the evidence in
+    # /Library/Logs/DiagnosticReports/cosmic-capture-kit_2026-09-16-220735_*.cpu_resource.diag,
+    # where all 48 samples of the main thread sit in ONE scene-settings callout
+    # and both busy threads' deepest frame is
+    # `std::sys::pal::unix::stack_overflow::imp::signal_handler + 0`.
+    #
+    # Nothing in the app can fix this. A wedged process cannot execute ANY
+    # userspace code, including its own SIGTERM handler, so only a SIGKILL-class
+    # signal removes it. The binary on disk was never damaged either: its mtime
+    # was six days old and `codesign -vv` passed. The FILE was fine, the
+    # MAPPINGS were dead. Only the LOCATION we run from can prevent it.
+    #
+    # `ditto`, never `cp -R`: it preserves the code signature, the extended
+    # attributes and the resource forks. The Developer ID signature is what lets
+    # the TCC screen-recording grant survive both a rebuild and this path move,
+    # because TCC keys on bundle id plus team, not on path. The `rm -rf` first
+    # is deliberate too: the staged binary must land on NEW inodes, never be
+    # rewritten in place under a process that may still be mapping it.
+    #
+    # The staging directory sits OUTSIDE the app's own config dir
+    # (~/Library/Application Support/cosmic-capture-kit/) on purpose. A factory
+    # reset or a config cleanup must never be able to delete the running
+    # daemon's executable, which would recreate this exact wedge. It is not in
+    # ~/Library/Caches either, which the OS may purge whenever it likes.
+    #
+    # Real installs run from /Applications and were always immune. The dev loop
+    # was the anomaly.
+    STAGE="$HOME/Library/Application Support/cosmic-capture-kit-dev-stage"
+    rm -rf "$STAGE/Cosmic Capture Kit.app"
+    mkdir -p "$STAGE"
+    ditto "target/release/bundle/Cosmic Capture Kit.app" "$STAGE/Cosmic Capture Kit.app"
     # `open -a`, NOT `nohup ... & disown`: launching through Launch Services hands
     # the daemon to launchd as a genuinely independent process, immune to whatever
     # the calling shell does to its OWN process tree once this script exits.
@@ -747,13 +833,19 @@ dev-macos:
     # reproduction (this recipe's own shebang) never showed the bug. `open -a`
     # sidesteps the whole class of problem: it is the same mechanism already
     # used everywhere else to relaunch this app reliably during development.
-    open -a "$(pwd)/target/release/bundle/Cosmic Capture Kit.app" --args tray
+    open -a "$STAGE/Cosmic Capture Kit.app" --args tray
     sleep 1
-    pgrep -f 'Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit' >/dev/null \
-        && echo "==> Daemon restarted on the fresh binary" \
+    # Match the STAGED path, not any bundle: a leftover daemon still running out
+    # of the build tree must not be able to fake a pass here.
+    pgrep -f 'cosmic-capture-kit-dev-stage/Cosmic Capture Kit\.app/Contents/MacOS/cosmic-capture-kit' >/dev/null \
+        && echo "==> Daemon restarted on the fresh binary (staged off the external volume)" \
         || { echo "==> ERROR: daemon did not come up"; exit 1; }
     # `just build` already wrote the stable launcher; say it again, last, so it is
-    # what is left on screen after the daemon lines.
+    # what is left on screen after the daemon lines. It stays pointed at the
+    # BUILD TREE on purpose: the stable path means "the most recent build", and a
+    # PrintScreen press while the external volume is detached is a transient
+    # failure either way. The daemon squatting wedged for a day is the part
+    # DRAGON-759 fixes.
     . scripts/artifacts.sh
     cck_stable_launcher "$PWD/target/release/bundle/Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit"
 

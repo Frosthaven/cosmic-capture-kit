@@ -1,11 +1,5 @@
 # Cosmic Capture Kit
 
-<!-- cck-disclosure-start -->
-![AI disclosure for Cosmic Capture Kit: share of completed tickets by label, over the project lifetime and the last 30 days, split into bugs caught, features, and tasks](docs/ticket-mix.png)
-<!-- cck-disclosure-end -->
-
----
-
 ![The preview editor's annotation tools, with numbered callouts on the toolbar's shape, redaction, highlight, text and draw groups, the save, copy and upload file actions, a spotlight dimming everything but one strip, freehand writing with an emoji, and the zoom control](site-src/assets/annotations.png)
 
 Screen capture/recording with live annotations, OCR/QR/barcode scanning,

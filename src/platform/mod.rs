@@ -108,6 +108,9 @@
 //! | `platform::pipewire` | `linux/portal/pipewire.rs` | `platform/mod.rs` | linux | folder-sort |
 //! | `platform::pixfmt` | `linux/portal/pixfmt.rs` | `platform/mod.rs` | linux | folder-sort |
 //! | `platform::linux_autostart` | `linux/autostart.rs` | `platform/mod.rs` | linux | folder-sort |
+//! | `platform::mac::activation` | `wm/activation.rs` | `mac/mod.rs` | macos | facet-sort |
+//! | `platform::mac::return_focus` | `wm/return_focus.rs` | `mac/mod.rs` | macos | facet-sort |
+//! | `platform::mac::picker_keys` | `wm/picker_keys.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `platform::mac::active_window` | `wm/active_window.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `platform::mac::coords` | `wm/coords.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `platform::mac::focus` | `wm/focus.rs` | `mac/mod.rs` | macos | facet-sort |

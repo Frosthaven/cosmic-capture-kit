@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2024"
 description = "Screen capture/recording with live annotations, OCR/QR/barcode scanning, color picker with saved palettes, and cloud uploads for every platform."
 license = "GPL-3.0-only"

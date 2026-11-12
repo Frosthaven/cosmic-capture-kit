@@ -1210,6 +1210,12 @@ impl cosmic::Application for App {
         // there), so Linux/Windows compile exactly as before.
         #[cfg(target_os = "macos")]
         crate::startup_guard::report(self.startup_presence());
+        // The picker hotkeys follow the session state the same way and for the same
+        // reason: re-derived here after EVERY message, so no exit from the picking phase
+        // (commit, cancel, countdown, recording, a new window) can leave a key registered.
+        // macOS-only; see `platform::mac::picker_keys`.
+        #[cfg(target_os = "macos")]
+        self.sync_picker_keys();
         task
     }
 

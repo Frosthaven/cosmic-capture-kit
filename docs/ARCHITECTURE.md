@@ -65,13 +65,22 @@ points to.
     DRAGON-154 pre-order-front chrome strip that opts the overlays out of
     AeroSpace's window detection, with the legacy pause/resume +
     `AerospaceGuard` death-pipe babysitter behind `CCK_AEROSPACE_PAUSE=1`),
+    `activation.rs` (the capture activation gate: a capture child never becomes
+    the active app until it has an editor, an alert or a panel to show, which is
+    what keeps a fullscreen game from minimizing),
+    `return_focus.rs` (the editor hands the keyboard back to the app the capture
+    started from when it closes),
+    `picker_keys.rs` (the picker's keys as Carbon hotkeys while the capture child
+    is inactive, since an inactive app's window gets no key events; the full set
+    while picking, Close only through a countdown, with held keys repeated here),
     `focus.rs`, `spaces.rs`, `active_window.rs`, `coords.rs` (the AppKit
     to app-coordinate mapper); `services/` — `file_panel.rs`,
     `login_item.rs`, `appearance.rs`, `env.rs`; root files `tcc.rs`
     (prompt-free permission probes + one-shot requests + System-Settings deep
     links; the pure `map_*_status` reducers are unit-tested), `wallpaper.rs`
     (NSWorkspace desktop-picture resolution with an honest HEIC/missing
-    degrade), `pinch.rs`, `screenshot.rs` (mounted at `crate::screenshot`
+    degrade), `pinch.rs` (the recognizer, plus a global magnify monitor while
+    the capture child is inactive), `screenshot.rs` (mounted at `crate::screenshot`
     off-Linux), `tray.rs`, `daemon.rs`. Read each module's doc comment before
     touching overlay placement or the WM dance.
   - `windows/` (all `cfg(windows)`) — the Windows plugin (DRAGON-229),

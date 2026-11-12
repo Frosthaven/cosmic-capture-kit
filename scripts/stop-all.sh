@@ -115,6 +115,9 @@ else
     # macOS. Anchored to the binary, never to the project name: the checkout
     # directory is itself called "cosmic-capture-kit", so a bare match would also
     # hit an editor with the source open.
+    # The bundle pattern is path-independent on purpose, so it also covers the
+    # DRAGON-759 dev-stage copy under ~/Library/Application Support/, the
+    # /Applications install, and the build tree alike.
     MAC_PATTERNS=(
         '(^|/)target/artifacts/cosmic-capture-kit( |$)'
         '(^|/)target/release/cosmic-capture-kit( |$)'

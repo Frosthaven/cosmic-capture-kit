@@ -83,6 +83,8 @@ impl App {
                 self.sub_cursor_ready(),
                 #[cfg(target_os = "macos")]
                 self.sub_wallpaper_ready(),
+                #[cfg(target_os = "macos")]
+                self.sub_picker_keys(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_passthrough(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -723,6 +725,24 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(50))
                     .map(|_| Msg::Capture(CaptureMsg::WallpaperReady)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// macOS: poll the picker hotkeys (`platform::mac::picker_keys`). Carbon delivers a
+    /// hotkey press into a process-wide channel with no way to wake iced, so this tick is
+    /// what turns a press into a message, and it is also the clock the synthesized key
+    /// repeat runs on. Alive ONLY while a hotkey set is registered, which is only while the
+    /// picker or a countdown is up and this process is inactive; the 16ms period bounds the
+    /// key latency at one frame. The drain is a non-blocking channel read.
+    #[cfg(target_os = "macos")]
+    fn sub_picker_keys(&self) -> Option<Subscription<Msg>> {
+        if crate::platform::mac::picker_keys::is_live() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::Capture(CaptureMsg::PickerKeysPoll)),
             )
         } else {
             None

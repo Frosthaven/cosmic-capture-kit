@@ -124,6 +124,8 @@ once, and the settings command is what a normal install needs.
 | `just dist` | Build the shipping Linux binary in the release container | docker |
 | `just flatpak` | EXPERIMENTAL: build the Flatpak, restart the resident as it | flatpak-builder |
 | `just docs` | Serve the documentation site with live reload | python3 |
+| `just gate` | Run a gate in a worktree of its own, and remove it afterwards | |
+| `just prune-worktrees` | Collect the scratch a killed gate left behind | |
 
 ### `just dev`
 
@@ -239,6 +241,45 @@ Serves the MkDocs site at `http://127.0.0.1:8000` with live reload, on the
 pinned toolchain from `docs-requirements.txt` rather than whatever `mkdocs`
 happens to be on `PATH`. Creates `.venv-docs` on first run; a fresh clone needs
 nothing but `python3`.
+
+### `just gate` and `just prune-worktrees`
+
+For running the suite against a commit without disturbing your working tree, or
+for running two gates at once without their builds colliding.
+
+```sh
+just gate mycheck cargo test
+```
+
+That checks the current `HEAD` out into `~/.cck-worktrees/mycheck`, points
+`CARGO_TARGET_DIR` at `~/.cck-worktrees/mycheck-target`, runs the command in
+there, and **removes both when it ends, pass or fail**, including on Ctrl-C.
+The command's exit status is the recipe's, so a failing gate still fails.
+`--ref` picks a different commit, `--no-worktree` gives only the scratch build
+directory (the Windows cross-check uses that), and `--export` adds an empty
+tree for `scripts/publish-public.sh --out`.
+
+`just` splices a recipe's arguments as one flat string, so a command carrying
+quotes or a shell operator goes to the script directly:
+
+```sh
+bash scripts/gate-worktree.sh mycheck -- bash -c 'cargo build && cargo test'
+```
+
+`just prune-worktrees` collects what a gate that was killed never got to
+remove: any `~/.cck-worktrees` entry `git worktree list` no longer registers,
+plus its `-target` sibling. `just gate` and `just build` both run it first, so
+you should never need it by hand; `--dry-run` shows what it would take. It
+leaves a live gate alone, and it refuses to remove a registered worktree with
+uncommitted changes without naming it first.
+
+Why this exists rather than a `git worktree add` of your own:
+`git worktree prune` drops the registration and never deletes the directory,
+and nothing removes a `-target` sibling for you, so the tidy-looking cleanup
+leaves the whole build tree on disk. That has now filled three machines, most
+recently with 96 directories and 509 GB of month-old gate residue.
+`bash scripts/gate-worktree.sh --self-check` proves the mechanism against a
+throwaway repo in a temp dir.
 
 ## Installing it on your PATH
 

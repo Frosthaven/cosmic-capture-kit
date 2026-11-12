@@ -920,6 +920,38 @@ impl Shortcut {
 
     /// Whether a keypress (modifiers + logical key) triggers this shortcut. Modifiers
     /// must match exactly, so Ctrl+A and Ctrl+Shift+A are distinct.
+    /// The key press this chord stands for, as the `(modifiers, key)` pair the key dispatch
+    /// takes. The inverse of [`Self::from_event`] for every chord that function can build,
+    /// and it also covers the bare Space (`" "`) that `from_event` refuses.
+    ///
+    /// Its one consumer is the macOS picker hotkeys (`platform::mac::picker_keys`): a Carbon
+    /// hotkey reports only WHICH registration fired, so the press is rebuilt from the chord
+    /// that was registered and fed to `App::handle_key` like any other.
+    ///
+    /// Pure, and unit-tested.
+    #[cfg(any(target_os = "macos", test))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn to_event(&self) -> (Modifiers, Key) {
+        let mut mods = Modifiers::empty();
+        if self.ctrl {
+            mods |= Modifiers::CTRL;
+        }
+        if self.alt {
+            mods |= Modifiers::ALT;
+        }
+        if self.shift {
+            mods |= Modifiers::SHIFT;
+        }
+        if self.logo {
+            mods |= Modifiers::LOGO;
+        }
+        let key = match &self.key {
+            ShortcutKey::Char(c) => Key::Character(c.as_str().into()),
+            ShortcutKey::Named(n) => Key::Named(n.to_iced()),
+        };
+        (mods, key)
+    }
+
     pub fn matches(&self, modifiers: Modifiers, key: &Key) -> bool {
         self.ctrl == modifiers.control()
             && self.alt == modifiers.alt()
@@ -1678,6 +1710,148 @@ pub fn fixed_scanner_action(modifiers: Modifiers, key: &Key) -> Option<FixedScan
     FixedScannerAction::ALL
         .into_iter()
         .find(|a| a.chord().matches(modifiers, key))
+}
+
+/// Every chord the capture PICKER answers, as data: the set the macOS picker hotkeys
+/// register while the capture child is inactive (`platform::mac::picker_keys`).
+///
+/// It is the list of what `App::handle_key` reads on a capture overlay, built from the same
+/// constructors those matchers use, so the two cannot drift (pinned by
+/// `picker_hotkey_tests`, which runs every entry back through its own matcher):
+/// * the baked Close ([`fixed_editor_action`], Escape);
+/// * the accept keys ([`is_accept_key`], bare Enter and bare Space);
+/// * the eight directionals ([`nudge_direction`], the arrows and `h` `j` `k` `l`);
+/// * the three `Context::Recording` bindings, read from the LIVE `keymap`, so a rebind is
+///   honoured and an unbound action registers nothing;
+/// * the region-copy chord and the three scanner chords ([`is_region_copy_chord`],
+///   [`fixed_scanner_action`]).
+///
+/// Deduplicated in first-seen order (region copy and the scanner's copy are one chord).
+/// NOT included: the colour picker's numpad zoom, which is told apart by key LOCATION, and
+/// a chord carries none. [`picker_hotkeys`] adds it, with the location, on top of this list.
+///
+/// Pure, and unit-tested.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn picker_hotkey_chords(keymap: &Keymap) -> Vec<Shortcut> {
+    let mut out: Vec<Shortcut> = Vec::new();
+    let mut push = |sc: Shortcut| {
+        if !out.contains(&sc) {
+            out.push(sc);
+        }
+    };
+    push(FixedEditorAction::Close.chord());
+    if let Some(alt) = FixedEditorAction::Close.alt_chord() {
+        push(alt);
+    }
+    push(Shortcut::named(NamedKey::Enter));
+    push(Shortcut::char(' '));
+    for k in [NamedKey::Left, NamedKey::Right, NamedKey::Up, NamedKey::Down] {
+        push(Shortcut::named(k));
+    }
+    for c in ['h', 'j', 'k', 'l'] {
+        push(Shortcut::char(c));
+    }
+    for action in Action::ALL.into_iter().filter(|a| a.context() == Context::Recording) {
+        if let Some(sc) = keymap.get(action) {
+            push(sc);
+        }
+    }
+    push(Shortcut::primary_char('c'));
+    for action in FixedScannerAction::ALL {
+        push(action.chord());
+    }
+    out
+}
+
+/// Which of the picker's keys the macOS hotkey set carries, by session phase
+/// (`platform::mac::picker_keys`).
+///
+/// A registered hotkey swallows its key system-wide, so each phase carries only what that
+/// phase can answer.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerKeyPhase {
+    /// Nothing registered: a recording, a grab in flight, the editor, a window of ours.
+    None,
+    /// A countdown is running. Only the Close chord is live, because cancel is the one
+    /// thing the keyboard can do to a countdown, and without it nothing can stop the timer
+    /// while this process is inactive.
+    CancelOnly,
+    /// The picker is up and idle: the whole set.
+    Full,
+}
+
+/// One key of the macOS picker hotkey set.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerHotkey {
+    /// The chord, as the key dispatch reads it.
+    pub chord: Shortcut,
+    /// The key is on the NUMPAD. Only the magnifier zoom is ([`magnifier_zoom_step`] keys on
+    /// the location), and a [`Shortcut`] cannot say so.
+    pub numpad: bool,
+    /// Holding the key repeats it: the directionals and the zoom. A hotkey fires once per
+    /// press, so the hotkey layer synthesizes these repeats itself.
+    pub repeats: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl PickerHotkey {
+    /// The key press this entry stands for, with its location.
+    ///
+    /// Pure, and unit-tested.
+    pub fn to_event(&self) -> (Modifiers, Key, Location) {
+        let (mods, key) = self.chord.to_event();
+        (mods, key, if self.numpad { Location::Numpad } else { Location::Standard })
+    }
+}
+
+/// The picker hotkey set for a session phase.
+///
+/// * [`PickerKeyPhase::None`] registers nothing.
+/// * [`PickerKeyPhase::CancelOnly`]: the baked Close chord(s) only, which is what
+///   `WindowChromeMsg::Close` turns into "cancel the timer" while a countdown runs.
+/// * [`PickerKeyPhase::Full`]: every chord of [`picker_hotkey_chords`], and with
+///   `color_picking` the two numpad zoom keys. The zoom keys are left out of every other
+///   launch because nothing reads them there, and a registered key is a swallowed key.
+///
+/// `repeats` is set for exactly the keys a HOLD means something for: the eight directionals
+/// (decided by [`nudge_direction`], the matcher the dispatch itself asks) and the zoom.
+///
+/// Pure, and unit-tested.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn picker_hotkeys(phase: PickerKeyPhase, keymap: &Keymap, color_picking: bool) -> Vec<PickerHotkey> {
+    let plain = |chord: Shortcut| {
+        let (mods, key) = chord.to_event();
+        PickerHotkey { repeats: nudge_direction(mods, &key).is_some(), numpad: false, chord }
+    };
+    match phase {
+        PickerKeyPhase::None => Vec::new(),
+        PickerKeyPhase::CancelOnly => {
+            let mut out = vec![plain(FixedEditorAction::Close.chord())];
+            if let Some(alt) = FixedEditorAction::Close.alt_chord()
+                && alt != out[0].chord
+            {
+                out.push(plain(alt));
+            }
+            out
+        }
+        PickerKeyPhase::Full => {
+            let mut out: Vec<PickerHotkey> =
+                picker_hotkey_chords(keymap).into_iter().map(plain).collect();
+            if color_picking {
+                for c in ['+', '-'] {
+                    out.push(PickerHotkey { chord: Shortcut::char(c), numpad: true, repeats: true });
+                }
+            }
+            out
+        }
+    }
 }
 
 /// [`is_region_copy_chord`]'s DISPLAY form, for the capture toolbar's tooltip: `"Ctrl+C"` on
@@ -3890,6 +4064,136 @@ mod picker_window_key_tests {
             );
             // …and it really is the difference from the overlay's own lane.
             assert!(nudge_direction(Modifiers::empty(), &ch(letter)).is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod picker_hotkey_tests {
+    use super::*;
+
+    fn fires_something(keymap: &Keymap, sc: &Shortcut) -> bool {
+        let (mods, key) = sc.to_event();
+        fixed_editor_action(mods, &key) == Some(FixedEditorAction::Close)
+            || is_accept_key(mods, &key)
+            || nudge_direction(mods, &key).is_some()
+            || keymap.action_for(Context::Recording, mods, &key).is_some()
+            || is_region_copy_chord(mods, &key)
+            || fixed_scanner_action(mods, &key).is_some()
+    }
+
+    #[test]
+    fn every_registered_chord_is_one_the_picker_dispatch_answers() {
+        let keymap = Keymap::defaults();
+        let chords = picker_hotkey_chords(&keymap);
+        for sc in &chords {
+            assert!(fires_something(&keymap, sc), "{sc:?} is registered but nothing reads it");
+        }
+    }
+
+    #[test]
+    fn the_set_covers_close_accept_and_all_eight_directionals() {
+        let chords = picker_hotkey_chords(&Keymap::defaults());
+        let has = |pred: &dyn Fn(Modifiers, &Key) -> bool| {
+            chords.iter().any(|sc| {
+                let (m, k) = sc.to_event();
+                pred(m, &k)
+            })
+        };
+        assert!(has(&|m, k| fixed_editor_action(m, k) == Some(FixedEditorAction::Close)));
+        assert!(has(&|m, k| is_accept_key(m, k) && *k == Key::Named(Named::Enter)));
+        assert!(has(&|m, k| is_accept_key(m, k) && matches!(k, Key::Character(c) if c == " ")));
+        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+            let n = chords
+                .iter()
+                .filter(|sc| {
+                    let (m, k) = sc.to_event();
+                    nudge_direction(m, &k) == Some(dir)
+                })
+                .count();
+            assert_eq!(n, 2, "{dir:?} needs its arrow and its letter");
+        }
+    }
+
+    #[test]
+    fn a_rebound_recording_action_is_followed_and_an_unbound_one_registers_nothing() {
+        let mut keymap = Keymap::defaults();
+        let default_stop = keymap.get(Action::RecordStop).expect("RecordStop has a default");
+        let rebound = Shortcut { ctrl: true, ..Shortcut::char('9') };
+        keymap.set(Action::RecordStop, rebound.clone());
+        let chords = picker_hotkey_chords(&keymap);
+        assert!(chords.contains(&rebound));
+        assert!(!chords.contains(&default_stop));
+    }
+
+    #[test]
+    fn a_countdown_carries_the_close_chord_and_nothing_else() {
+        let keys = picker_hotkeys(PickerKeyPhase::CancelOnly, &Keymap::defaults(), true);
+        assert!(!keys.is_empty());
+        for k in &keys {
+            let (m, key, _) = k.to_event();
+            assert_eq!(fixed_editor_action(m, &key), Some(FixedEditorAction::Close), "{k:?}");
+            assert!(!k.repeats && !k.numpad);
+        }
+    }
+
+    #[test]
+    fn no_phase_but_picking_and_countdown_registers_a_key() {
+        assert!(picker_hotkeys(PickerKeyPhase::None, &Keymap::defaults(), true).is_empty());
+    }
+
+    #[test]
+    fn the_full_set_is_every_picker_chord_and_only_the_directionals_repeat() {
+        let keymap = Keymap::defaults();
+        let keys = picker_hotkeys(PickerKeyPhase::Full, &keymap, false);
+        assert_eq!(
+            keys.iter().map(|k| k.chord.clone()).collect::<Vec<_>>(),
+            picker_hotkey_chords(&keymap)
+        );
+        for k in &keys {
+            let (m, key, loc) = k.to_event();
+            assert_eq!(loc, Location::Standard);
+            assert_eq!(k.repeats, nudge_direction(m, &key).is_some(), "{k:?}");
+        }
+        assert_eq!(keys.iter().filter(|k| k.repeats).count(), 8);
+    }
+
+    #[test]
+    fn the_numpad_zoom_joins_a_colour_picker_launch_only() {
+        let keymap = Keymap::defaults();
+        let zoom = |keys: &[PickerHotkey]| {
+            keys.iter()
+                .filter_map(|k| {
+                    let (_, key, loc) = k.to_event();
+                    magnifier_zoom_step(&key, loc).map(|step| (step, k.repeats))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(zoom(&picker_hotkeys(PickerKeyPhase::Full, &keymap, false)).is_empty());
+        assert_eq!(
+            zoom(&picker_hotkeys(PickerKeyPhase::Full, &keymap, true)),
+            vec![(1, true), (-1, true)]
+        );
+    }
+
+    #[test]
+    fn no_chord_is_listed_twice() {
+        let chords = picker_hotkey_chords(&Keymap::defaults());
+        for (i, sc) in chords.iter().enumerate() {
+            assert!(!chords[i + 1..].contains(sc), "{sc:?} is listed twice");
+        }
+    }
+
+    #[test]
+    fn to_event_round_trips_through_from_event() {
+        for sc in [
+            Shortcut::named(NamedKey::Escape),
+            Shortcut::primary_char('c'),
+            Shortcut::shift_alt_named(NamedKey::Enter),
+            Shortcut::char('h'),
+        ] {
+            let (mods, key) = sc.to_event();
+            assert_eq!(Shortcut::from_event(mods, &key), Some(sc));
         }
     }
 }

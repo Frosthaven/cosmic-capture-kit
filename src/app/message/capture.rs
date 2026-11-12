@@ -54,6 +54,11 @@ pub enum CaptureMsg {
     /// launch-critical frozen flats). Never constructed on Linux (inline resolve).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     WallpaperReady,
+    /// macOS: drain the picker hotkeys and run each press, repeat and release through the
+    /// key dispatch (`platform::mac::picker_keys`). Fired by `sub_picker_keys` only while a hotkey set
+    /// is registered. Never constructed off macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PickerKeysPoll,
     /// DRAGON-213: drain the DEDICATED launch cursor grab slot into `frozen_cursor` (+
     /// its display handle). Fired by the drain poll while `cursor_pending`, on BOTH
     /// platforms — the pointer is locked at LAUNCH (its own thread), so the region/

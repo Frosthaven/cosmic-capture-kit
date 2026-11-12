@@ -120,11 +120,52 @@ pub(in crate::app) fn transient_dir(is_video: bool) -> std::path::PathBuf {
 /// (`begin_capture` → `destroy_surfaces`, before the window flow's
 /// focus-then-grab — DRAGON-194), and the countdown / recording phases re-mint
 /// their own surfaces with their own interactivity.
-// Only `overlay_pick_exclusive` (Linux) consumes it; the pure tests below keep it alive
+// Only `overlay_keyboard_interactivity` (Linux) consumes it; the pure tests below keep it alive
 // off Linux, so the bin build is dead there (Windows has no exclusive-grab step). DRAGON-229.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn picking_phase(countdown: bool, capture_live: bool, recording: bool) -> bool {
     !countdown && !capture_live && !recording
+}
+
+/// What keyboard a capture overlay asks the compositor for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux layer-shell only
+pub(super) enum OverlayKeyboard {
+    /// Focus on the first commit. The idle picker (DRAGON-228).
+    Exclusive,
+    /// Focus on click. Countdown, live capture and recording chrome.
+    OnDemand,
+    /// No keyboard at all, so no focus is ever taken. Mouse only.
+    None,
+}
+
+/// **Pure**, unit-tested: the keyboard a capture overlay is minted with.
+///
+/// A fullscreen application in front at launch gets NO keyboard from us in any
+/// phase. On Wayland keys and focus are one thing, and a fullscreen XWayland game
+/// (GLFW, SDL) iconifies itself on the `FocusOut` our focus causes. Measured
+/// 2026-11-11: the Exclusive region picker minimized Minecraft. `OnDemand` is
+/// refused there too, because the first click on our chrome is the same focus
+/// loss, one step later. The picker is then mouse only: drag, and the toolbar
+/// confirms and cancels. Every key goes to the game.
+///
+/// Everything else keeps the historical rule: Exclusive while picking (see
+/// [`picking_phase`]), OnDemand otherwise.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux layer-shell only
+fn overlay_keyboard(picking: bool, fullscreen_in_front: bool) -> OverlayKeyboard {
+    if fullscreen_in_front {
+        // KEYBOARD SPOT. A focus-free key source for the picker plugs in HERE:
+        // keep `None` for the surface and feed the keys into the normal dispatch
+        // from that source, as macOS does with Carbon hotkeys
+        // (`platform/mac/wm/picker_keys.rs`). Two candidates, neither usable today:
+        //   * the xdg GlobalShortcuts portal (`platform::global_shortcuts`), which
+        //     xdg-desktop-portal-cosmic 1.11 does not serve (kde's does);
+        //   * temporary cosmic-comp shortcuts, which means editing the user's
+        //     shortcut config per capture, and a crash leaves Escape hijacked.
+        // if focus_free_picker_keys_bound { return OverlayKeyboard::None; }
+        return OverlayKeyboard::None;
+    }
+    if picking { OverlayKeyboard::Exclusive } else { OverlayKeyboard::OnDemand }
 }
 
 // ── The tray-menu dropdown hold (Linux, DRAGON-600) ──────────────────────────
@@ -468,11 +509,38 @@ fn immediate_resolution_waits_for_countdown(delay_secs: u64) -> bool {
 }
 
 impl App {
-    /// The keyboard interactivity to MINT a capture overlay with right now:
-    /// Exclusive during picking (see [`picking_phase`]), OnDemand otherwise.
+    /// The keyboard interactivity to MINT a capture overlay with right now. The
+    /// effectful half of [`overlay_keyboard`]: it reads the phase and the launch-time
+    /// "fullscreen application in front" fact, and decides nothing.
+    ///
+    /// That fact is read ONCE per process, at the first mint. It must be: after our
+    /// own surfaces are up, "who is activated" is partly an answer about us. The
+    /// process is one-shot, so one launch is one capture session.
     #[cfg(target_os = "linux")]
-    pub(super) fn overlay_pick_exclusive(&self) -> bool {
-        picking_phase(self.countdown.is_some(), self.capture_live, self.recording.is_some())
+    pub(super) fn overlay_keyboard_interactivity(
+        &self,
+    ) -> cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity {
+        use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
+        let picking =
+            picking_phase(self.countdown.is_some(), self.capture_live, self.recording.is_some());
+        match overlay_keyboard(picking, self.fullscreen_in_front()) {
+            OverlayKeyboard::Exclusive => KeyboardInteractivity::Exclusive,
+            OverlayKeyboard::OnDemand => KeyboardInteractivity::OnDemand,
+            OverlayKeyboard::None => KeyboardInteractivity::None,
+        }
+    }
+
+    /// Whether a fullscreen application was in front when this capture launched.
+    /// Read from the compositor ONCE per process, at the first overlay mint, and
+    /// cached; see [`Self::overlay_keyboard_interactivity`] for why once.
+    #[cfg(target_os = "linux")]
+    pub(super) fn fullscreen_in_front(&self) -> bool {
+        static FULLSCREEN_IN_FRONT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FULLSCREEN_IN_FRONT.get_or_init(|| {
+            let front = crate::platform::compositor::fullscreen_app_in_front();
+            log::info!("overlay: fullscreen app in front at launch = {front}");
+            front
+        })
     }
 
     /// DRAGON-599: this session's whole desktop, in CAPTURE coordinates, as the walls a
@@ -5183,6 +5251,18 @@ mod picker_keyboard_tests {
         assert!(!picking_phase(true, false, false));
         assert!(!picking_phase(false, true, false));
         assert!(!picking_phase(false, false, true));
+    }
+
+    #[test]
+    fn a_fullscreen_app_in_front_gets_no_keyboard_in_any_phase() {
+        use super::{OverlayKeyboard, overlay_keyboard};
+        // The historical rule, untouched when nothing fullscreen is in front.
+        assert_eq!(overlay_keyboard(true, false), OverlayKeyboard::Exclusive);
+        assert_eq!(overlay_keyboard(false, false), OverlayKeyboard::OnDemand);
+        // Over a fullscreen app: never Exclusive, and never OnDemand either, since a
+        // click on our chrome would be the same focus loss.
+        assert_eq!(overlay_keyboard(true, true), OverlayKeyboard::None);
+        assert_eq!(overlay_keyboard(false, true), OverlayKeyboard::None);
     }
 }
 

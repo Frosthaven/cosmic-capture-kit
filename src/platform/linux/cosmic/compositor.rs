@@ -188,26 +188,19 @@ fn connect_toplevels() -> Option<(Connection, EventQueue<WaylandState>, WaylandS
     ))
 }
 
-/// Per output name, the toplevels on the active workspace as global rects + ids.
-// The transient `HashMap`/`HashSet` below are keyed by Wayland proxies. Those carry
-// interior mutability (hence `mutable_key_type`), but we only ever use them as
-// stable identity keys, so the lint is a false positive here.
-#[allow(clippy::mutable_key_type)]
-pub fn list_toplevels() -> HashMap<String, Vec<Toplevel>> {
-    let mut result: HashMap<String, Vec<Toplevel>> = HashMap::new();
-    // `_conn` is never read again, but the connection must outlive the queue that borrows it.
-    let Some((_conn, mut queue, mut data)) = connect_toplevels() else {
-        return result;
-    };
-    // The ext-foreign-toplevel-list enumeration + cosmic-info handshake arrive
-    // asynchronously: back-to-back roundtrips don't give the compositor
-    // wall-clock time to deliver them. Dispatch over a short real-time window,
-    // stopping early once the toplevel count settles (non-zero & stable).
+/// Wait for the toplevel enumeration to settle. `false` means the connection died.
+///
+/// The ext-foreign-toplevel-list enumeration + cosmic-info handshake arrive
+/// asynchronously: back-to-back roundtrips don't give the compositor
+/// wall-clock time to deliver them. Dispatch over a short real-time window,
+/// stopping early once the toplevel count settles (non-zero & stable). Bounded at
+/// 40 rounds of 15ms, so an empty desktop costs about 600ms and never more.
+fn settle_toplevels(queue: &mut EventQueue<WaylandState>, data: &mut WaylandState) -> bool {
     let mut last = 0usize;
     let mut stable = 0;
     for _ in 0..40 {
-        if queue.roundtrip(&mut data).is_err() {
-            return result;
+        if queue.roundtrip(data).is_err() {
+            return false;
         }
         let n = data.toplevel_info_state.toplevels().count();
         if n > 0 && n == last {
@@ -220,6 +213,44 @@ pub fn list_toplevels() -> HashMap<String, Vec<Toplevel>> {
         }
         last = n;
         std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    true
+}
+
+/// Whether the ACTIVATED toplevel is fullscreen right now: "is a fullscreen
+/// application in front". `false` when the session has no cosmic toplevel info.
+///
+/// The capture overlays read this once at launch, before any surface of ours can
+/// take focus, to decide whether they may ask for the keyboard at all. A fullscreen
+/// XWayland game (GLFW, SDL) iconifies itself on the X11 `FocusOut` that an
+/// Exclusive layer surface causes. Measured 2026-11-11 with Minecraft: the region
+/// picker minimized it, and the keyboard-None cursor probe below did not.
+pub fn fullscreen_app_in_front() -> bool {
+    let Some((_conn, mut queue, mut data)) = connect_toplevels() else {
+        return false;
+    };
+    if !settle_toplevels(&mut queue, &mut data) {
+        return false;
+    }
+    data.toplevel_info_state.toplevels().any(|t| {
+        t.state.contains(&zcosmic_toplevel_handle_v1::State::Activated)
+            && t.state.contains(&zcosmic_toplevel_handle_v1::State::Fullscreen)
+    })
+}
+
+/// Per output name, the toplevels on the active workspace as global rects + ids.
+// The transient `HashMap`/`HashSet` below are keyed by Wayland proxies. Those carry
+// interior mutability (hence `mutable_key_type`), but we only ever use them as
+// stable identity keys, so the lint is a false positive here.
+#[allow(clippy::mutable_key_type)]
+pub fn list_toplevels() -> HashMap<String, Vec<Toplevel>> {
+    let mut result: HashMap<String, Vec<Toplevel>> = HashMap::new();
+    // `_conn` is never read again, but the connection must outlive the queue that borrows it.
+    let Some((_conn, mut queue, mut data)) = connect_toplevels() else {
+        return result;
+    };
+    if !settle_toplevels(&mut queue, &mut data) {
+        return result;
     }
 
     // output -> (name, logical position)
@@ -651,24 +682,8 @@ fn activate_where(pred: impl Fn(&ToplevelInfo) -> bool) {
     let Some((conn, mut queue, mut data)) = connect_toplevels() else {
         return;
     };
-    // Wait for the async toplevel enumeration to settle (same as list_toplevels()).
-    let mut last = 0usize;
-    let mut stable = 0;
-    for _ in 0..40 {
-        if queue.roundtrip(&mut data).is_err() {
-            return;
-        }
-        let n = data.toplevel_info_state.toplevels().count();
-        if n > 0 && n == last {
-            stable += 1;
-            if stable >= 3 {
-                break;
-            }
-        } else {
-            stable = 0;
-        }
-        last = n;
-        std::thread::sleep(std::time::Duration::from_millis(15));
+    if !settle_toplevels(&mut queue, &mut data) {
+        return;
     }
 
     let Some(handle) = data
@@ -811,24 +826,8 @@ pub fn activate_until(target_id: &str, subject_id: &str, want_active: bool) -> b
     let Some((conn, mut queue, mut data)) = connect_toplevels() else {
         return false;
     };
-    // Wait for the async toplevel enumeration to settle (same as list_toplevels()).
-    let mut last = 0usize;
-    let mut stable = 0;
-    for _ in 0..40 {
-        if queue.roundtrip(&mut data).is_err() {
-            return false;
-        }
-        let n = data.toplevel_info_state.toplevels().count();
-        if n > 0 && n == last {
-            stable += 1;
-            if stable >= 3 {
-                break;
-            }
-        } else {
-            stable = 0;
-        }
-        last = n;
-        std::thread::sleep(std::time::Duration::from_millis(15));
+    if !settle_toplevels(&mut queue, &mut data) {
+        return false;
     }
     // Poll-and-reissue with a STABILITY requirement. A first observation of the
     // desired state is NOT enough: the compositor's post-overlay focus

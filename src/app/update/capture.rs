@@ -377,6 +377,11 @@ impl App {
                         self.windowed_swap_pending = true;
                         Task::none()
                     } else {
+                        // The grab is done and the cover IS the editor now, so the
+                        // capture activation gate opens here (`wm/activation.rs`).
+                        crate::platform::mac::activation::permit();
+                        // A cold activation can be refused, so it is verified and retried.
+                        crate::platform::mac::activation::ensure_active_soon();
                         window::gain_focus(id)
                     };
                 }
@@ -406,6 +411,7 @@ impl App {
                     _ => Task::none(),
                 }
             }
+            CaptureMsg::PickerKeysPoll => self.drain_picker_keys(),
             CaptureMsg::WallpaperReady => {
                 // macOS (DRAGON-200): the deferred per-output picker wallpaper landed
                 // (grabbed AFTER the frozen flats so it never delayed the region still).

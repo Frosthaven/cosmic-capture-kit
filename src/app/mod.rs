@@ -693,6 +693,18 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
         startup.post_update,
     ) {
         crate::platform::mac::window::install_overlay_chrome_strip();
+        // The other half of "capture children are never activated" (DRAGON-150/151, the
+        // long note at the top of this function): winit activates the app at launch and
+        // again in every `gain_focus`, and neither can be switched off from above winit.
+        // Both took a fullscreen game out of front, which made it minimize. The gate drops
+        // them until this process has an editor, an alert or a panel to show. Capture
+        // launches only, for the same reason as the strip: the Regular-policy launches
+        // above are ordinary apps and must activate. See `platform/mac/wm/activation.rs`.
+        crate::platform::mac::activation::install_capture_gate();
+        // And remember which app the user was in, so the editor can hand the keyboard
+        // back to it when it closes (`platform/mac/wm/return_focus.rs`). Read here, before
+        // anything in this process can become the active app.
+        crate::platform::mac::return_focus::record_at_boot();
     }
     // DRAGON-303: on macOS 26 an NSGlassContainerView in the titlebar swallows clicks meant
     // for content under the transparent titlebar, so the settings / preview CSD header's

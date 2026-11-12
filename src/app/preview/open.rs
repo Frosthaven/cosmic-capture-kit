@@ -1486,6 +1486,10 @@ impl App {
                     crate::diag::Failure::HandoffAccepted,
                     &format!("host pid {pid} accepted the capture; this process is done"),
                 );
+                // macOS: the host owns giving the keyboard back when its editor closes, and
+                // it must return to the app THIS capture started from, so leave it the pid.
+                #[cfg(target_os = "macos")]
+                crate::platform::mac::return_focus::hand_to_host(pid);
                 Some(self.finish_session())
             }
             Err(e) => {

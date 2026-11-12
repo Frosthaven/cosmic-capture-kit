@@ -163,6 +163,11 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         {
+            // A session that made itself the active app (its editor) hands the keyboard
+            // back to the app the capture started from; every other session does nothing.
+            // Requested here, before the exit is queued, so it is on its way when the
+            // process goes. See `platform/mac/wm/return_focus.rs`.
+            crate::platform::mac::return_focus::on_session_end();
             crate::platform::mac::window::resume_tiling_wm();
             // Release the AeroSpace death-pipe babysitter (DRAGON-130): dropping the
             // guard closes the child's stdin → it fires `aerospace enable on` on EOF —
@@ -232,6 +237,8 @@ impl App {
     /// Build a per-output `Layer::Overlay` surface. `input_zone`: None = full
     /// input, Some(rects) = only those rects are interactive (rest click-through).
     /// `keyboard` enables ON-DEMAND keyboard input (focus on click); `false` = none.
+    /// Over a fullscreen application it is none either way: a click that takes focus
+    /// minimizes a fullscreen game (see `capture_flow::overlay_keyboard`).
     #[cfg(target_os = "linux")]
     pub(super) fn overlay_surface(
         &self,
@@ -240,6 +247,7 @@ impl App {
         input_zone: Option<Vec<cosmic::iced::Rectangle>>,
         keyboard: bool,
     ) -> Task<cosmic::Action<Msg>> {
+        let keyboard = keyboard && !self.fullscreen_in_front();
         super::shell::overlay_surface(output, id, input_zone, keyboard)
     }
 
@@ -550,9 +558,15 @@ impl App {
         {
             // macOS (DRAGON-186 Phase 5b): grab the previously-active window's pixels
             // NOW, while its owning app is still frontmost, BEFORE `gain_focus` fires.
-            // `gain_focus` activates our accessory process, which deactivates that app
-            // and re-renders its window in the INACTIVE appearance (grayed traffic
-            // lights, dimmed title bar). All our window-pixel grabs otherwise happen
+            // `gain_focus` USED to activate our accessory process, which deactivated that
+            // app and re-rendered its window in the INACTIVE appearance (grayed traffic
+            // lights, dimmed title bar). That activation was never meant to happen (a
+            // capture child is never activated, DRAGON-150/151) and it is what minimized
+            // fullscreen games, so `platform/mac/wm/activation.rs` now drops it and
+            // `gain_focus` only makes the overlay KEY. The grab below stays: the overlay
+            // taking key can still change the previous window's chrome, and under the
+            // `CCK_MAC_CAPTURE_ACTIVATES=1` escape hatch the old activation is back.
+            // All our window-pixel grabs otherwise happen
             // AT/AFTER this activation, so they capture the gray look. This synchronous
             // pre-activation grab is the one deterministic point where the active
             // window's LIVE active pixels can still be read; window-mode commit prefers
@@ -1302,6 +1316,12 @@ impl App {
             return if self.mac_preview_preopen {
                 Task::none()
             } else {
+                // The overlay editor is above the normal window level, so the capture
+                // activation gate cannot recognise it as a real window on its own. The
+                // capture is over: open the gate so this `gain_focus` activates us.
+                crate::platform::mac::activation::permit();
+                // A cold activation can be refused, so it is verified and retried.
+                crate::platform::mac::activation::ensure_active_soon();
                 window::gain_focus(id)
             };
         }
@@ -1631,7 +1651,6 @@ impl App {
     /// (DRAGON-228) — Escape works again without a focusing click.
     #[cfg(target_os = "linux")]
     pub(super) fn restore_interactive_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
-        use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
         // `lab/flatpak`: the fallback toplevel is never recreated click-through, so
         // "restore" here means only "bring the selection window back if a portal dialog
         // yielded it" (idempotent when it is already up). Re-minting layer surfaces
@@ -1647,11 +1666,7 @@ impl App {
             }
             return self.teardown();
         }
-        let kb = if self.overlay_pick_exclusive() {
-            KeyboardInteractivity::Exclusive
-        } else {
-            KeyboardInteractivity::OnDemand
-        };
+        let kb = self.overlay_keyboard_interactivity();
         let plans: Vec<(OutputHandle, window::Id, window::Id)> = self
             .outputs
             .iter()
@@ -1730,7 +1745,6 @@ impl App {
     /// picking phase takes Exclusive keyboard, else OnDemand.
     #[cfg(target_os = "linux")]
     pub(super) fn mint_startup_pickers(&mut self) -> Task<cosmic::Action<Msg>> {
-        use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
         // `lab/flatpak`: an unresolved immediate capture degrades into the fallback
         // selector on this path: the layer surfaces below cannot exist, so kick the
         // seed-time portal request instead (once; a repeat means it is already
@@ -1747,11 +1761,7 @@ impl App {
             }
             return Task::none();
         }
-        let kb = if self.overlay_pick_exclusive() {
-            KeyboardInteractivity::Exclusive
-        } else {
-            KeyboardInteractivity::OnDemand
-        };
+        let kb = self.overlay_keyboard_interactivity();
         let plans: Vec<(OutputHandle, window::Id)> =
             self.outputs.iter().map(|o| (o.output.clone(), o.id)).collect();
         Task::batch(
@@ -1763,7 +1773,7 @@ impl App {
 
     // Wayland `OutputEvent` hotplug handler — Linux-only (macOS/Windows seed outputs via
     // `seed_outputs_mac`). Uses Linux-gated `OutputEvent` + `shell::overlay_surface_with` +
-    // `overlay_pick_exclusive`, so the DEFINITION must be gated too, not just its caller
+    // `overlay_keyboard_interactivity`, so the DEFINITION must be gated too, not just its caller
     // (`update_window_chrome`'s `WindowChromeMsg::Output` arm) — otherwise it still compiles on
     // macOS and fails to resolve those Linux-only items.
     #[cfg(target_os = "linux")]
@@ -1941,12 +1951,7 @@ impl App {
                 // phase mints EXCLUSIVE keyboard (Escape and the overlay shortcuts
                 // work without a focusing click — cosmic-comp never auto-focuses
                 // OnDemand layers); non-picking phases mint OnDemand as before.
-                use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
-                let kb = if self.overlay_pick_exclusive() {
-                    KeyboardInteractivity::Exclusive
-                } else {
-                    KeyboardInteractivity::OnDemand
-                };
+                let kb = self.overlay_keyboard_interactivity();
                 super::shell::overlay_surface_with(output, id, None, kb)
             }
             OutputEvent::Removed => {
